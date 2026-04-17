@@ -1,0 +1,70 @@
+﻿seed: 42
+
+model:
+  name: Qwen3.5-9B
+  path: ../models/Qwen3.5-9B
+  device_map: ""
+  torch_dtype: float32
+  runtime_backend: npu
+  runtime_device: npu:0
+  trust_remote_code: true
+  local_files_only: true
+  attn_implementation: ""
+
+adapter:
+  manifest_path: ""
+  checkpoint_path: ""
+
+datasets:
+  pan:
+    path: ../data/processed/pan_test_set.jsonl
+    split: test
+    max_samples: 0
+    shuffle: false
+    enabled: true
+    placeholder_ok: true
+    max_new_tokens: 64
+  mmlu:
+    path: ../data/benchmarks/mmlu
+    split: test
+    max_samples: 0
+    shuffle: false
+    enabled: true
+    placeholder_ok: true
+    max_new_tokens: 1
+  gsm8k:
+    path: ../data/benchmarks/gsm8k
+    split: test
+    max_samples: 0
+    shuffle: false
+    enabled: true
+    placeholder_ok: true
+    max_new_tokens: 256
+  humaneval:
+    path: ../data/benchmarks/humaneval
+    split: test
+    max_samples: 0
+    shuffle: false
+    enabled: true
+    placeholder_ok: true
+    max_new_tokens: 512
+    exec_timeout_seconds: 3
+  mbpp:
+    path: ../data/benchmarks/mbpp
+    split: test
+    max_samples: 0
+    shuffle: false
+    enabled: true
+    placeholder_ok: true
+    max_new_tokens: 512
+    exec_timeout_seconds: 3
+
+runtime:
+  max_length: 1024
+  batch_size: 1
+
+output:
+  output_root: D:/outputs/baselines/no_sft_qwen35_9b_npu
+
+
+

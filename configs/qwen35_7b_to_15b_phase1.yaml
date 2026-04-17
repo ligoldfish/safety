@@ -1,0 +1,41 @@
+seed: 42
+
+dataset:
+  pan_repo_dir: ../external/safety-residual-space
+  raw_dir: ../data/raw/pan
+  processed_dir: ../data/processed
+  metadata_dir: ../data/metadata
+  exposure_size: 60
+  pan_test_size_per_type: 60
+  pan_train_size: 2600
+  alignment_size: 2100
+  analysis_val_size: 500
+  max_prompt_chars: 2048
+  system_prompt: "You are a helpful assistant."
+  include_system_prompt: true
+
+models:
+  teacher:
+    name: Qwen3.5-7B-Instruct
+    path: ../models/Qwen3.5-7B-Instruct
+    device_map: auto
+    torch_dtype: bfloat16
+    trust_remote_code: true
+    local_files_only: true
+    attn_implementation: ""
+  student:
+    name: Qwen3.5-1.5B-Instruct
+    path: ../models/Qwen3.5-1.5B-Instruct
+    device_map: auto
+    torch_dtype: bfloat16
+    trust_remote_code: true
+    local_files_only: true
+    attn_implementation: ""
+
+extraction:
+  output_root: ../outputs/phase1
+  max_length: 4096
+  batch_size: 4
+  shard_size: 128
+  storage_dtype: float16
+  skip_existing: true

@@ -1,0 +1,22 @@
+seed: 42
+
+inputs:
+  hidden_root: ../outputs/qwen35_08b_phase1/hidden_states
+  train_dir: teacher_alignment
+  val_dir: teacher_analysis_val
+  test_dir: teacher_pan_test
+
+method:
+  rank: 1
+  target_label: harmless
+  reference_label: harmful
+  selection_metric: balanced_accuracy
+  selected_layers: []
+
+limits:
+  train_max_samples_per_label: 0
+  val_max_samples_per_label: 0
+  test_max_samples_per_label: 0
+
+output:
+  output_root: ../outputs/qwen35_08b_phase2

@@ -1,0 +1,42 @@
+﻿seed: 42
+
+model:
+  name: Qwen3.5-1B
+  path: ../models/Qwen3.5-1B
+  device_map: ""
+  torch_dtype: float32
+  runtime_backend: npu
+  runtime_device: npu:0
+  trust_remote_code: true
+  local_files_only: true
+  attn_implementation: ""
+
+data:
+  train_split: ../data/processed/alignment_set.jsonl
+  val_split: ../data/processed/analysis_val_set.jsonl
+  test_split: ../data/processed/pan_test_set.jsonl
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.0
+  target_modules:
+    - self_attn.v_proj
+    - self_attn.o_proj
+    - mlp.up_proj
+    - mlp.down_proj
+
+optim:
+  epochs: 3
+  batch_size: 8
+  micro_batch_size: 1
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  max_length: 1024
+  max_new_tokens: 64
+  log_every_steps: 10
+
+output:
+  output_root: D:/outputs/baselines/sft_qwen35_1b_npu
+
+

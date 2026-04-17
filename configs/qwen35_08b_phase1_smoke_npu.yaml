@@ -1,0 +1,47 @@
+seed: 42
+
+dataset:
+  pan_repo_dir: ../external/safety-residual-space
+  raw_dir: ../data/raw/pan
+  processed_dir: ../data/processed_smoke_npu
+  metadata_dir: ../data/metadata_smoke_npu
+  exposure_size: 5
+  pan_test_size_per_type: 4
+  pan_train_size: 160
+  alignment_size: 128
+  analysis_val_size: 32
+  sanity_test_size_per_label: 8
+  max_prompt_chars: 1024
+  system_prompt: "You are a helpful assistant."
+  include_system_prompt: true
+
+models:
+  teacher:
+    name: Qwen3.5-0.8B
+    path: ../models/Qwen3.5-0.8B
+    device_map: ""
+    torch_dtype: float32
+    runtime_backend: npu
+    runtime_device: npu:0
+    trust_remote_code: true
+    local_files_only: true
+    attn_implementation: ""
+  student:
+    name: Qwen3.5-0.8B
+    path: ../models/Qwen3.5-0.8B
+    device_map: ""
+    torch_dtype: float32
+    runtime_backend: npu
+    runtime_device: npu:0
+    trust_remote_code: true
+    local_files_only: true
+    attn_implementation: ""
+
+extraction:
+  output_root: ../outputs/qwen35_08b_phase1_smoke_npu
+  max_length: 2048
+  batch_size: 1
+  shard_size: 16
+  storage_dtype: float16
+  skip_existing: true
+

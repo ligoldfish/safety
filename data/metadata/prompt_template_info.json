@@ -1,0 +1,7 @@
+{
+  "family": "Qwen3.5",
+  "system_prompt": "You are a helpful assistant.",
+  "include_system_prompt": true,
+  "rendering_rule": "tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)",
+  "feature_position": "last non-padding token of the generation prompt, corresponding to the first assistant token prediction position"
+}

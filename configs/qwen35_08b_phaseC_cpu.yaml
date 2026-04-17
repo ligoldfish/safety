@@ -1,0 +1,29 @@
+seed: 42
+
+model:
+  name: Qwen3.5-0.8B
+  path: ../models/Qwen3.5-0.8B
+  device_map: auto
+  torch_dtype: auto
+  trust_remote_code: true
+  local_files_only: true
+  attn_implementation: ""
+
+inputs:
+  artifact_path: ../outputs/qwen35_08b_phase2/subspace_artifacts.pt
+  val_split: ../data/processed/analysis_val_set.jsonl
+  test_split: ../data/processed/pan_test_set.jsonl
+
+method:
+  alphas: [0.0, 0.25, 0.5, 1.0]
+  selection_metric: balanced_accuracy
+  max_length: 4096
+  batch_size: 1
+  intervention_position: last_non_padding
+
+limits:
+  val_max_samples_per_label: 2
+  test_max_samples_per_label: 2
+
+output:
+  output_root: ../outputs/qwen35_08b_phase3
