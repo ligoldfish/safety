@@ -7,6 +7,11 @@ from typing import Dict, List
 
 import torch
 
+SUPPORTED_FEATURE_TYPES = {
+    "",
+    "final_response_prefix_hidden_state",
+}
+
 
 @dataclass
 class HiddenStateSplit:
@@ -44,7 +49,13 @@ def load_hidden_state_split(
     layer_buffers: Dict[int, List[torch.Tensor]] = {}
 
     for part_path in part_paths:
-        payload = torch.load(part_path, map_location="cpu")
+        payload = torch.load(part_path, map_location="cpu", weights_only=True)
+        feature_type = str(payload.get("feature_type", ""))
+        if feature_type not in SUPPORTED_FEATURE_TYPES:
+            raise ValueError(
+                f"Unsupported hidden-state feature type in {part_path}: {feature_type}. "
+                "Please regenerate hidden states with the thinking-on final-response-prefix pipeline."
+            )
         layer_keys = sorted(int(key) for key in payload["hidden_by_layer"].keys())
         chosen_layers = selected_layers or layer_keys
         keep_indices: List[int] = []

@@ -1,4 +1,4 @@
-from .eval_utils import looks_like_refusal, mean
+from .eval_utils import HarmfulResponseJudgment, judge_harmful_response_safety, looks_like_refusal, mean
 from .losses import cosine_layer_alignment_loss
 from .trainer_phase1 import (
     BatchPayload,
@@ -26,7 +26,9 @@ __all__ = [
     "cosine_layer_alignment_loss",
     "evaluate_generation_refusal_metrics",
     "evaluate_layer_alignment",
+    "HarmfulResponseJudgment",
     "forward_semalign_batch",
+    "judge_harmful_response_safety",
     "load_records",
     "load_student_target_map",
     "looks_like_refusal",

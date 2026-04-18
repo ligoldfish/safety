@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from difflib import SequenceMatcher
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List
@@ -14,6 +15,11 @@ try:
     from datasets import load_from_disk as hf_load_from_disk
 except Exception:
     hf_load_from_disk = None
+
+try:
+    from thefuzz import process as fuzz_process
+except Exception:
+    fuzz_process = None
 
 
 HF_DATASET_METADATA_FILES = {
@@ -26,6 +32,7 @@ MBPP_STANDARD_TEST_END_TASK_ID = 510
 MBPP_STANDARD_TEST_SIZE = (
     MBPP_STANDARD_TEST_END_TASK_ID - MBPP_STANDARD_TEST_START_TASK_ID + 1
 )
+OFFICIAL_GSM8K_NUMBER_RE = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?")
 
 
 @dataclass
@@ -249,6 +256,90 @@ def extract_multiple_choice_prediction(
         if candidate in option_set:
             return candidate
     return ""
+
+
+def _replace_choice_text_with_labels(
+    text: str,
+    choice_map: Dict[str, str],
+) -> str:
+    processed = str(text)
+    for label, choice in sorted(choice_map.items(), key=lambda item: len(str(item[1])), reverse=True):
+        choice_text = re.sub(r"\s+", " ", str(choice)).strip()
+        if not choice_text:
+            continue
+        processed = re.sub(
+            re.escape(choice_text),
+            f" {label} ",
+            processed,
+            flags=re.IGNORECASE,
+        )
+    return processed
+
+
+def extract_official_mmlu_prediction(
+    text: str,
+    option_labels: List[str],
+    choice_map: Dict[str, str],
+) -> str:
+    answer_text = str(text).strip()
+    if not answer_text:
+        return ""
+
+    processed = _replace_choice_text_with_labels(answer_text, choice_map)
+    label_group = "|".join(re.escape(label) for label in option_labels)
+    patterns = [
+        rf"answer(?:\s+is|:)?\s*\(?({label_group})\)?\b",
+        rf"the\s+correct\s+answer\s+is\s*\(?({label_group})\)?\b",
+        rf"choose\s*\(?({label_group})\)?\b",
+        rf"option\s*\(?({label_group})\)?\b",
+        rf"^\s*\(?({label_group})\)?[\s\.\):,-]*$",
+        rf"\b({label_group})\b(?=[\s\.\):,-]*(?:is\s+correct|is\s+right|$))",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, processed, flags=re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        candidate = match.group(1).upper()
+        if candidate in option_labels:
+            return candidate
+
+    match = re.search(rf"\b({label_group})\b", processed, flags=re.IGNORECASE)
+    if match:
+        candidate = match.group(1).upper()
+        if candidate in option_labels:
+            return candidate
+
+    choice_texts = [str(choice_map[label]) for label in option_labels if label in choice_map]
+    if fuzz_process is not None and choice_texts:
+        result = fuzz_process.extractOne(answer_text, choice_texts)
+        if result:
+            matched_choice = result[0]
+            for label in option_labels:
+                if str(choice_map.get(label, "")) == matched_choice:
+                    return label
+
+    best_label = ""
+    best_score = 0.0
+    normalized_answer = re.sub(r"\s+", " ", answer_text).strip().lower()
+    for label in option_labels:
+        choice_text = re.sub(r"\s+", " ", str(choice_map.get(label, ""))).strip().lower()
+        if not choice_text:
+            continue
+        score = SequenceMatcher(a=normalized_answer, b=choice_text).ratio()
+        if score > best_score:
+            best_score = score
+            best_label = label
+    if best_score >= 0.6:
+        return best_label
+    return ""
+
+
+def extract_official_gsm8k_prediction(text: str) -> str:
+    answer_text = str(text)
+    matches = OFFICIAL_GSM8K_NUMBER_RE.findall(answer_text)
+    if not matches:
+        return ""
+    return matches[-1].replace(",", "").lstrip("+")
 
 
 def load_gsm8k_examples(

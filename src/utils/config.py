@@ -13,7 +13,7 @@ class Phase1ModelConfig:
     path: str
     device_map: str = "auto"
     torch_dtype: str = "bfloat16"
-    chat_template_enable_thinking: bool | None = None
+    chat_template_enable_thinking: bool = True
     runtime_backend: str = ""
     runtime_device: str = ""
     trust_remote_code: bool = True

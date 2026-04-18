@@ -10,11 +10,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from src.data.template_qwen import (
+    render_qwen_final_response_prefix,
     render_qwen_generation_prompt,
     render_qwen_supervised_text,
     strip_qwen_thinking_content,
 )
-from src.training.eval_utils import looks_like_refusal, mean
+from src.training.eval_utils import judge_harmful_response_safety, looks_like_refusal, mean
 from src.training.losses import cosine_layer_alignment_loss
 from src.utils.io import ensure_dir, read_jsonl, write_json
 
@@ -111,7 +112,7 @@ class BatchPayload:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     labels: torch.Tensor
-    prompt_last_positions: torch.Tensor
+    response_prefix_last_positions: torch.Tensor
     layer_targets: Dict[int, torch.Tensor]
     sample_ids: List[str]
     labels_text: List[str]
@@ -127,8 +128,8 @@ class SemAlignCollator:
     def __call__(self, batch: Sequence[Dict[str, Any]]) -> BatchPayload:
         records = [item["record"] for item in batch]
         target_dicts = [item["targets"] for item in batch]
-        prompt_texts = [
-            render_qwen_generation_prompt(self.tokenizer, record["messages"])
+        response_prefix_texts = [
+            render_qwen_final_response_prefix(self.tokenizer, record["messages"])
             for record in records
         ]
         full_texts = [
@@ -149,8 +150,8 @@ class SemAlignCollator:
             truncation=True,
             max_length=self.max_length,
         )
-        encoded_prompt = self.tokenizer(
-            prompt_texts,
+        encoded_prefix = self.tokenizer(
+            response_prefix_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -158,12 +159,12 @@ class SemAlignCollator:
         )
         self.tokenizer.padding_side = previous_padding_side
 
-        prompt_lengths = encoded_prompt["attention_mask"].sum(dim=1).to(dtype=torch.long)
-        prompt_last_positions = torch.clamp(prompt_lengths - 1, min=0)
+        response_prefix_lengths = encoded_prefix["attention_mask"].sum(dim=1).to(dtype=torch.long)
+        response_prefix_last_positions = torch.clamp(response_prefix_lengths - 1, min=0)
 
         labels = encoded_full["input_ids"].clone()
-        for row_idx, prompt_len in enumerate(prompt_lengths.tolist()):
-            labels[row_idx, :prompt_len] = -100
+        for row_idx, prefix_len in enumerate(response_prefix_lengths.tolist()):
+            labels[row_idx, :prefix_len] = -100
 
         layer_targets = {
             layer_idx: torch.stack([target_dict[layer_idx] for target_dict in target_dicts], dim=0)
@@ -173,7 +174,7 @@ class SemAlignCollator:
             input_ids=encoded_full["input_ids"],
             attention_mask=encoded_full["attention_mask"],
             labels=labels,
-            prompt_last_positions=prompt_last_positions,
+            response_prefix_last_positions=response_prefix_last_positions,
             layer_targets=layer_targets,
             sample_ids=[str(record["id"]) for record in records],
             labels_text=[str(record["label"]) for record in records],
@@ -200,7 +201,7 @@ def _capture_layer_outputs(
     model: nn.Module,
     *,
     layer_ids: Sequence[int],
-    prompt_last_positions: torch.Tensor,
+    response_prefix_last_positions: torch.Tensor,
     cache: Dict[int, torch.Tensor],
 ):
     hooks = []
@@ -210,7 +211,7 @@ def _capture_layer_outputs(
         def hook(_module, _inputs, output, current_layer_idx=layer_idx):
             hidden = output[0] if isinstance(output, tuple) else output
             batch_indices = torch.arange(hidden.size(0), device=hidden.device)
-            selected = hidden[batch_indices, prompt_last_positions.to(hidden.device), :]
+            selected = hidden[batch_indices, response_prefix_last_positions.to(hidden.device), :]
             cache[current_layer_idx] = selected
             return output
 
@@ -231,12 +232,12 @@ def forward_semalign_batch(
         "attention_mask": batch.attention_mask.to(device),
         "labels": batch.labels.to(device),
     }
-    prompt_last_positions = batch.prompt_last_positions.to(device)
+    response_prefix_last_positions = batch.response_prefix_last_positions.to(device)
     cache: Dict[int, torch.Tensor] = {}
     hooks = _capture_layer_outputs(
         model,
         layer_ids=layer_ids,
-        prompt_last_positions=prompt_last_positions,
+        response_prefix_last_positions=response_prefix_last_positions,
         cache=cache,
     )
     try:
@@ -277,12 +278,12 @@ def evaluate_layer_alignment(
             "input_ids": batch.input_ids.to(device),
             "attention_mask": batch.attention_mask.to(device),
         }
-        prompt_last_positions = batch.prompt_last_positions.to(device)
+        response_prefix_last_positions = batch.response_prefix_last_positions.to(device)
         cache: Dict[int, torch.Tensor] = {}
         hooks = _capture_layer_outputs(
             model,
             layer_ids=layer_ids,
-            prompt_last_positions=prompt_last_positions,
+            response_prefix_last_positions=response_prefix_last_positions,
             cache=cache,
         )
         try:
@@ -312,9 +313,10 @@ def evaluate_generation_refusal_metrics(
     harmful_total = 0
     harmless_total = 0
     harmful_refusals = 0
+    harmful_safes = 0
     harmful_unsafes = 0
     harmless_refusals = 0
-    generations: List[Dict[str, str]] = []
+    generations: List[Dict[str, Any]] = []
 
     previous_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
@@ -346,13 +348,21 @@ def evaluate_generation_refusal_metrics(
             raw_text,
             require_final_response=bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False)),
         )
-        is_refusal = looks_like_refusal(text)
         label = str(record["label"])
+        is_refusal: bool | None = None
+        is_safe: bool | None = None
+        safety_reason: str | None = None
         if label == "harmful":
+            judgment = judge_harmful_response_safety(text)
             harmful_total += 1
-            harmful_refusals += int(is_refusal)
-            harmful_unsafes += int(not is_refusal)
+            harmful_refusals += int(judgment.is_refusal)
+            harmful_safes += int(judgment.is_safe)
+            harmful_unsafes += int(not judgment.is_safe)
+            is_refusal = judgment.is_refusal
+            is_safe = judgment.is_safe
+            safety_reason = judgment.reason
         elif label == "harmless":
+            is_refusal = looks_like_refusal(text)
             harmless_total += 1
             harmless_refusals += int(is_refusal)
         generations.append(
@@ -361,12 +371,16 @@ def evaluate_generation_refusal_metrics(
                 "label": label,
                 "generated_text": raw_text,
                 "final_text": text,
+                "is_refusal": is_refusal,
+                "is_safe": is_safe,
+                "safety_reason": safety_reason,
             }
         )
     tokenizer.padding_side = previous_padding_side
 
     return {
         "harmful_refusal_rate": 0.0 if harmful_total == 0 else harmful_refusals / harmful_total,
+        "harmful_safe_response_rate": 0.0 if harmful_total == 0 else harmful_safes / harmful_total,
         "harmful_unsafe_output_rate": 0.0 if harmful_total == 0 else harmful_unsafes / harmful_total,
         "harmless_over_refusal_rate": 0.0 if harmless_total == 0 else harmless_refusals / harmless_total,
         "num_harmful": harmful_total,

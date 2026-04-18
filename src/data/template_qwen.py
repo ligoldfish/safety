@@ -9,12 +9,16 @@ _QWEN_THINK_TAG_RE = re.compile(r"</?think>", flags=re.IGNORECASE)
 _QWEN_SPECIAL_MARKER_RE = re.compile(r"<\|(?:im_start|im_end|endoftext)\|>")
 
 
-def _resolve_enable_thinking(tokenizer: Any, enable_thinking: bool | None) -> bool | None:
-    if enable_thinking is not None:
-        return bool(enable_thinking)
+def _resolve_enable_thinking(tokenizer: Any, enable_thinking: bool | None) -> bool:
+    if enable_thinking is False:
+        raise ValueError("Non-thinking chat template mode is no longer supported for Qwen3.5.")
+    if enable_thinking is True:
+        return True
     inherited = getattr(tokenizer, "_codex_chat_template_enable_thinking", None)
+    if inherited is False:
+        raise ValueError("Non-thinking chat template mode is no longer supported for Qwen3.5.")
     if inherited is None:
-        return None
+        return True
     return bool(inherited)
 
 
@@ -33,7 +37,7 @@ def build_qwen_messages(
 def render_qwen_generation_prompt(
     tokenizer: Any,
     messages: Sequence[Dict[str, str]],
-    enable_thinking: bool | None = None,
+    enable_thinking: bool | None = True,
 ) -> str:
     resolved_enable_thinking = _resolve_enable_thinking(tokenizer, enable_thinking)
     if hasattr(tokenizer, "apply_chat_template"):
@@ -41,8 +45,7 @@ def render_qwen_generation_prompt(
             "tokenize": False,
             "add_generation_prompt": True,
         }
-        if resolved_enable_thinking is not None:
-            kwargs["enable_thinking"] = resolved_enable_thinking
+        kwargs["enable_thinking"] = resolved_enable_thinking
         try:
             return tokenizer.apply_chat_template(list(messages), **kwargs)
         except TypeError:
@@ -61,7 +64,7 @@ def render_qwen_supervised_text(
     tokenizer: Any,
     messages: Sequence[Dict[str, str]],
     assistant_text: str,
-    enable_thinking: bool | None = None,
+    enable_thinking: bool | None = True,
 ) -> str:
     full_messages = list(messages) + [{"role": "assistant", "content": assistant_text}]
     resolved_enable_thinking = _resolve_enable_thinking(tokenizer, enable_thinking)
@@ -70,8 +73,7 @@ def render_qwen_supervised_text(
             "tokenize": False,
             "add_generation_prompt": False,
         }
-        if resolved_enable_thinking is not None:
-            kwargs["enable_thinking"] = resolved_enable_thinking
+        kwargs["enable_thinking"] = resolved_enable_thinking
         try:
             return tokenizer.apply_chat_template(full_messages, **kwargs)
         except TypeError:
@@ -79,6 +81,19 @@ def render_qwen_supervised_text(
 
     prompt = render_qwen_generation_prompt(tokenizer=tokenizer, messages=messages)
     return prompt + str(assistant_text)
+
+
+def render_qwen_final_response_prefix(
+    tokenizer: Any,
+    messages: Sequence[Dict[str, str]],
+    enable_thinking: bool | None = True,
+) -> str:
+    return render_qwen_supervised_text(
+        tokenizer=tokenizer,
+        messages=messages,
+        assistant_text="",
+        enable_thinking=enable_thinking,
+    )
 
 
 def strip_qwen_thinking_content(

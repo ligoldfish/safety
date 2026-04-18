@@ -1,6 +1,8 @@
 from .first_gen_token import (
     build_chat_batch,
+    build_response_prefix_batch,
     extract_last_position_hidden,
+    gather_final_response_prefix_representations,
     gather_first_generated_token_representations,
 )
 from .layer_pairing import LayerPair, build_layer_pairs, map_teacher_to_student_layer
@@ -17,11 +19,13 @@ __all__ = [
     "SemanticBasisResult",
     "SafeSubspaceResult",
     "build_chat_batch",
+    "build_response_prefix_batch",
     "build_layer_pairs",
     "build_semantic_basis_from_lm_head",
     "build_teacher_safe_subspace",
     "extract_last_position_hidden",
     "fit_linear_probe_accuracy",
+    "gather_final_response_prefix_representations",
     "gather_first_generated_token_representations",
     "map_teacher_to_student_layer",
     "project_coeff",

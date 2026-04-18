@@ -119,15 +119,21 @@ def main() -> None:
         key=lambda item: int(item[0].split("_")[-1]),
     ):
         epoch_idx = int(epoch_name.split("_")[-1])
+        harmful_safe_response_rate = metrics.get("harmful_safe_response_rate")
+        if harmful_safe_response_rate in (None, ""):
+            harmful_safe_response_rate = (
+                None
+                if metrics.get("num_harmful", 0) == 0
+                else 1.0 - float(metrics.get("harmful_unsafe_output_rate", 1.0 - float(metrics["harmful_refusal_rate"])))
+            )
         harmful_unsafe_output_rate = metrics.get("harmful_unsafe_output_rate")
         if harmful_unsafe_output_rate in (None, ""):
-            harmful_unsafe_output_rate = (
-                0.0 if metrics["num_harmful"] == 0 else 1.0 - float(metrics["harmful_refusal_rate"])
-            )
+            harmful_unsafe_output_rate = 0.0 if metrics["num_harmful"] == 0 else 1.0 - float(harmful_safe_response_rate)
         training_rows.append(
             {
                 "epoch": epoch_idx,
                 "harmful_refusal_rate": metrics["harmful_refusal_rate"],
+                "harmful_safe_response_rate": harmful_safe_response_rate,
                 "harmful_unsafe_output_rate": harmful_unsafe_output_rate,
                 "harmless_over_refusal_rate": metrics["harmless_over_refusal_rate"],
                 "layer_target_cosine_mean": metrics["layer_target_cosine_mean"],
@@ -141,6 +147,7 @@ def main() -> None:
         fieldnames=[
             "epoch",
             "harmful_refusal_rate",
+            "harmful_safe_response_rate",
             "harmful_unsafe_output_rate",
             "harmless_over_refusal_rate",
             "layer_target_cosine_mean",

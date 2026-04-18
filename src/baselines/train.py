@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from src.data.template_qwen import render_qwen_generation_prompt, render_qwen_supervised_text
+from src.data.template_qwen import render_qwen_final_response_prefix, render_qwen_supervised_text
 
 
 class PanSupervisedDataset(Dataset):
@@ -40,8 +40,8 @@ class SupervisedCollator:
 
     def __call__(self, batch: Sequence[Dict[str, Any]]) -> SupervisedBatch:
         records = list(batch)
-        prompt_texts = [
-            render_qwen_generation_prompt(self.tokenizer, record["messages"])
+        response_prefix_texts = [
+            render_qwen_final_response_prefix(self.tokenizer, record["messages"])
             for record in records
         ]
         full_texts = [
@@ -62,8 +62,8 @@ class SupervisedCollator:
             truncation=True,
             max_length=self.max_length,
         )
-        encoded_prompt = self.tokenizer(
-            prompt_texts,
+        encoded_prefix = self.tokenizer(
+            response_prefix_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -71,10 +71,10 @@ class SupervisedCollator:
         )
         self.tokenizer.padding_side = previous_padding_side
 
-        prompt_lengths = encoded_prompt["attention_mask"].sum(dim=1).to(dtype=torch.long)
+        response_prefix_lengths = encoded_prefix["attention_mask"].sum(dim=1).to(dtype=torch.long)
         labels = encoded_full["input_ids"].clone()
-        for row_idx, prompt_len in enumerate(prompt_lengths.tolist()):
-            labels[row_idx, :prompt_len] = -100
+        for row_idx, prefix_len in enumerate(response_prefix_lengths.tolist()):
+            labels[row_idx, :prefix_len] = -100
 
         return SupervisedBatch(
             input_ids=encoded_full["input_ids"],

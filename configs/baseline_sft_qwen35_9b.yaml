@@ -3,6 +3,7 @@
 model:
   name: Qwen3.5-9B
   path: ../models/Qwen3.5-9B
+  chat_template_enable_thinking: true
   device_map: auto
   torch_dtype: auto
   runtime_backend: ""
@@ -33,7 +34,7 @@ optim:
   learning_rate: 0.0003
   weight_decay: 0.0
   max_length: 1024
-  max_new_tokens: 64
+  max_new_tokens: 512
   log_every_steps: 10
 
 output:

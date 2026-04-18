@@ -24,7 +24,7 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 256
+    max_new_tokens: 1024
   mmlu:
     path: ../data/benchmarks/mmlu
     split: test
@@ -32,7 +32,7 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 512
+    max_new_tokens: 1024
   gsm8k:
     path: ../data/benchmarks/gsm8k
     split: test

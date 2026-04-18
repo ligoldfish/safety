@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import multiprocessing as mp
 import re
+import textwrap
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
@@ -15,11 +17,14 @@ from src.baselines.config import AdapterConfig, BaselineModelConfig
 from src.baselines.datasets import (
     CodeExample,
     GSM8KExample,
+    extract_official_gsm8k_prediction,
+    extract_official_mmlu_prediction,
     extract_multiple_choice_prediction,
     extract_prediction_number,
+    normalize_numeric_answer,
     sanitize_code_generation,
 )
-from src.data.task_datasets import MCQExample, load_mcq_dataset, render_mcq_prompt
+from src.data.task_datasets import MCQExample, load_mcq_dataset
 from src.data.template_qwen import (
     build_qwen_messages,
     render_qwen_generation_prompt,
@@ -110,6 +115,7 @@ def _generate_text(
         **encoded,
         max_new_tokens=max_new_tokens,
         do_sample=False,
+        repetition_penalty=1.0,
         use_cache=True,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
@@ -197,6 +203,171 @@ def _continuation_nll(
     return float((loss_per_token * active_mask.to(loss_per_token.dtype)).sum().item())
 
 
+def _render_official_mmlu_chat_prompt(example: MCQExample) -> str:
+    option_labels = [chr(ord("A") + idx) for idx in range(len(example.choices))]
+    option_lines = "\n".join(
+        f"{label}. {choice}"
+        for label, choice in zip(option_labels, example.choices)
+    )
+    return (
+        "The following is a multiple-choice question. "
+        "Please choose the most suitable one among A, B, C and D as the answer to this question.\n\n"
+        f"{example.question}\n{option_lines}"
+    )
+
+
+def _safe_numeric_eval(text: str) -> float:
+    candidate = str(text).strip().replace(",", "")
+    if not candidate:
+        raise ValueError("empty numeric expression")
+    if not re.fullmatch(r"[0-9eE\.\+\-\(\)\/ ]+", candidate):
+        raise ValueError(f"unsupported numeric expression: {text}")
+    return float(eval(candidate, {"__builtins__": {}}, {}))
+
+
+def _gsm8k_answers_match(target: str, prediction: str) -> bool:
+    if not target or not prediction:
+        return False
+    try:
+        return math.isclose(
+            _safe_numeric_eval(target),
+            _safe_numeric_eval(prediction),
+            abs_tol=1e-4,
+        )
+    except Exception:
+        return normalize_numeric_answer(target) == normalize_numeric_answer(prediction)
+
+
+def _build_humaneval_official_prompt(example: CodeExample) -> str:
+    prompt_text = str(example.prompt)
+    signature_match = re.search(
+        rf"def\s+({re.escape(example.entry_point)}\s*\(.*?\))\s*:",
+        prompt_text,
+        flags=re.DOTALL,
+    )
+    signature = signature_match.group(1).strip() if signature_match else f"{example.entry_point}(...)"
+    description_match = re.search(
+        r'"""(.*?)"""|\'\'\'(.*?)\'\'\'',
+        prompt_text,
+        flags=re.DOTALL,
+    )
+    description = ""
+    if description_match:
+        description = description_match.group(1) or description_match.group(2) or ""
+        description = description.strip()
+    if not description:
+        description = prompt_text.strip()
+    return (
+        f"Write a Python function `{signature}` to solve the following problem:\n"
+        f"{description}\n"
+        f"{prompt_text}"
+    )
+
+
+def _extract_humaneval_completion(
+    generated_text: str,
+    entry_point: str,
+    *,
+    require_final_response: bool,
+) -> str:
+    final_text = strip_qwen_thinking_content(
+        generated_text,
+        require_final_response=require_final_response,
+    )
+    if not final_text:
+        return ""
+
+    fenced_def = re.search(
+        rf"```(?:python)?\s*def\s+{re.escape(entry_point)}\s*\(.*?\):\s*\n(.*?)```",
+        final_text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if fenced_def:
+        return fenced_def.group(1)
+
+    def_match = re.search(
+        rf"def\s+{re.escape(entry_point)}\s*\(.*?\):\s*\n(.*)",
+        final_text,
+        flags=re.DOTALL,
+    )
+    if def_match:
+        return def_match.group(1)
+
+    fenced = re.search(
+        r"```(?:python)?\s*(.*?)```",
+        final_text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if fenced:
+        fenced_text = fenced.group(1).strip("\n")
+        if re.search(rf"def\s+{re.escape(entry_point)}\s*\(", fenced_text):
+            nested_match = re.search(
+                rf"def\s+{re.escape(entry_point)}\s*\(.*?\):\s*\n(.*)",
+                fenced_text,
+                flags=re.DOTALL,
+            )
+            if nested_match:
+                return nested_match.group(1)
+        return textwrap.indent(fenced_text, "    ")
+
+    stripped = sanitize_code_generation(
+        final_text,
+        require_final_response=False,
+    )
+    if not stripped:
+        return ""
+    return textwrap.indent(stripped, "    ")
+
+
+def _build_mbpp_officialish_prompt(example: CodeExample) -> str:
+    if example.entry_point:
+        return (
+            f"Write a Python function `{example.entry_point}` to solve the following problem:\n"
+            f"{example.prompt}"
+        )
+    return (
+        "Write Python code to solve the following problem. "
+        "Return only Python code.\n"
+        f"{example.prompt}"
+    )
+
+
+def _extract_mbpp_code(
+    generated_text: str,
+    entry_point: str,
+    *,
+    require_final_response: bool,
+) -> str:
+    final_text = strip_qwen_thinking_content(
+        generated_text,
+        require_final_response=require_final_response,
+    )
+    if not final_text:
+        return ""
+
+    fenced = re.findall(
+        r"```(?:python)?\s*(.*?)```",
+        final_text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if fenced:
+        final_text = max(fenced, key=len).strip()
+
+    if entry_point:
+        entry_match = re.search(
+            rf"(def\s+{re.escape(entry_point)}\s*\(.*)",
+            final_text,
+            flags=re.DOTALL,
+        )
+        if entry_match:
+            return entry_match.group(1).strip()
+
+    generic_def = re.search(r"(def\s+[A-Za-z_][A-Za-z0-9_]*\s*\(.*)", final_text, flags=re.DOTALL)
+    if generic_def:
+        return generic_def.group(1).strip()
+    return sanitize_code_generation(final_text, require_final_response=False)
+
+
 def evaluate_mcq(
     model: Any,
     tokenizer: Any,
@@ -210,14 +381,14 @@ def evaluate_mcq(
     predictions: List[Dict[str, Any]] = []
     use_thinking_generation = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
     for example in examples:
-        prompt = render_mcq_prompt(example)
+        prompt = _render_official_mmlu_chat_prompt(example)
         option_labels = [chr(ord("A") + idx) for idx in range(len(example.choices))]
+        choice_map = {
+            label: str(choice)
+            for label, choice in zip(option_labels, example.choices)
+        }
         if use_thinking_generation:
-            user_text = (
-                f"{prompt}\n\n"
-                "Think step by step. In your final response after reasoning, "
-                'output only a JSON object in the format {"answer": "A"} with a single capital letter.'
-            )
+            user_text = prompt
             prompt_text = render_qwen_generation_prompt(
                 tokenizer,
                 build_qwen_messages(user_text),
@@ -234,7 +405,11 @@ def evaluate_mcq(
                 generated_text,
                 require_final_response=True,
             )
-            predicted_label = extract_multiple_choice_prediction(final_text, option_labels)
+            predicted_label = extract_official_mmlu_prediction(
+                final_text,
+                option_labels,
+                choice_map,
+            )
             predicted_index = option_labels.index(predicted_label) if predicted_label in option_labels else -1
             is_correct = int(predicted_index == int(example.answer_index))
             correct += is_correct
@@ -249,6 +424,7 @@ def evaluate_mcq(
                     "correct": bool(is_correct),
                     "generated_text": generated_text,
                     "final_text": final_text,
+                    "choice_map": choice_map,
                 }
             )
             continue
@@ -308,11 +484,7 @@ def evaluate_gsm8k(
     predictions: List[Dict[str, Any]] = []
     require_final_response = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
     for example in examples:
-        user_text = (
-            "Solve the following grade-school math problem. "
-            "Show your reasoning briefly and end with 'Final answer: <number>'.\n\n"
-            f"Question: {example.question}"
-        )
+        user_text = example.question
         prompt_text = render_qwen_generation_prompt(
             tokenizer,
             build_qwen_messages(user_text),
@@ -329,8 +501,8 @@ def evaluate_gsm8k(
             generated_text,
             require_final_response=require_final_response,
         )
-        prediction = extract_prediction_number(final_text)
-        is_correct = int(prediction == example.final_answer)
+        prediction = extract_official_gsm8k_prediction(final_text)
+        is_correct = int(_gsm8k_answers_match(example.final_answer, prediction))
         correct += is_correct
         predictions.append(
             {
@@ -424,31 +596,21 @@ def _truncate_to_longest_python_prefix(text: str) -> str:
 
 def _assemble_humaneval_program(example: CodeExample, generated_text: str) -> str:
     require_final_response = bool(getattr(example, "requires_final_response", False))
-    completion = sanitize_code_generation(
+    completion = _extract_humaneval_completion(
         generated_text,
+        example.entry_point,
         require_final_response=require_final_response,
     )
-    stripped_completion = completion.lstrip()
-    prompt_text = example.prompt.rstrip()
-    if stripped_completion.startswith(prompt_text.lstrip()):
-        candidate_code = completion
-    elif example.entry_point and re.search(
-        rf"def\s+{re.escape(example.entry_point)}\s*\(",
-        completion,
-    ):
-        candidate_code = completion
-    else:
-        candidate_code = prompt_text + completion
-    candidate_code = _trim_to_code_start(candidate_code)
-    candidate_code = _truncate_to_longest_python_prefix(candidate_code)
+    candidate_code = _truncate_to_longest_python_prefix(str(example.prompt) + completion)
     tests_blob = "\n\n".join(example.tests)
     return f"{candidate_code}\n\n{tests_blob}\n\ncheck({example.entry_point})\n"
 
 
 def _assemble_mbpp_program(example: CodeExample, generated_text: str) -> str:
     require_final_response = bool(getattr(example, "requires_final_response", False))
-    candidate_code = sanitize_code_generation(
+    candidate_code = _extract_mbpp_code(
         generated_text,
+        example.entry_point,
         require_final_response=require_final_response,
     )
     candidate_code = _trim_to_code_start(candidate_code)
@@ -477,17 +639,9 @@ def evaluate_code_generation(
     for example in examples:
         setattr(example, "requires_final_response", require_final_response)
         if dataset_key == "humaneval":
-            user_text = (
-                "Complete the following Python function. "
-                "After reasoning, your final response must contain only Python code with no markdown fences and no commentary.\n\n"
-                f"{example.prompt}"
-            )
+            user_text = _build_humaneval_official_prompt(example)
         elif dataset_key == "mbpp":
-            user_text = (
-                "Write Python code that solves the following task. "
-                "After reasoning, your final response must contain only Python code with no markdown fences and no commentary.\n\n"
-                f"{example.prompt}"
-            )
+            user_text = _build_mbpp_officialish_prompt(example)
         else:
             raise ValueError(f"Unsupported code dataset: {dataset_name}")
 
@@ -532,6 +686,10 @@ def evaluate_code_generation(
                 "error": error_text,
                 "generated_text": generated_text,
                 "sanitized_code": sanitize_code_generation(
+                    generated_text,
+                    require_final_response=require_final_response,
+                ),
+                "final_text": strip_qwen_thinking_content(
                     generated_text,
                     require_final_response=require_final_response,
                 ),

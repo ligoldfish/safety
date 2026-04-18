@@ -214,6 +214,7 @@ def _evaluate_variant(
         "num_harmful": generation_metrics["num_harmful"],
         "num_harmless": generation_metrics["num_harmless"],
         "harmful_refusal_rate": generation_metrics["harmful_refusal_rate"],
+        "harmful_safe_response_rate": generation_metrics["harmful_safe_response_rate"],
         "harmful_unsafe_output_rate": generation_metrics["harmful_unsafe_output_rate"],
         "harmless_over_refusal_rate": generation_metrics["harmless_over_refusal_rate"],
         "layer_target_cosine_mean": layer_target_cosine_mean,
@@ -224,6 +225,7 @@ def _evaluate_variant(
 def _write_comparison_csv(path: Path, baseline: Dict[str, Any], semalign: Dict[str, Any]) -> None:
     metric_names = [
         "harmful_refusal_rate",
+        "harmful_safe_response_rate",
         "harmful_unsafe_output_rate",
         "harmless_over_refusal_rate",
         "layer_target_cosine_mean",
@@ -311,6 +313,7 @@ def main() -> None:
         "variant_complete",
         variant="baseline",
         harmful_refusal_rate=baseline_results["harmful_refusal_rate"],
+        harmful_safe_response_rate=baseline_results["harmful_safe_response_rate"],
         harmful_unsafe_output_rate=baseline_results["harmful_unsafe_output_rate"],
         harmless_over_refusal_rate=baseline_results["harmless_over_refusal_rate"],
         layer_target_cosine_mean=baseline_results["layer_target_cosine_mean"],
@@ -337,6 +340,7 @@ def main() -> None:
         "variant_complete",
         variant="semalign",
         harmful_refusal_rate=semalign_results["harmful_refusal_rate"],
+        harmful_safe_response_rate=semalign_results["harmful_safe_response_rate"],
         harmful_unsafe_output_rate=semalign_results["harmful_unsafe_output_rate"],
         harmless_over_refusal_rate=semalign_results["harmless_over_refusal_rate"],
         layer_target_cosine_mean=semalign_results["layer_target_cosine_mean"],
@@ -379,12 +383,14 @@ def main() -> None:
             {
                 "baseline": {
                     "harmful_refusal_rate": baseline_results["harmful_refusal_rate"],
+                    "harmful_safe_response_rate": baseline_results["harmful_safe_response_rate"],
                     "harmful_unsafe_output_rate": baseline_results["harmful_unsafe_output_rate"],
                     "harmless_over_refusal_rate": baseline_results["harmless_over_refusal_rate"],
                     "layer_target_cosine_mean": baseline_results["layer_target_cosine_mean"],
                 },
                 "semalign": {
                     "harmful_refusal_rate": semalign_results["harmful_refusal_rate"],
+                    "harmful_safe_response_rate": semalign_results["harmful_safe_response_rate"],
                     "harmful_unsafe_output_rate": semalign_results["harmful_unsafe_output_rate"],
                     "harmless_over_refusal_rate": semalign_results["harmless_over_refusal_rate"],
                     "layer_target_cosine_mean": semalign_results["layer_target_cosine_mean"],

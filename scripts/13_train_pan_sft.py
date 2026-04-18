@@ -228,6 +228,7 @@ def main() -> None:
         epoch_metrics = {
             "val_loss": val_loss,
             "harmful_refusal_rate": generation_metrics["harmful_refusal_rate"],
+            "harmful_safe_response_rate": generation_metrics["harmful_safe_response_rate"],
             "harmful_unsafe_output_rate": generation_metrics["harmful_unsafe_output_rate"],
             "harmless_over_refusal_rate": generation_metrics["harmless_over_refusal_rate"],
             "num_harmful": generation_metrics["num_harmful"],

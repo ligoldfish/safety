@@ -67,7 +67,7 @@ def load_hf_model(
     model_path: str,
     device_map: str = "auto",
     torch_dtype: str = "auto",
-    chat_template_enable_thinking: bool | None = None,
+    chat_template_enable_thinking: bool = True,
     runtime_backend: str = "",
     runtime_device: str = "",
     trust_remote_code: bool = True,
@@ -76,6 +76,9 @@ def load_hf_model(
 ) -> Tuple[Any, Any, Dict[str, Any]]:
     resolved = Path(model_path)
     model_ref = str(resolved if resolved.exists() else model_path)
+    if chat_template_enable_thinking is False:
+        raise ValueError("Non-thinking mode is no longer supported for Qwen3.5 models.")
+    thinking_enabled = bool(chat_template_enable_thinking)
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_ref,
@@ -88,7 +91,7 @@ def load_hf_model(
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    setattr(tokenizer, "_codex_chat_template_enable_thinking", chat_template_enable_thinking)
+    setattr(tokenizer, "_codex_chat_template_enable_thinking", thinking_enabled)
 
     runtime = _resolve_runtime(runtime_backend=runtime_backend, runtime_device=runtime_device)
     model_kwargs: Dict[str, Any] = {
@@ -110,6 +113,6 @@ def load_hf_model(
     setattr(model, "_codex_runtime_backend", runtime["backend"] or str(device_map))
     setattr(model, "_codex_runtime_device", str(runtime["device"]) if runtime["device"] is not None else str(device_map))
     setattr(model, "_codex_xla_model", runtime["xla_model"])
-    setattr(model, "_codex_chat_template_enable_thinking", chat_template_enable_thinking)
+    setattr(model, "_codex_chat_template_enable_thinking", thinking_enabled)
     model.eval()
     return tokenizer, model, extract_model_meta(model)
