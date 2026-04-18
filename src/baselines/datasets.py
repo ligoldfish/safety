@@ -8,6 +8,25 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List
 
+from src.data.template_qwen import strip_qwen_thinking_content
+
+try:
+    from datasets import load_from_disk as hf_load_from_disk
+except Exception:
+    hf_load_from_disk = None
+
+
+HF_DATASET_METADATA_FILES = {
+    "dataset_dict.json",
+    "dataset_info.json",
+    "state.json",
+}
+MBPP_STANDARD_TEST_START_TASK_ID = 11
+MBPP_STANDARD_TEST_END_TASK_ID = 510
+MBPP_STANDARD_TEST_SIZE = (
+    MBPP_STANDARD_TEST_END_TASK_ID - MBPP_STANDARD_TEST_START_TASK_ID + 1
+)
+
 
 @dataclass
 class GSM8KExample:
@@ -63,6 +82,20 @@ def _load_rows_from_path(path: Path, split: str) -> List[Dict[str, Any]]:
             return _read_parquet(path)
         raise ValueError(f"Unsupported file format: {path}")
 
+    dataset_dict_marker = path / "dataset_dict.json"
+    dataset_info_marker = path / "dataset_info.json"
+    state_marker = path / "state.json"
+    if dataset_dict_marker.exists() or (dataset_info_marker.exists() and state_marker.exists()):
+        if hf_load_from_disk is None:
+            raise RuntimeError("datasets is required to read HuggingFace save_to_disk datasets")
+        loaded = hf_load_from_disk(str(path))
+        if hasattr(loaded, "keys"):
+            split_name = split if split in loaded else next(iter(loaded.keys()), None)
+            if split_name is None:
+                return []
+            return list(loaded[split_name])
+        return list(loaded)
+
     split_candidates = [
         path / f"{split}.jsonl",
         path / f"{split}.json",
@@ -78,12 +111,56 @@ def _load_rows_from_path(path: Path, split: str) -> List[Dict[str, Any]]:
     if rows:
         return rows
     for candidate in sorted(path.rglob("*.json")):
+        if candidate.name in HF_DATASET_METADATA_FILES:
+            continue
         rows.extend(_read_json(candidate))
     if rows:
         return rows
     for candidate in sorted(path.rglob("*.parquet")):
         rows.extend(_read_parquet(candidate))
     return rows
+
+
+def _extract_mbpp_task_id(row: Dict[str, Any]) -> int | None:
+    raw_value = row.get("task_id", row.get("id"))
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, int):
+        return raw_value
+    match = re.search(r"\d+", str(raw_value))
+    if not match:
+        return None
+    return int(match.group(0))
+
+
+def _resolve_mbpp_test_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    split_key_candidates = ("split", "subset", "partition", "source_split")
+    split_rows = [
+        row
+        for row in rows
+        if any(str(row.get(key, "")).strip().lower() == "test" for key in split_key_candidates)
+    ]
+    if len(split_rows) == MBPP_STANDARD_TEST_SIZE:
+        return split_rows
+
+    task_rows: List[tuple[int, Dict[str, Any]]] = []
+    for row in rows:
+        task_id = _extract_mbpp_task_id(row)
+        if task_id is None:
+            continue
+        if MBPP_STANDARD_TEST_START_TASK_ID <= task_id <= MBPP_STANDARD_TEST_END_TASK_ID:
+            task_rows.append((task_id, row))
+    if len(task_rows) == MBPP_STANDARD_TEST_SIZE:
+        task_rows.sort(key=lambda item: item[0])
+        return [row for _, row in task_rows]
+
+    if len(rows) == MBPP_STANDARD_TEST_SIZE:
+        return rows
+
+    raise ValueError(
+        "MBPP test split should resolve to exactly 500 rows. "
+        f"Loaded {len(rows)} rows instead."
+    )
 
 
 def normalize_numeric_answer(text: str) -> str:
@@ -140,6 +217,38 @@ def extract_prediction_number(text: str) -> str:
     if not matches:
         return ""
     return normalize_numeric_answer(matches[-1])
+
+
+def extract_multiple_choice_prediction(
+    text: str,
+    option_labels: List[str],
+) -> str:
+    answer_text = str(text).strip()
+    if not answer_text:
+        return ""
+
+    option_set = {str(label).upper() for label in option_labels}
+    patterns = [
+        r'"answer"\s*:\s*"([A-Z])"',
+        r"'answer'\s*:\s*'([A-Z])'",
+        r"\banswer\s*[:=]\s*['\"]?([A-Z])['\"]?\b",
+        r"\boption\s*[:=]?\s*([A-Z])\b",
+        r"^\s*([A-Z])\s*$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, answer_text, flags=re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        candidate = match.group(1).upper()
+        if candidate in option_set:
+            return candidate
+
+    cleaned = re.sub(r"[^A-Za-z]", " ", answer_text).split()
+    for token in cleaned:
+        candidate = token.upper()
+        if candidate in option_set:
+            return candidate
+    return ""
 
 
 def load_gsm8k_examples(
@@ -199,11 +308,13 @@ def load_code_examples(
         raise FileNotFoundError(f"Dataset path not found: {data_path}")
 
     rows = _load_rows_from_path(path, split)
+    name = str(dataset_name).strip().lower()
+    if name == "mbpp" and str(split).strip().lower() == "test":
+        rows = _resolve_mbpp_test_rows(rows)
     if max_samples > 0:
         rows = rows[:max_samples]
 
     examples: List[CodeExample] = []
-    name = str(dataset_name).strip().lower()
     for idx, row in enumerate(rows):
         task_id = str(row.get("task_id") or row.get("id") or f"{name}_{idx:06d}")
         if name == "humaneval":
@@ -233,10 +344,23 @@ def load_code_examples(
     return examples
 
 
-def sanitize_code_generation(text: str) -> str:
-    code = str(text).strip()
+def sanitize_code_generation(
+    text: str,
+    *,
+    require_final_response: bool = False,
+) -> str:
+    code = strip_qwen_thinking_content(
+        str(text),
+        require_final_response=require_final_response,
+    )
     fenced = re.findall(r"```(?:python)?\s*(.*?)```", code, flags=re.DOTALL | re.IGNORECASE)
     if fenced:
         code = max(fenced, key=len).strip()
     code = re.sub(r"^python\s*", "", code, flags=re.IGNORECASE)
+    code = re.sub(
+        r"^(?:sure[,!: ]*|here(?:'s| is)(?: the)? code[:：]?\s*|the code is[:：]?\s*|final code[:：]?\s*)",
+        "",
+        code,
+        flags=re.IGNORECASE,
+    )
     return code.strip()

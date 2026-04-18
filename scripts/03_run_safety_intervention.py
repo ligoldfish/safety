@@ -197,6 +197,7 @@ def main() -> None:
         model_path=cfg.model.path,
         device_map=cfg.model.device_map,
         torch_dtype=cfg.model.torch_dtype,
+        chat_template_enable_thinking=cfg.model.chat_template_enable_thinking,
         runtime_backend=cfg.model.runtime_backend,
         runtime_device=cfg.model.runtime_device,
         trust_remote_code=cfg.model.trust_remote_code,

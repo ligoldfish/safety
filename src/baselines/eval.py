@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import multiprocessing as mp
 import re
@@ -14,11 +15,16 @@ from src.baselines.config import AdapterConfig, BaselineModelConfig
 from src.baselines.datasets import (
     CodeExample,
     GSM8KExample,
+    extract_multiple_choice_prediction,
     extract_prediction_number,
     sanitize_code_generation,
 )
 from src.data.task_datasets import MCQExample, load_mcq_dataset, render_mcq_prompt
-from src.data.template_qwen import build_qwen_messages, render_qwen_generation_prompt
+from src.data.template_qwen import (
+    build_qwen_messages,
+    render_qwen_generation_prompt,
+    strip_qwen_thinking_content,
+)
 from src.models import inject_lora_modules_by_names
 from src.models.hf_loader import load_hf_model
 from src.training import evaluate_generation_refusal_metrics
@@ -32,6 +38,7 @@ def load_model_for_evaluation(
         model_path=model_cfg.path,
         device_map=model_cfg.device_map,
         torch_dtype=model_cfg.torch_dtype,
+        chat_template_enable_thinking=model_cfg.chat_template_enable_thinking,
         runtime_backend=model_cfg.runtime_backend,
         runtime_device=model_cfg.runtime_device,
         trust_remote_code=model_cfg.trust_remote_code,
@@ -104,6 +111,7 @@ def _generate_text(
         max_new_tokens=max_new_tokens,
         do_sample=False,
         use_cache=True,
+        eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     )
     if runtime_backend == "tpu" and xla_model is not None:
@@ -195,17 +203,60 @@ def evaluate_mcq(
     examples: Sequence[MCQExample],
     *,
     max_length: int,
+    max_new_tokens: int,
 ) -> Dict[str, Any]:
     device = _resolve_device(model)
     correct = 0
     predictions: List[Dict[str, Any]] = []
+    use_thinking_generation = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
     for example in examples:
         prompt = render_mcq_prompt(example)
+        option_labels = [chr(ord("A") + idx) for idx in range(len(example.choices))]
+        if use_thinking_generation:
+            user_text = (
+                f"{prompt}\n\n"
+                "Think step by step. In your final response after reasoning, "
+                'output only a JSON object in the format {"answer": "A"} with a single capital letter.'
+            )
+            prompt_text = render_qwen_generation_prompt(
+                tokenizer,
+                build_qwen_messages(user_text),
+            )
+            generated_text = _generate_text(
+                model,
+                tokenizer,
+                prompt_text,
+                device=device,
+                max_length=max_length,
+                max_new_tokens=max_new_tokens,
+            )
+            final_text = strip_qwen_thinking_content(
+                generated_text,
+                require_final_response=True,
+            )
+            predicted_label = extract_multiple_choice_prediction(final_text, option_labels)
+            predicted_index = option_labels.index(predicted_label) if predicted_label in option_labels else -1
+            is_correct = int(predicted_index == int(example.answer_index))
+            correct += is_correct
+            predictions.append(
+                {
+                    "id": example.sample_id,
+                    "subject": example.subject,
+                    "question": example.question,
+                    "choices": list(example.choices),
+                    "prediction": predicted_label,
+                    "target": option_labels[int(example.answer_index)],
+                    "correct": bool(is_correct),
+                    "generated_text": generated_text,
+                    "final_text": final_text,
+                }
+            )
+            continue
+
         prompt_text = render_qwen_generation_prompt(
             tokenizer,
             build_qwen_messages(prompt),
         )
-        option_labels = [chr(ord("A") + idx) for idx in range(len(example.choices))]
         scores = {
             label: -_continuation_nll(
                 model,
@@ -225,6 +276,8 @@ def evaluate_mcq(
             {
                 "id": example.sample_id,
                 "subject": example.subject,
+                "question": example.question,
+                "choices": list(example.choices),
                 "prediction": predicted_label,
                 "target": option_labels[int(example.answer_index)],
                 "correct": bool(is_correct),
@@ -253,6 +306,7 @@ def evaluate_gsm8k(
     device = _resolve_device(model)
     correct = 0
     predictions: List[Dict[str, Any]] = []
+    require_final_response = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
     for example in examples:
         user_text = (
             "Solve the following grade-school math problem. "
@@ -271,16 +325,22 @@ def evaluate_gsm8k(
             max_length=max_length,
             max_new_tokens=max_new_tokens,
         )
-        prediction = extract_prediction_number(generated_text)
+        final_text = strip_qwen_thinking_content(
+            generated_text,
+            require_final_response=require_final_response,
+        )
+        prediction = extract_prediction_number(final_text)
         is_correct = int(prediction == example.final_answer)
         correct += is_correct
         predictions.append(
             {
                 "id": example.sample_id,
+                "question": example.question,
                 "prediction": prediction,
                 "target": example.final_answer,
                 "correct": bool(is_correct),
                 "generated_text": generated_text,
+                "final_text": final_text,
             }
         )
 
@@ -325,8 +385,49 @@ def _run_code_program(program: str, timeout_seconds: int) -> tuple[bool, str]:
     return bool(result.get("passed", False)), str(result.get("error", ""))
 
 
+def _trim_to_code_start(text: str) -> str:
+    lines = str(text).splitlines()
+    code_start_patterns = [
+        r"^\s*@",
+        r"^\s*def\b",
+        r"^\s*class\b",
+        r"^\s*(?:from|import)\b",
+        r"^\s*(?:if|for|while|try|with)\b",
+        r"^\s*(?:return|pass|raise|yield|assert)\b",
+        r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=",
+    ]
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(re.match(pattern, line) for pattern in code_start_patterns):
+            return "\n".join(lines[idx:]).strip()
+    return str(text).strip()
+
+
+def _truncate_to_longest_python_prefix(text: str) -> str:
+    candidate = str(text).strip()
+    if not candidate:
+        return ""
+    lines = candidate.splitlines()
+    for end_idx in range(len(lines), 0, -1):
+        prefix = "\n".join(lines[:end_idx]).rstrip()
+        if not prefix.strip():
+            continue
+        try:
+            ast.parse(prefix)
+        except SyntaxError:
+            continue
+        return prefix
+    return candidate
+
+
 def _assemble_humaneval_program(example: CodeExample, generated_text: str) -> str:
-    completion = sanitize_code_generation(generated_text)
+    require_final_response = bool(getattr(example, "requires_final_response", False))
+    completion = sanitize_code_generation(
+        generated_text,
+        require_final_response=require_final_response,
+    )
     stripped_completion = completion.lstrip()
     prompt_text = example.prompt.rstrip()
     if stripped_completion.startswith(prompt_text.lstrip()):
@@ -338,12 +439,20 @@ def _assemble_humaneval_program(example: CodeExample, generated_text: str) -> st
         candidate_code = completion
     else:
         candidate_code = prompt_text + completion
+    candidate_code = _trim_to_code_start(candidate_code)
+    candidate_code = _truncate_to_longest_python_prefix(candidate_code)
     tests_blob = "\n\n".join(example.tests)
     return f"{candidate_code}\n\n{tests_blob}\n\ncheck({example.entry_point})\n"
 
 
 def _assemble_mbpp_program(example: CodeExample, generated_text: str) -> str:
-    candidate_code = sanitize_code_generation(generated_text)
+    require_final_response = bool(getattr(example, "requires_final_response", False))
+    candidate_code = sanitize_code_generation(
+        generated_text,
+        require_final_response=require_final_response,
+    )
+    candidate_code = _trim_to_code_start(candidate_code)
+    candidate_code = _truncate_to_longest_python_prefix(candidate_code)
     tests_blob = "\n".join(example.tests)
     return f"{candidate_code}\n\n{tests_blob}\n"
 
@@ -363,18 +472,20 @@ def evaluate_code_generation(
     executable = 0
     predictions: List[Dict[str, Any]] = []
     dataset_key = str(dataset_name).strip().lower()
+    require_final_response = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
 
     for example in examples:
+        setattr(example, "requires_final_response", require_final_response)
         if dataset_key == "humaneval":
             user_text = (
                 "Complete the following Python function. "
-                "Return only Python code with no markdown fences.\n\n"
+                "After reasoning, your final response must contain only Python code with no markdown fences and no commentary.\n\n"
                 f"{example.prompt}"
             )
         elif dataset_key == "mbpp":
             user_text = (
                 "Write Python code that solves the following task. "
-                "Return only Python code with no markdown fences.\n\n"
+                "After reasoning, your final response must contain only Python code with no markdown fences and no commentary.\n\n"
                 f"{example.prompt}"
             )
         else:
@@ -397,6 +508,8 @@ def evaluate_code_generation(
                 predictions.append(
                     {
                         "task_id": example.task_id,
+                        "prompt": example.prompt,
+                        "entry_point": example.entry_point,
                         "passed": False,
                         "error": "Missing entry_point",
                         "generated_text": generated_text,
@@ -413,10 +526,16 @@ def evaluate_code_generation(
         predictions.append(
             {
                 "task_id": example.task_id,
+                "prompt": example.prompt,
+                "entry_point": example.entry_point,
                 "passed": bool(task_passed),
                 "error": error_text,
                 "generated_text": generated_text,
-                "sanitized_code": sanitize_code_generation(generated_text),
+                "sanitized_code": sanitize_code_generation(
+                    generated_text,
+                    require_final_response=require_final_response,
+                ),
+                "assembled_program": program,
             }
         )
 

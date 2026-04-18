@@ -13,6 +13,7 @@ class BaselineModelConfig:
     path: str
     device_map: str = "auto"
     torch_dtype: str = "auto"
+    chat_template_enable_thinking: bool | None = None
     runtime_backend: str = ""
     runtime_device: str = ""
     trust_remote_code: bool = True

@@ -9,7 +9,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from src.data.template_qwen import render_qwen_generation_prompt, render_qwen_supervised_text
+from src.data.template_qwen import (
+    render_qwen_generation_prompt,
+    render_qwen_supervised_text,
+    strip_qwen_thinking_content,
+)
 from src.training.eval_utils import looks_like_refusal, mean
 from src.training.losses import cosine_layer_alignment_loss
 from src.utils.io import ensure_dir, read_jsonl, write_json
@@ -331,12 +335,17 @@ def evaluate_generation_refusal_metrics(
             max_new_tokens=max_new_tokens,
             do_sample=False,
             use_cache=True,
+            eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
         )
         if runtime_backend == "tpu" and xla_model is not None:
             xla_model.mark_step()
         new_tokens = generated[0, encoded["input_ids"].size(1):]
-        text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        raw_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        text = strip_qwen_thinking_content(
+            raw_text,
+            require_final_response=bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False)),
+        )
         is_refusal = looks_like_refusal(text)
         label = str(record["label"])
         if label == "harmful":
@@ -346,7 +355,14 @@ def evaluate_generation_refusal_metrics(
         elif label == "harmless":
             harmless_total += 1
             harmless_refusals += int(is_refusal)
-        generations.append({"id": str(record["id"]), "label": label, "generated_text": text})
+        generations.append(
+            {
+                "id": str(record["id"]),
+                "label": label,
+                "generated_text": raw_text,
+                "final_text": text,
+            }
+        )
     tokenizer.padding_side = previous_padding_side
 
     return {

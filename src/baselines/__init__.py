@@ -20,6 +20,7 @@ from .datasets import (
     normalize_numeric_answer,
     sanitize_code_generation,
 )
+from .debug import collect_error_predictions, export_error_predictions
 from .eval import (
     evaluate_code_generation,
     evaluate_gsm8k,
@@ -51,10 +52,12 @@ __all__ = [
     "SupervisedBatch",
     "SupervisedCollator",
     "build_supervised_dataloader",
+    "collect_error_predictions",
     "evaluate_code_generation",
     "evaluate_gsm8k",
     "evaluate_mcq",
     "evaluate_pan",
+    "export_error_predictions",
     "extract_prediction_number",
     "extract_reference_number",
     "forward_distill_batch",

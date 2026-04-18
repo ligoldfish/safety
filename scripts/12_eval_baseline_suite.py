@@ -16,6 +16,7 @@ from src.baselines import (
     evaluate_gsm8k,
     evaluate_mcq,
     evaluate_pan,
+    export_error_predictions,
     load_code_examples,
     load_eval_config,
     load_gsm8k_examples,
@@ -84,6 +85,7 @@ def main() -> None:
 
     tokenizer, model = load_model_for_evaluation(cfg.model, adapter)
     results: dict[str, dict] = {}
+    debug_outputs: dict[str, dict] = {}
 
     pan_cfg = cfg.datasets.pan
     try:
@@ -134,6 +136,7 @@ def main() -> None:
                 tokenizer,
                 mmlu_examples,
                 max_length=cfg.runtime.max_length,
+                max_new_tokens=mmlu_cfg.max_new_tokens,
             )
     except Exception as exc:
         if mmlu_cfg.placeholder_ok:
@@ -235,6 +238,15 @@ def main() -> None:
             raise
     write_json(output_root / "mbpp_results.json", results["mbpp"])
 
+    for task_name in ("mmlu", "gsm8k", "humaneval", "mbpp"):
+        debug_summary = export_error_predictions(
+            output_root,
+            task_name,
+            results.get(task_name, {}),
+        )
+        if debug_summary is not None:
+            debug_outputs[task_name] = debug_summary
+
     summary = {
         "config_path": str(Path(args.config).resolve()),
         "model_name": cfg.model.name,
@@ -249,6 +261,7 @@ def main() -> None:
             }
             for task_name, task_result in results.items()
         },
+        "debug_outputs": debug_outputs,
         "log_path": str(log_path),
     }
     write_json(output_root / "summary.json", summary)
