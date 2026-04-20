@@ -298,6 +298,7 @@ def main() -> None:
             device=student_device,
             max_length=cfg.optim.max_length,
             max_new_tokens=cfg.optim.max_new_tokens,
+            batch_size=micro_batch_size,
         )
         epoch_metrics = {
             **val_loss_metrics,

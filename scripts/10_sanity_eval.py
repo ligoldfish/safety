@@ -207,6 +207,7 @@ def _evaluate_variant(
         device=device,
         max_length=max_length,
         max_new_tokens=max_new_tokens,
+        batch_size=batch_size,
     )
     return {
         "variant": variant_name,

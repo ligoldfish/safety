@@ -4,7 +4,7 @@ model:
   name: Qwen3.5-9B
   path: ../models/Qwen3.5-9B
   device_map: ""
-  torch_dtype: float32
+  torch_dtype: bfloat16
   chat_template_enable_thinking: true
   runtime_backend: npu
   runtime_device: npu:0
@@ -25,6 +25,7 @@ datasets:
     enabled: true
     placeholder_ok: true
     max_new_tokens: 1024
+    initial_max_new_tokens: 384
   mmlu:
     path: ../data/benchmarks/mmlu
     split: test
@@ -32,7 +33,7 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 1024
+    max_new_tokens: 2048
   gsm8k:
     path: ../data/benchmarks/gsm8k
     split: test
@@ -40,7 +41,7 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 1024
+    max_new_tokens: 2048
   humaneval:
     path: ../data/benchmarks/humaneval
     split: test
@@ -48,7 +49,7 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 2048
+    max_new_tokens: 3072
     exec_timeout_seconds: 3
   mbpp:
     path: ../data/benchmarks/mbpp
@@ -57,12 +58,12 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 2048
+    max_new_tokens: 3072
     exec_timeout_seconds: 3
 
 runtime:
   max_length: 1024
-  batch_size: 1
+  batch_size: 2
 
 output:
   output_root: D:/outputs/baselines/no_sft_qwen35_9b_npu

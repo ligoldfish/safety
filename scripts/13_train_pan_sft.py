@@ -224,6 +224,7 @@ def main() -> None:
             device=device,
             max_length=cfg.optim.max_length,
             max_new_tokens=cfg.optim.max_new_tokens,
+            batch_size=micro_batch_size,
         )
         epoch_metrics = {
             "val_loss": val_loss,

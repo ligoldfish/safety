@@ -284,6 +284,7 @@ def main() -> None:
             device=device,
             max_length=cfg.optim.max_length,
             max_new_tokens=cfg.optim.max_new_tokens,
+            batch_size=micro_batch_size,
         )
         epoch_metrics = {
             "harmful_refusal_rate": generation_metrics["harmful_refusal_rate"],
