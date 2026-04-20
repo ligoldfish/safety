@@ -32,7 +32,7 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 1024
+    max_new_tokens: 2048
   gsm8k:
     path: ../data/benchmarks/gsm8k
     split: test
@@ -40,7 +40,7 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 1024
+    max_new_tokens: 2048
   humaneval:
     path: ../data/benchmarks/humaneval
     split: test
@@ -48,7 +48,7 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 2048
+    max_new_tokens: 3072
     exec_timeout_seconds: 3
   mbpp:
     path: ../data/benchmarks/mbpp
@@ -57,12 +57,12 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 2048
+    max_new_tokens: 3072
     exec_timeout_seconds: 3
 
 runtime:
   max_length: 1024
-  batch_size: 1
+  batch_size: 2
 
 output:
   output_root: D:/outputs/baselines/no_sft_qwen35_9b_tpu

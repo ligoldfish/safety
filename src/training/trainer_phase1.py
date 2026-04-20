@@ -309,6 +309,8 @@ def evaluate_generation_refusal_metrics(
     device: torch.device,
     max_length: int,
     max_new_tokens: int,
+    batch_size: int = 1,
+    initial_max_new_tokens: int = 0,
 ) -> Dict[str, Any]:
     harmful_total = 0
     harmless_total = 0
@@ -327,84 +329,138 @@ def evaluate_generation_refusal_metrics(
     xla_model = getattr(model, "_codex_xla_model", None)
     require_final_response = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
 
-    def _generate_response(prompt_text: str, *, generation_max_new_tokens: int) -> tuple[str, str]:
+    effective_batch_size = max(1, int(batch_size))
+    initial_generation_max_new_tokens = int(max_new_tokens)
+    if require_final_response and int(initial_max_new_tokens) > 0:
+        initial_generation_max_new_tokens = max(
+            1,
+            min(int(initial_max_new_tokens), int(max_new_tokens)),
+        )
+
+    def _generate_responses(
+        prompt_texts: Sequence[str],
+        *,
+        generation_max_new_tokens: int,
+    ) -> tuple[List[str], List[str]]:
+        if not prompt_texts:
+            return [], []
         encoded = tokenizer(
-            prompt_text,
+            list(prompt_texts),
             return_tensors="pt",
+            padding=True,
             truncation=True,
             max_length=max_length,
         )
         encoded = {key: value.to(device) for key, value in encoded.items()}
-        generated = model.generate(
-            **encoded,
-            max_new_tokens=generation_max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-        )
+        with torch.inference_mode():
+            generated = model.generate(
+                **encoded,
+                max_new_tokens=generation_max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
         if runtime_backend == "tpu" and xla_model is not None:
             xla_model.mark_step()
-        new_tokens = generated[0, encoded["input_ids"].size(1):]
-        raw_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-        final_text = strip_qwen_thinking_content(
-            raw_text,
-            require_final_response=require_final_response,
-        )
-        return raw_text, final_text
-
-    for record in records:
-        prompt_text = render_qwen_generation_prompt(tokenizer, record["messages"])
-        raw_text, text = _generate_response(prompt_text, generation_max_new_tokens=max_new_tokens)
-        used_max_new_tokens = int(max_new_tokens)
-        retried_for_final_response = False
-        if require_final_response and raw_text.strip() and not text:
-            retry_max_new_tokens = min(max(int(max_new_tokens) * 2, int(max_new_tokens) + 512), 4096)
-            if retry_max_new_tokens > int(max_new_tokens):
-                retried_for_final_response = True
-                used_max_new_tokens = retry_max_new_tokens
-                raw_text, text = _generate_response(prompt_text, generation_max_new_tokens=retry_max_new_tokens)
-        label = str(record["label"])
-        is_refusal: bool | None = None
-        is_safe: bool | None = None
-        safety_reason: str | None = None
-        incomplete_final_response = bool(require_final_response and raw_text.strip() and not text)
-        if label == "harmful":
-            if incomplete_final_response:
-                judgment = HarmfulResponseJudgment(
-                    is_refusal=False,
-                    is_safe=False,
-                    reason="incomplete_final_response",
+        prompt_width = int(encoded["input_ids"].size(1))
+        raw_texts: List[str] = []
+        final_texts: List[str] = []
+        for row_idx in range(len(prompt_texts)):
+            new_tokens = generated[row_idx, prompt_width:]
+            raw_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+            raw_texts.append(raw_text)
+            final_texts.append(
+                strip_qwen_thinking_content(
+                    raw_text,
+                    require_final_response=require_final_response,
                 )
-                harmful_incomplete += 1
-            else:
-                judgment = judge_harmful_response_safety(text)
-            harmful_total += 1
-            harmful_refusals += int(judgment.is_refusal)
-            harmful_safes += int(judgment.is_safe)
-            harmful_unsafes += int(not judgment.is_safe)
-            is_refusal = judgment.is_refusal
-            is_safe = judgment.is_safe
-            safety_reason = judgment.reason
-        elif label == "harmless":
-            is_refusal = looks_like_refusal(text)
-            harmless_total += 1
-            harmless_refusals += int(is_refusal)
-            harmless_incomplete += int(incomplete_final_response)
-        generations.append(
-            {
-                "id": str(record["id"]),
-                "label": label,
-                "generated_text": raw_text,
-                "final_text": text,
-                "is_refusal": is_refusal,
-                "is_safe": is_safe,
-                "safety_reason": safety_reason,
-                "incomplete_final_response": incomplete_final_response,
-                "retried_for_final_response": retried_for_final_response,
-                "used_max_new_tokens": used_max_new_tokens,
-            }
+            )
+        return raw_texts, final_texts
+
+    for batch_start in range(0, len(records), effective_batch_size):
+        batch_records = list(records[batch_start: batch_start + effective_batch_size])
+        prompt_texts = [
+            render_qwen_generation_prompt(tokenizer, record["messages"])
+            for record in batch_records
+        ]
+        raw_texts, final_texts = _generate_responses(
+            prompt_texts,
+            generation_max_new_tokens=initial_generation_max_new_tokens,
         )
+        used_max_new_tokens = [int(initial_generation_max_new_tokens)] * len(batch_records)
+        retried_for_final_response = [False] * len(batch_records)
+
+        if require_final_response:
+            retry_indexes = [
+                idx
+                for idx, (raw_text, final_text) in enumerate(zip(raw_texts, final_texts))
+                if raw_text.strip() and not final_text
+            ]
+            if retry_indexes:
+                if int(initial_generation_max_new_tokens) < int(max_new_tokens):
+                    retry_max_new_tokens = int(max_new_tokens)
+                else:
+                    retry_max_new_tokens = min(
+                        max(int(max_new_tokens) * 2, int(max_new_tokens) + 512),
+                        4096,
+                    )
+                if retry_max_new_tokens > int(initial_generation_max_new_tokens):
+                    retry_prompt_texts = [prompt_texts[idx] for idx in retry_indexes]
+                    retry_raw_texts, retry_final_texts = _generate_responses(
+                        retry_prompt_texts,
+                        generation_max_new_tokens=retry_max_new_tokens,
+                    )
+                    for local_idx, retry_idx in enumerate(retry_indexes):
+                        raw_texts[retry_idx] = retry_raw_texts[local_idx]
+                        final_texts[retry_idx] = retry_final_texts[local_idx]
+                        used_max_new_tokens[retry_idx] = int(retry_max_new_tokens)
+                        retried_for_final_response[retry_idx] = True
+
+        for row_idx, record in enumerate(batch_records):
+            raw_text = raw_texts[row_idx]
+            text = final_texts[row_idx]
+            label = str(record["label"])
+            is_refusal: bool | None = None
+            is_safe: bool | None = None
+            safety_reason: str | None = None
+            incomplete_final_response = bool(require_final_response and raw_text.strip() and not text)
+            if label == "harmful":
+                if incomplete_final_response:
+                    judgment = HarmfulResponseJudgment(
+                        is_refusal=False,
+                        is_safe=False,
+                        reason="incomplete_final_response",
+                    )
+                    harmful_incomplete += 1
+                else:
+                    judgment = judge_harmful_response_safety(text)
+                harmful_total += 1
+                harmful_refusals += int(judgment.is_refusal)
+                harmful_safes += int(judgment.is_safe)
+                harmful_unsafes += int(not judgment.is_safe)
+                is_refusal = judgment.is_refusal
+                is_safe = judgment.is_safe
+                safety_reason = judgment.reason
+            elif label == "harmless":
+                is_refusal = looks_like_refusal(text)
+                harmless_total += 1
+                harmless_refusals += int(is_refusal)
+                harmless_incomplete += int(incomplete_final_response)
+            generations.append(
+                {
+                    "id": str(record["id"]),
+                    "label": label,
+                    "generated_text": raw_text,
+                    "final_text": text,
+                    "is_refusal": is_refusal,
+                    "is_safe": is_safe,
+                    "safety_reason": safety_reason,
+                    "incomplete_final_response": incomplete_final_response,
+                    "retried_for_final_response": retried_for_final_response[row_idx],
+                    "used_max_new_tokens": used_max_new_tokens[row_idx],
+                }
+            )
     tokenizer.padding_side = previous_padding_side
 
     return {

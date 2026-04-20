@@ -36,6 +36,7 @@ class EvalTaskConfig:
     enabled: bool = True
     placeholder_ok: bool = True
     max_new_tokens: int = 128
+    initial_max_new_tokens: int = 0
     exec_timeout_seconds: int = 3
 
 

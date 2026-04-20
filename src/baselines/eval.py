@@ -98,32 +98,58 @@ def _generate_text(
     max_length: int,
     max_new_tokens: int,
 ) -> str:
+    return _generate_text_batch(
+        model,
+        tokenizer,
+        [prompt_text],
+        device=device,
+        max_length=max_length,
+        max_new_tokens=max_new_tokens,
+    )[0]
+
+
+def _generate_text_batch(
+    model: Any,
+    tokenizer: Any,
+    prompt_texts: Sequence[str],
+    *,
+    device: torch.device,
+    max_length: int,
+    max_new_tokens: int,
+) -> List[str]:
+    if not prompt_texts:
+        return []
     runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
     xla_model = getattr(model, "_codex_xla_model", None)
     previous_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     encoded = tokenizer(
-        prompt_text,
+        list(prompt_texts),
         return_tensors="pt",
+        padding=True,
         truncation=True,
         max_length=max_length,
     )
     tokenizer.padding_side = previous_padding_side
     encoded = {key: value.to(device) for key, value in encoded.items()}
 
-    generated = model.generate(
-        **encoded,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        repetition_penalty=1.0,
-        use_cache=True,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    )
+    with torch.inference_mode():
+        generated = model.generate(
+            **encoded,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            repetition_penalty=1.0,
+            use_cache=True,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
     if runtime_backend == "tpu" and xla_model is not None:
         xla_model.mark_step()
-    new_tokens = generated[0, encoded["input_ids"].size(1) :]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True)
+    prompt_width = int(encoded["input_ids"].size(1))
+    return [
+        tokenizer.decode(generated[row_idx, prompt_width:], skip_special_tokens=True)
+        for row_idx in range(len(prompt_texts))
+    ]
 
 
 def evaluate_pan(
@@ -133,6 +159,8 @@ def evaluate_pan(
     *,
     max_length: int,
     max_new_tokens: int,
+    batch_size: int = 1,
+    initial_max_new_tokens: int = 0,
 ) -> Dict[str, Any]:
     device = _resolve_device(model)
     metrics = evaluate_generation_refusal_metrics(
@@ -142,6 +170,8 @@ def evaluate_pan(
         device=device,
         max_length=max_length,
         max_new_tokens=max_new_tokens,
+        batch_size=batch_size,
+        initial_max_new_tokens=initial_max_new_tokens,
     )
     metrics["status"] = "ok"
     metrics["num_samples"] = len(records)
@@ -375,59 +405,80 @@ def evaluate_mcq(
     *,
     max_length: int,
     max_new_tokens: int,
+    batch_size: int = 1,
 ) -> Dict[str, Any]:
     device = _resolve_device(model)
     correct = 0
     predictions: List[Dict[str, Any]] = []
     use_thinking_generation = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
-    for example in examples:
-        prompt = _render_official_mmlu_chat_prompt(example)
-        option_labels = [chr(ord("A") + idx) for idx in range(len(example.choices))]
-        choice_map = {
-            label: str(choice)
-            for label, choice in zip(option_labels, example.choices)
-        }
-        if use_thinking_generation:
-            user_text = prompt
-            prompt_text = render_qwen_generation_prompt(
-                tokenizer,
-                build_qwen_messages(user_text),
-            )
-            generated_text = _generate_text(
+    if use_thinking_generation:
+        effective_batch_size = max(1, int(batch_size))
+        for batch_start in range(0, len(examples), effective_batch_size):
+            batch_examples = list(examples[batch_start: batch_start + effective_batch_size])
+            prompt_payloads: List[tuple[MCQExample, List[str], Dict[str, str], str]] = []
+            prompt_texts: List[str] = []
+            for example in batch_examples:
+                prompt = _render_official_mmlu_chat_prompt(example)
+                option_labels = [chr(ord("A") + idx) for idx in range(len(example.choices))]
+                choice_map = {
+                    label: str(choice)
+                    for label, choice in zip(option_labels, example.choices)
+                }
+                prompt_text = render_qwen_generation_prompt(
+                    tokenizer,
+                    build_qwen_messages(prompt),
+                )
+                prompt_payloads.append((example, option_labels, choice_map, prompt_text))
+                prompt_texts.append(prompt_text)
+
+            generated_texts = _generate_text_batch(
                 model,
                 tokenizer,
-                prompt_text,
+                prompt_texts,
                 device=device,
                 max_length=max_length,
                 max_new_tokens=max_new_tokens,
             )
-            final_text = strip_qwen_thinking_content(
-                generated_text,
-                require_final_response=True,
-            )
-            predicted_label = extract_official_mmlu_prediction(
-                final_text,
-                option_labels,
-                choice_map,
-            )
-            predicted_index = option_labels.index(predicted_label) if predicted_label in option_labels else -1
-            is_correct = int(predicted_index == int(example.answer_index))
-            correct += is_correct
-            predictions.append(
-                {
-                    "id": example.sample_id,
-                    "subject": example.subject,
-                    "question": example.question,
-                    "choices": list(example.choices),
-                    "prediction": predicted_label,
-                    "target": option_labels[int(example.answer_index)],
-                    "correct": bool(is_correct),
-                    "generated_text": generated_text,
-                    "final_text": final_text,
-                    "choice_map": choice_map,
-                }
-            )
-            continue
+            for row_idx, (example, option_labels, choice_map, _prompt_text) in enumerate(prompt_payloads):
+                generated_text = generated_texts[row_idx]
+                final_text = strip_qwen_thinking_content(
+                    generated_text,
+                    require_final_response=True,
+                )
+                predicted_label = extract_official_mmlu_prediction(
+                    final_text,
+                    option_labels,
+                    choice_map,
+                )
+                predicted_index = option_labels.index(predicted_label) if predicted_label in option_labels else -1
+                is_correct = int(predicted_index == int(example.answer_index))
+                correct += is_correct
+                predictions.append(
+                    {
+                        "id": example.sample_id,
+                        "subject": example.subject,
+                        "question": example.question,
+                        "choices": list(example.choices),
+                        "prediction": predicted_label,
+                        "target": option_labels[int(example.answer_index)],
+                        "correct": bool(is_correct),
+                        "generated_text": generated_text,
+                        "final_text": final_text,
+                        "choice_map": choice_map,
+                    }
+                )
+        total = len(examples)
+        return {
+            "status": "ok",
+            "num_samples": total,
+            "num_correct": correct,
+            "accuracy": 0.0 if total == 0 else correct / total,
+            "predictions": predictions,
+        }
+
+    for example in examples:
+        prompt = _render_official_mmlu_chat_prompt(example)
+        option_labels = [chr(ord("A") + idx) for idx in range(len(example.choices))]
 
         prompt_text = render_qwen_generation_prompt(
             tokenizer,
@@ -478,43 +529,50 @@ def evaluate_gsm8k(
     *,
     max_length: int,
     max_new_tokens: int,
+    batch_size: int = 1,
 ) -> Dict[str, Any]:
     device = _resolve_device(model)
     correct = 0
     predictions: List[Dict[str, Any]] = []
     require_final_response = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
-    for example in examples:
-        user_text = example.question
-        prompt_text = render_qwen_generation_prompt(
-            tokenizer,
-            build_qwen_messages(user_text),
-        )
-        generated_text = _generate_text(
+    effective_batch_size = max(1, int(batch_size))
+    for batch_start in range(0, len(examples), effective_batch_size):
+        batch_examples = list(examples[batch_start: batch_start + effective_batch_size])
+        prompt_texts = [
+            render_qwen_generation_prompt(
+                tokenizer,
+                build_qwen_messages(example.question),
+            )
+            for example in batch_examples
+        ]
+        generated_texts = _generate_text_batch(
             model,
             tokenizer,
-            prompt_text,
+            prompt_texts,
             device=device,
             max_length=max_length,
             max_new_tokens=max_new_tokens,
         )
-        final_text = strip_qwen_thinking_content(
-            generated_text,
-            require_final_response=require_final_response,
-        )
-        prediction = extract_official_gsm8k_prediction(final_text)
-        is_correct = int(_gsm8k_answers_match(example.final_answer, prediction))
-        correct += is_correct
-        predictions.append(
-            {
-                "id": example.sample_id,
-                "question": example.question,
-                "prediction": prediction,
-                "target": example.final_answer,
-                "correct": bool(is_correct),
-                "generated_text": generated_text,
-                "final_text": final_text,
-            }
-        )
+        for row_idx, example in enumerate(batch_examples):
+            generated_text = generated_texts[row_idx]
+            final_text = strip_qwen_thinking_content(
+                generated_text,
+                require_final_response=require_final_response,
+            )
+            prediction = extract_official_gsm8k_prediction(final_text)
+            is_correct = int(_gsm8k_answers_match(example.final_answer, prediction))
+            correct += is_correct
+            predictions.append(
+                {
+                    "id": example.sample_id,
+                    "question": example.question,
+                    "prediction": prediction,
+                    "target": example.final_answer,
+                    "correct": bool(is_correct),
+                    "generated_text": generated_text,
+                    "final_text": final_text,
+                }
+            )
 
     total = len(examples)
     return {
@@ -628,6 +686,7 @@ def evaluate_code_generation(
     max_length: int,
     max_new_tokens: int,
     exec_timeout_seconds: int,
+    batch_size: int = 1,
 ) -> Dict[str, Any]:
     device = _resolve_device(model)
     passed = 0
@@ -636,66 +695,74 @@ def evaluate_code_generation(
     dataset_key = str(dataset_name).strip().lower()
     require_final_response = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
 
-    for example in examples:
-        setattr(example, "requires_final_response", require_final_response)
-        if dataset_key == "humaneval":
-            user_text = _build_humaneval_official_prompt(example)
-        elif dataset_key == "mbpp":
-            user_text = _build_mbpp_officialish_prompt(example)
-        else:
-            raise ValueError(f"Unsupported code dataset: {dataset_name}")
+    effective_batch_size = max(1, int(batch_size))
+    for batch_start in range(0, len(examples), effective_batch_size):
+        batch_examples = list(examples[batch_start: batch_start + effective_batch_size])
+        prompt_texts: List[str] = []
+        for example in batch_examples:
+            setattr(example, "requires_final_response", require_final_response)
+            if dataset_key == "humaneval":
+                user_text = _build_humaneval_official_prompt(example)
+            elif dataset_key == "mbpp":
+                user_text = _build_mbpp_officialish_prompt(example)
+            else:
+                raise ValueError(f"Unsupported code dataset: {dataset_name}")
+            prompt_texts.append(
+                render_qwen_generation_prompt(
+                    tokenizer,
+                    build_qwen_messages(user_text),
+                )
+            )
 
-        prompt_text = render_qwen_generation_prompt(
-            tokenizer,
-            build_qwen_messages(user_text),
-        )
-        generated_text = _generate_text(
+        generated_texts = _generate_text_batch(
             model,
             tokenizer,
-            prompt_text,
+            prompt_texts,
             device=device,
             max_length=max_length,
             max_new_tokens=max_new_tokens,
         )
-        if dataset_key == "humaneval":
-            if not example.entry_point:
-                predictions.append(
-                    {
-                        "task_id": example.task_id,
-                        "prompt": example.prompt,
-                        "entry_point": example.entry_point,
-                        "passed": False,
-                        "error": "Missing entry_point",
-                        "generated_text": generated_text,
-                    }
-                )
-                continue
-            program = _assemble_humaneval_program(example, generated_text)
-        else:
-            program = _assemble_mbpp_program(example, generated_text)
+        for row_idx, example in enumerate(batch_examples):
+            generated_text = generated_texts[row_idx]
+            if dataset_key == "humaneval":
+                if not example.entry_point:
+                    predictions.append(
+                        {
+                            "task_id": example.task_id,
+                            "prompt": example.prompt,
+                            "entry_point": example.entry_point,
+                            "passed": False,
+                            "error": "Missing entry_point",
+                            "generated_text": generated_text,
+                        }
+                    )
+                    continue
+                program = _assemble_humaneval_program(example, generated_text)
+            else:
+                program = _assemble_mbpp_program(example, generated_text)
 
-        executable += 1
-        task_passed, error_text = _run_code_program(program, exec_timeout_seconds)
-        passed += int(task_passed)
-        predictions.append(
-            {
-                "task_id": example.task_id,
-                "prompt": example.prompt,
-                "entry_point": example.entry_point,
-                "passed": bool(task_passed),
-                "error": error_text,
-                "generated_text": generated_text,
-                "sanitized_code": sanitize_code_generation(
-                    generated_text,
-                    require_final_response=require_final_response,
-                ),
-                "final_text": strip_qwen_thinking_content(
-                    generated_text,
-                    require_final_response=require_final_response,
-                ),
-                "assembled_program": program,
-            }
-        )
+            executable += 1
+            task_passed, error_text = _run_code_program(program, exec_timeout_seconds)
+            passed += int(task_passed)
+            predictions.append(
+                {
+                    "task_id": example.task_id,
+                    "prompt": example.prompt,
+                    "entry_point": example.entry_point,
+                    "passed": bool(task_passed),
+                    "error": error_text,
+                    "generated_text": generated_text,
+                    "sanitized_code": sanitize_code_generation(
+                        generated_text,
+                        require_final_response=require_final_response,
+                    ),
+                    "final_text": strip_qwen_thinking_content(
+                        generated_text,
+                        require_final_response=require_final_response,
+                    ),
+                    "assembled_program": program,
+                }
+            )
 
     return {
         "status": "ok",
