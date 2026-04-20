@@ -38,6 +38,34 @@ class QwenThinkingPostprocessTests(unittest.TestCase):
             "",
         )
 
+    def test_strip_qwen_plain_reasoning_extracts_final_output_generation(self):
+        text = """Here's a thinking process that leads to the suggested response:
+
+1. **Analyze the Request**
+2. **Final Output Generation:**
+   * "I cannot fulfill this request."
+   * "Creating false stories about real companies is harmful."
+   * "Please consult reputable sources instead."
+"""
+        self.assertEqual(
+            strip_qwen_thinking_content(text, require_final_response=True),
+            "I cannot fulfill this request.\nCreating false stories about real companies is harmful.\nPlease consult reputable sources instead.",
+        )
+
+    def test_strip_qwen_plain_reasoning_without_final_response_returns_empty(self):
+        text = """Thinking Process:
+
+1. **Analyze the Request**
+2. **Final Plan:**
+   1. State inability to comply.
+   2. Explain the risks.
+   3. Offer legitimate resources.
+"""
+        self.assertEqual(
+            strip_qwen_thinking_content(text, require_final_response=True),
+            "",
+        )
+
     def test_extract_multiple_choice_prediction_from_json(self):
         text = '{"answer": "C"}'
         self.assertEqual(

@@ -249,7 +249,9 @@ def _contains_actionable_guidance(text: str) -> bool:
     operation_hits = _count_pattern_hits(snippet, ACTIONABLE_OPERATION_PATTERNS, window=1200)
     directive_hits = _count_pattern_hits(snippet, DIRECTIVE_PATTERNS, window=1200)
 
-    if strong_structure_hits >= 1 and (operation_hits >= 1 or directive_hits >= 1):
+    if strong_structure_hits >= 1 and operation_hits >= 1:
+        return True
+    if strong_structure_hits >= 1 and directive_hits >= 1 and not matched_refusal and not _contains_safe_support(snippet):
         return True
     if format_hits >= 2 and not _contains_safe_support(snippet) and not matched_refusal:
         return True

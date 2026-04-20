@@ -15,7 +15,7 @@ from src.data.template_qwen import (
     render_qwen_supervised_text,
     strip_qwen_thinking_content,
 )
-from src.training.eval_utils import judge_harmful_response_safety, looks_like_refusal, mean
+from src.training.eval_utils import HarmfulResponseJudgment, judge_harmful_response_safety, looks_like_refusal, mean
 from src.training.losses import cosine_layer_alignment_loss
 from src.utils.io import ensure_dir, read_jsonl, write_json
 
@@ -315,7 +315,9 @@ def evaluate_generation_refusal_metrics(
     harmful_refusals = 0
     harmful_safes = 0
     harmful_unsafes = 0
+    harmful_incomplete = 0
     harmless_refusals = 0
+    harmless_incomplete = 0
     generations: List[Dict[str, Any]] = []
 
     previous_padding_side = tokenizer.padding_side
@@ -323,8 +325,9 @@ def evaluate_generation_refusal_metrics(
     model.eval()
     runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
     xla_model = getattr(model, "_codex_xla_model", None)
-    for record in records:
-        prompt_text = render_qwen_generation_prompt(tokenizer, record["messages"])
+    require_final_response = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
+
+    def _generate_response(prompt_text: str, *, generation_max_new_tokens: int) -> tuple[str, str]:
         encoded = tokenizer(
             prompt_text,
             return_tensors="pt",
@@ -334,7 +337,7 @@ def evaluate_generation_refusal_metrics(
         encoded = {key: value.to(device) for key, value in encoded.items()}
         generated = model.generate(
             **encoded,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=generation_max_new_tokens,
             do_sample=False,
             use_cache=True,
             eos_token_id=tokenizer.eos_token_id,
@@ -344,16 +347,38 @@ def evaluate_generation_refusal_metrics(
             xla_model.mark_step()
         new_tokens = generated[0, encoded["input_ids"].size(1):]
         raw_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-        text = strip_qwen_thinking_content(
+        final_text = strip_qwen_thinking_content(
             raw_text,
-            require_final_response=bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False)),
+            require_final_response=require_final_response,
         )
+        return raw_text, final_text
+
+    for record in records:
+        prompt_text = render_qwen_generation_prompt(tokenizer, record["messages"])
+        raw_text, text = _generate_response(prompt_text, generation_max_new_tokens=max_new_tokens)
+        used_max_new_tokens = int(max_new_tokens)
+        retried_for_final_response = False
+        if require_final_response and raw_text.strip() and not text:
+            retry_max_new_tokens = min(max(int(max_new_tokens) * 2, int(max_new_tokens) + 512), 4096)
+            if retry_max_new_tokens > int(max_new_tokens):
+                retried_for_final_response = True
+                used_max_new_tokens = retry_max_new_tokens
+                raw_text, text = _generate_response(prompt_text, generation_max_new_tokens=retry_max_new_tokens)
         label = str(record["label"])
         is_refusal: bool | None = None
         is_safe: bool | None = None
         safety_reason: str | None = None
+        incomplete_final_response = bool(require_final_response and raw_text.strip() and not text)
         if label == "harmful":
-            judgment = judge_harmful_response_safety(text)
+            if incomplete_final_response:
+                judgment = HarmfulResponseJudgment(
+                    is_refusal=False,
+                    is_safe=False,
+                    reason="incomplete_final_response",
+                )
+                harmful_incomplete += 1
+            else:
+                judgment = judge_harmful_response_safety(text)
             harmful_total += 1
             harmful_refusals += int(judgment.is_refusal)
             harmful_safes += int(judgment.is_safe)
@@ -365,6 +390,7 @@ def evaluate_generation_refusal_metrics(
             is_refusal = looks_like_refusal(text)
             harmless_total += 1
             harmless_refusals += int(is_refusal)
+            harmless_incomplete += int(incomplete_final_response)
         generations.append(
             {
                 "id": str(record["id"]),
@@ -374,6 +400,9 @@ def evaluate_generation_refusal_metrics(
                 "is_refusal": is_refusal,
                 "is_safe": is_safe,
                 "safety_reason": safety_reason,
+                "incomplete_final_response": incomplete_final_response,
+                "retried_for_final_response": retried_for_final_response,
+                "used_max_new_tokens": used_max_new_tokens,
             }
         )
     tokenizer.padding_side = previous_padding_side
@@ -382,9 +411,12 @@ def evaluate_generation_refusal_metrics(
         "harmful_refusal_rate": 0.0 if harmful_total == 0 else harmful_refusals / harmful_total,
         "harmful_safe_response_rate": 0.0 if harmful_total == 0 else harmful_safes / harmful_total,
         "harmful_unsafe_output_rate": 0.0 if harmful_total == 0 else harmful_unsafes / harmful_total,
+        "harmful_incomplete_output_rate": 0.0 if harmful_total == 0 else harmful_incomplete / harmful_total,
         "harmless_over_refusal_rate": 0.0 if harmless_total == 0 else harmless_refusals / harmless_total,
+        "harmless_incomplete_output_rate": 0.0 if harmless_total == 0 else harmless_incomplete / harmless_total,
         "num_harmful": harmful_total,
         "num_harmless": harmless_total,
+        "num_incomplete_final_response": harmful_incomplete + harmless_incomplete,
         "generations": generations,
     }
 
