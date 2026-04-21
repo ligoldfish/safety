@@ -72,13 +72,8 @@ setup_runtime() {
     "${PYTHON_BIN}" -m pip install -U datasets pyarrow
   fi
 
-  if [[ "${DEVICE}" == "npu" ]]; then
-    export ASCEND_RT_VISIBLE_DEVICES="${VISIBLE_DEVICES}"
-    EFFECTIVE_DEVICE_ID="0"
-  else
-    IFS=',' read -r TPU_FIRST_ID _ <<< "${VISIBLE_DEVICES}"
-    EFFECTIVE_DEVICE_ID="${TPU_FIRST_ID}"
-  fi
+  IFS=',' read -r FIRST_VISIBLE_ID _ <<< "${VISIBLE_DEVICES}"
+  EFFECTIVE_DEVICE_ID="${FIRST_VISIBLE_ID}"
 }
 
 run_cmd() {
