@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Keep this script in LF format so it runs correctly under Linux bash.
 set -e
 set -u
 set -o pipefail
