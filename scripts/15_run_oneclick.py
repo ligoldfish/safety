@@ -188,6 +188,9 @@ def _runtime_device_value(device: str, device_id: int) -> str:
 
 def _build_env_overrides(device: str, device_id: int) -> dict[str, str]:
     if device == "npu":
+        inherited_visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip()
+        if inherited_visible_devices:
+            return {"ASCEND_RT_VISIBLE_DEVICES": inherited_visible_devices}
         return {"ASCEND_RT_VISIBLE_DEVICES": str(device_id)}
     return {}
 

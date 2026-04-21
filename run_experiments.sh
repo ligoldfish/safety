@@ -74,7 +74,14 @@ setup_runtime() {
   fi
 
   IFS=',' read -r FIRST_VISIBLE_ID _ <<< "${VISIBLE_DEVICES}"
-  EFFECTIVE_DEVICE_ID="${FIRST_VISIBLE_ID}"
+  if [[ "${DEVICE}" == "npu" ]]; then
+    export ASCEND_RT_VISIBLE_DEVICES="${VISIBLE_DEVICES}"
+    EFFECTIVE_DEVICE_ID="0"
+    echo "[INFO] ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES}"
+    echo "[INFO] Using logical device npu:${EFFECTIVE_DEVICE_ID} mapped onto visible physical NPU(s): ${VISIBLE_DEVICES}"
+  else
+    EFFECTIVE_DEVICE_ID="${FIRST_VISIBLE_ID}"
+  fi
 }
 
 run_cmd() {
