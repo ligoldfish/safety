@@ -67,7 +67,7 @@ def load_hf_model(
     model_path: str,
     device_map: str = "auto",
     torch_dtype: str = "auto",
-    chat_template_enable_thinking: bool = True,
+    chat_template_enable_thinking: bool = False,
     runtime_backend: str = "",
     runtime_device: str = "",
     trust_remote_code: bool = True,
@@ -76,8 +76,6 @@ def load_hf_model(
 ) -> Tuple[Any, Any, Dict[str, Any]]:
     resolved = Path(model_path)
     model_ref = str(resolved if resolved.exists() else model_path)
-    if chat_template_enable_thinking is False:
-        raise ValueError("Non-thinking mode is no longer supported for Qwen3.5 models.")
     thinking_enabled = bool(chat_template_enable_thinking)
 
     tokenizer = AutoTokenizer.from_pretrained(

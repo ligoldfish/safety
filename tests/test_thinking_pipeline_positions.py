@@ -91,9 +91,10 @@ def _build_record() -> dict:
 class ThinkingPipelinePositionTests(unittest.TestCase):
     def test_supervised_collator_masks_thinking_prefix_tokens(self):
         tokenizer = FakeQwenTokenizer()
+        setattr(tokenizer, "_codex_chat_template_enable_thinking", True)
         record = _build_record()
-        prefix_text = render_qwen_final_response_prefix(tokenizer, record["messages"])
-        full_text = render_qwen_supervised_text(tokenizer, record["messages"], record["target_response"])
+        prefix_text = render_qwen_final_response_prefix(tokenizer, record["messages"], enable_thinking=True)
+        full_text = render_qwen_supervised_text(tokenizer, record["messages"], record["target_response"], enable_thinking=True)
         self.assertGreater(len(full_text), len(prefix_text))
 
         collator = SupervisedCollator(tokenizer, max_length=1024)
@@ -106,8 +107,9 @@ class ThinkingPipelinePositionTests(unittest.TestCase):
 
     def test_semalign_collator_aligns_on_final_response_prefix(self):
         tokenizer = FakeQwenTokenizer()
+        setattr(tokenizer, "_codex_chat_template_enable_thinking", True)
         record = _build_record()
-        prefix_text = render_qwen_final_response_prefix(tokenizer, record["messages"])
+        prefix_text = render_qwen_final_response_prefix(tokenizer, record["messages"], enable_thinking=True)
 
         collator = SemAlignCollator(tokenizer, max_length=1024, layer_ids=[0])
         batch = collator(

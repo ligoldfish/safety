@@ -133,7 +133,7 @@ class GeneralEvalBatchingTests(unittest.TestCase):
         self.original_build_messages = baseline_eval.build_qwen_messages
         self.original_render_prompt = baseline_eval.render_qwen_generation_prompt
         baseline_eval.build_qwen_messages = lambda user_text: [{"role": "user", "content": str(user_text)}]
-        baseline_eval.render_qwen_generation_prompt = lambda _tokenizer, messages: str(messages[-1]["content"])
+        baseline_eval.render_qwen_generation_prompt = lambda _tokenizer, messages, **_kwargs: str(messages[-1]["content"])
 
     def tearDown(self) -> None:
         baseline_eval.build_qwen_messages = self.original_build_messages
@@ -162,8 +162,8 @@ class GeneralEvalBatchingTests(unittest.TestCase):
         model = _FakeModel(
             tokenizer,
             {
-                (prompt_1, 64): "Paris",
-                (prompt_2, 64): "Mars",
+                (prompt_1, 64): "Final Answer: B",
+                (prompt_2, 64): "Final Answer: C",
             },
         )
 
@@ -177,8 +177,86 @@ class GeneralEvalBatchingTests(unittest.TestCase):
         )
 
         self.assertEqual(result["num_correct"], 2)
+        self.assertEqual(result["num_incomplete"], 0)
+        self.assertEqual(result["num_effective"], 2)
         self.assertEqual(len(model.generate_calls), 1)
         self.assertEqual(model.generate_calls[0]["batch_size"], 2)
+        self.assertEqual(model.generate_calls[0]["max_new_tokens"], 64)
+
+    def test_evaluate_mcq_retries_when_first_pass_is_incomplete(self):
+        tokenizer = _FakeTokenizer()
+        examples = [
+            MCQExample(
+                sample_id="m1",
+                question="What is the capital of France?",
+                choices=["London", "Paris", "Rome", "Berlin"],
+                answer_index=1,
+                subject="geography",
+            ),
+        ]
+        prompt_1 = baseline_eval._render_official_mmlu_chat_prompt(examples[0])
+        model = _FakeModel(
+            tokenizer,
+            {
+                (prompt_1, 8): "<think>\nLet me think about European capitals.",
+                (prompt_1, 64): "<think>\nParis is the capital.\n</think>\n\nFinal Answer: B",
+            },
+        )
+
+        result = baseline_eval.evaluate_mcq(
+            model,
+            tokenizer,
+            examples,
+            max_length=256,
+            max_new_tokens=64,
+            batch_size=1,
+            initial_max_new_tokens=8,
+        )
+
+        self.assertEqual(result["num_correct"], 1)
+        self.assertEqual(result["num_incomplete"], 0)
+        self.assertEqual(len(model.generate_calls), 2)
+        self.assertEqual(model.generate_calls[0]["max_new_tokens"], 8)
+        self.assertEqual(model.generate_calls[1]["max_new_tokens"], 64)
+        self.assertTrue(result["predictions"][0]["retried_for_final_response"])
+        self.assertEqual(int(result["predictions"][0]["used_max_new_tokens"]), 64)
+
+    def test_evaluate_mcq_marks_incomplete_when_both_passes_fail(self):
+        tokenizer = _FakeTokenizer()
+        examples = [
+            MCQExample(
+                sample_id="m1",
+                question="What is the capital of France?",
+                choices=["London", "Paris", "Rome", "Berlin"],
+                answer_index=1,
+                subject="geography",
+            ),
+        ]
+        prompt_1 = baseline_eval._render_official_mmlu_chat_prompt(examples[0])
+        model = _FakeModel(
+            tokenizer,
+            {
+                (prompt_1, 8): "<think>\nLet me think first.",
+                (prompt_1, 64): "<think>\nStill reasoning without closing.",
+            },
+        )
+
+        result = baseline_eval.evaluate_mcq(
+            model,
+            tokenizer,
+            examples,
+            max_length=256,
+            max_new_tokens=64,
+            batch_size=1,
+            initial_max_new_tokens=8,
+        )
+
+        self.assertEqual(result["num_correct"], 0)
+        self.assertEqual(result["num_incomplete"], 1)
+        self.assertEqual(result["num_effective"], 0)
+        self.assertAlmostEqual(result["incomplete_final_response_rate"], 1.0)
+        self.assertTrue(result["predictions"][0]["incomplete_final_response"])
+        self.assertEqual(result["predictions"][0]["prediction"], "")
 
     def test_evaluate_gsm8k_batches_generation(self):
         tokenizer = _FakeTokenizer()
@@ -186,11 +264,13 @@ class GeneralEvalBatchingTests(unittest.TestCase):
             GSM8KExample(sample_id="g1", question="1 + 1 = ?", answer_text="#### 2", final_answer="2"),
             GSM8KExample(sample_id="g2", question="6 * 3 = ?", answer_text="#### 18", final_answer="18"),
         ]
+        prompt_1 = baseline_eval._build_gsm8k_prompt(examples[0])
+        prompt_2 = baseline_eval._build_gsm8k_prompt(examples[1])
         model = _FakeModel(
             tokenizer,
             {
-                ("1 + 1 = ?", 64): "The answer is 2.",
-                ("6 * 3 = ?", 64): "The answer is 18.",
+                (prompt_1, 64): "The answer is 2.",
+                (prompt_2, 64): "The answer is 18.",
             },
         )
 
@@ -204,8 +284,40 @@ class GeneralEvalBatchingTests(unittest.TestCase):
         )
 
         self.assertEqual(result["num_correct"], 2)
+        self.assertEqual(result["num_incomplete"], 0)
         self.assertEqual(len(model.generate_calls), 1)
         self.assertEqual(model.generate_calls[0]["batch_size"], 2)
+
+    def test_evaluate_gsm8k_retries_when_first_pass_is_incomplete(self):
+        tokenizer = _FakeTokenizer()
+        examples = [
+            GSM8KExample(sample_id="g1", question="1 + 1 = ?", answer_text="#### 2", final_answer="2"),
+        ]
+        prompt_1 = baseline_eval._build_gsm8k_prompt(examples[0])
+        model = _FakeModel(
+            tokenizer,
+            {
+                (prompt_1, 8): "<think>\nLet me compute one plus one.",
+                (prompt_1, 64): "<think>\n1 + 1 = 2.\n</think>\n\nFinal Answer: 2",
+            },
+        )
+
+        result = baseline_eval.evaluate_gsm8k(
+            model,
+            tokenizer,
+            examples,
+            max_length=128,
+            max_new_tokens=64,
+            batch_size=1,
+            initial_max_new_tokens=8,
+        )
+
+        self.assertEqual(result["num_correct"], 1)
+        self.assertEqual(result["num_incomplete"], 0)
+        self.assertEqual(len(model.generate_calls), 2)
+        self.assertEqual(model.generate_calls[0]["max_new_tokens"], 8)
+        self.assertEqual(model.generate_calls[1]["max_new_tokens"], 64)
+        self.assertTrue(result["predictions"][0]["retried_for_final_response"])
 
     def test_evaluate_code_generation_batches_generation(self):
         tokenizer = _FakeTokenizer()
@@ -228,8 +340,8 @@ class GeneralEvalBatchingTests(unittest.TestCase):
         model = _FakeModel(
             tokenizer,
             {
-                (prompt_1, 128): "def solve():\n    return 1",
-                (prompt_2, 128): "def solve_two():\n    return 2",
+                (prompt_1, 128): "```python\ndef solve():\n    return 1\n```",
+                (prompt_2, 128): "```python\ndef solve_two():\n    return 2\n```",
             },
         )
 
@@ -250,8 +362,106 @@ class GeneralEvalBatchingTests(unittest.TestCase):
             baseline_eval._run_code_program = original_run_code
 
         self.assertEqual(result["num_passed"], 2)
+        self.assertEqual(result["num_incomplete"], 0)
         self.assertEqual(len(model.generate_calls), 1)
         self.assertEqual(model.generate_calls[0]["batch_size"], 2)
+
+    def test_evaluate_code_generation_marks_incomplete_when_final_response_missing(self):
+        tokenizer = _FakeTokenizer()
+        examples = [
+            CodeExample(
+                task_id="mbpp/1",
+                prompt="Return 1.",
+                tests=["assert solve() == 1"],
+                entry_point="solve",
+            ),
+        ]
+        prompt_1 = baseline_eval._build_mbpp_officialish_prompt(examples[0])
+        model = _FakeModel(
+            tokenizer,
+            {
+                (prompt_1, 16): "<think>\nThinking about how to solve this.",
+                (prompt_1, 128): "<think>\nStill reasoning and never closing.",
+            },
+        )
+
+        run_calls: list[tuple[str, int]] = []
+
+        def _fake_run(program, timeout_seconds):
+            run_calls.append((program, timeout_seconds))
+            return True, ""
+
+        original_run_code = baseline_eval._run_code_program
+        baseline_eval._run_code_program = _fake_run
+        try:
+            result = baseline_eval.evaluate_code_generation(
+                model,
+                tokenizer,
+                examples,
+                dataset_name="mbpp",
+                max_length=256,
+                max_new_tokens=128,
+                exec_timeout_seconds=1,
+                batch_size=1,
+                initial_max_new_tokens=16,
+            )
+        finally:
+            baseline_eval._run_code_program = original_run_code
+
+        self.assertEqual(result["num_passed"], 0)
+        self.assertEqual(result["num_executable"], 0)
+        self.assertEqual(result["num_incomplete"], 1)
+        self.assertAlmostEqual(result["pass_at_1"], 0.0)
+        self.assertAlmostEqual(result["pass_at_1_effective"], 0.0)
+        self.assertEqual(run_calls, [])
+        self.assertTrue(result["predictions"][0]["incomplete_final_response"])
+        self.assertEqual(result["predictions"][0]["error"], "incomplete_final_response")
+
+    def test_evaluate_code_generation_marks_empty_completion_as_incomplete(self):
+        tokenizer = _FakeTokenizer()
+        examples = [
+            CodeExample(
+                task_id="mbpp/1",
+                prompt="Return 1.",
+                tests=["assert solve() == 1"],
+                entry_point="solve",
+            ),
+        ]
+        prompt_1 = baseline_eval._build_mbpp_officialish_prompt(examples[0])
+        model = _FakeModel(
+            tokenizer,
+            {
+                (prompt_1, 128): "python",
+            },
+        )
+
+        run_calls: list[tuple[str, int]] = []
+
+        def _fake_run(program, timeout_seconds):
+            run_calls.append((program, timeout_seconds))
+            return True, ""
+
+        original_run_code = baseline_eval._run_code_program
+        baseline_eval._run_code_program = _fake_run
+        try:
+            result = baseline_eval.evaluate_code_generation(
+                model,
+                tokenizer,
+                examples,
+                dataset_name="mbpp",
+                max_length=256,
+                max_new_tokens=128,
+                exec_timeout_seconds=1,
+                batch_size=1,
+            )
+        finally:
+            baseline_eval._run_code_program = original_run_code
+
+        self.assertEqual(result["num_passed"], 0)
+        self.assertEqual(result["num_executable"], 0)
+        self.assertEqual(result["num_incomplete"], 1)
+        self.assertEqual(run_calls, [])
+        self.assertEqual(result["predictions"][0]["error"], "empty_completion")
 
 
 if __name__ == "__main__":

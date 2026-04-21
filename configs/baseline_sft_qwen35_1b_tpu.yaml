@@ -3,6 +3,7 @@
 model:
   name: Qwen3.5-1B
   path: ../models/Qwen3.5-1B
+  chat_template_enable_thinking: false
   device_map: ""
   torch_dtype: float32
   runtime_backend: tpu
@@ -37,6 +38,6 @@ optim:
   log_every_steps: 10
 
 output:
-  output_root: D:/outputs/baselines/sft_qwen35_1b_tpu
+  output_root: ../outputs/baselines/sft_qwen35_1b_tpu
 
 

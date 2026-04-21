@@ -140,6 +140,7 @@ def main() -> None:
                 max_length=cfg.runtime.max_length,
                 max_new_tokens=mmlu_cfg.max_new_tokens,
                 batch_size=cfg.runtime.batch_size,
+                initial_max_new_tokens=mmlu_cfg.initial_max_new_tokens,
             )
     except Exception as exc:
         if mmlu_cfg.placeholder_ok:
@@ -170,6 +171,7 @@ def main() -> None:
                 max_length=cfg.runtime.max_length,
                 max_new_tokens=gsm8k_cfg.max_new_tokens,
                 batch_size=cfg.runtime.batch_size,
+                initial_max_new_tokens=gsm8k_cfg.initial_max_new_tokens,
             )
     except Exception as exc:
         if gsm8k_cfg.placeholder_ok:
@@ -203,6 +205,7 @@ def main() -> None:
                 max_new_tokens=humaneval_cfg.max_new_tokens,
                 exec_timeout_seconds=humaneval_cfg.exec_timeout_seconds,
                 batch_size=cfg.runtime.batch_size,
+                initial_max_new_tokens=humaneval_cfg.initial_max_new_tokens,
             )
     except Exception as exc:
         if humaneval_cfg.placeholder_ok:
@@ -236,6 +239,7 @@ def main() -> None:
                 max_new_tokens=mbpp_cfg.max_new_tokens,
                 exec_timeout_seconds=mbpp_cfg.exec_timeout_seconds,
                 batch_size=cfg.runtime.batch_size,
+                initial_max_new_tokens=mbpp_cfg.initial_max_new_tokens,
             )
     except Exception as exc:
         if mbpp_cfg.placeholder_ok:

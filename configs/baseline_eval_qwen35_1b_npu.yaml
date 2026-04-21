@@ -1,10 +1,11 @@
-﻿seed: 42
+seed: 42
 
 model:
   name: Qwen3.5-1B
   path: ../models/Qwen3.5-1B
   device_map: ""
   torch_dtype: float32
+  chat_template_enable_thinking: false
   runtime_backend: npu
   runtime_device: npu:0
   trust_remote_code: true
@@ -23,48 +24,50 @@ datasets:
     shuffle: false
     enabled: true
     placeholder_ok: true
-    max_new_tokens: 64
+    max_new_tokens: 1024
+    initial_max_new_tokens: 0
   mmlu:
     path: ../data/benchmarks/mmlu
     split: test
     max_samples: 0
     shuffle: false
-    enabled: true
+    enabled: false
     placeholder_ok: true
-    max_new_tokens: 1
+    max_new_tokens: 512
+    initial_max_new_tokens: 0
   gsm8k:
     path: ../data/benchmarks/gsm8k
     split: test
     max_samples: 0
     shuffle: false
-    enabled: true
+    enabled: false
     placeholder_ok: true
-    max_new_tokens: 256
+    max_new_tokens: 512
+    initial_max_new_tokens: 0
   humaneval:
     path: ../data/benchmarks/humaneval
     split: test
     max_samples: 0
     shuffle: false
-    enabled: true
+    enabled: false
     placeholder_ok: true
-    max_new_tokens: 512
+    max_new_tokens: 1024
+    initial_max_new_tokens: 0
     exec_timeout_seconds: 3
   mbpp:
     path: ../data/benchmarks/mbpp
     split: test
     max_samples: 0
     shuffle: false
-    enabled: true
+    enabled: false
     placeholder_ok: true
-    max_new_tokens: 512
+    max_new_tokens: 1024
+    initial_max_new_tokens: 0
     exec_timeout_seconds: 3
 
 runtime:
-  max_length: 1024
+  max_length: 2048
   batch_size: 1
 
 output:
-  output_root: D:/outputs/baselines/no_sft_qwen35_1b_npu
-
-
-
+  output_root: ../outputs/baselines/no_sft_qwen35_1b_npu

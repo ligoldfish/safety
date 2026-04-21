@@ -1,3 +1,7 @@
 /models/
 /outputs/
 data/benchmarks/
+__pycache__/
+*.pyc
+*.pyo
+pan_results.json

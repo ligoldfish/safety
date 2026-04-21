@@ -35,6 +35,9 @@ from src.models.hf_loader import load_hf_model
 from src.training import evaluate_generation_refusal_metrics
 
 
+RETRY_MAX_NEW_TOKENS_CAP = 8192
+
+
 def load_model_for_evaluation(
     model_cfg: BaselineModelConfig,
     adapter_cfg: AdapterConfig | None = None,
@@ -89,6 +92,72 @@ def _resolve_device(model: Any) -> torch.device:
         return torch.device("cpu")
 
 
+def _generate_text_batch_with_info(
+    model: Any,
+    tokenizer: Any,
+    prompt_texts: Sequence[str],
+    *,
+    device: torch.device,
+    max_length: int,
+    max_new_tokens: int,
+) -> tuple[List[str], List[int]]:
+    if not prompt_texts:
+        return [], []
+    runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
+    xla_model = getattr(model, "_codex_xla_model", None)
+    previous_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    encoded = tokenizer(
+        list(prompt_texts),
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    )
+    tokenizer.padding_side = previous_padding_side
+    prompt_seq_lens = [int(value) for value in encoded["attention_mask"].sum(dim=1).tolist()]
+    encoded = {key: value.to(device) for key, value in encoded.items()}
+
+    with torch.inference_mode():
+        generated = model.generate(
+            **encoded,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            repetition_penalty=1.0,
+            use_cache=True,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    if runtime_backend == "tpu" and xla_model is not None:
+        xla_model.mark_step()
+    prompt_width = int(encoded["input_ids"].size(1))
+    texts = [
+        tokenizer.decode(generated[row_idx, prompt_width:], skip_special_tokens=True)
+        for row_idx in range(len(prompt_texts))
+    ]
+    return texts, prompt_seq_lens
+
+
+def _generate_text_batch(
+    model: Any,
+    tokenizer: Any,
+    prompt_texts: Sequence[str],
+    *,
+    device: torch.device,
+    max_length: int,
+    max_new_tokens: int,
+) -> List[str]:
+    texts, _ = _generate_text_batch_with_info(
+        model,
+        tokenizer,
+        prompt_texts,
+        device=device,
+        max_length=max_length,
+        max_new_tokens=max_new_tokens,
+    )
+    return texts
+
+
 def _generate_text(
     model: Any,
     tokenizer: Any,
@@ -108,7 +177,31 @@ def _generate_text(
     )[0]
 
 
-def _generate_text_batch(
+def _resolve_first_pass_max_new_tokens(
+    max_new_tokens: int,
+    initial_max_new_tokens: int,
+    require_final_response: bool,
+) -> int:
+    base = int(max_new_tokens)
+    if require_final_response and int(initial_max_new_tokens) > 0:
+        return max(1, min(int(initial_max_new_tokens), base))
+    return base
+
+
+def _resolve_retry_max_new_tokens(
+    first_max_new_tokens: int,
+    max_new_tokens: int,
+    retry_cap: int = RETRY_MAX_NEW_TOKENS_CAP,
+) -> int:
+    if int(first_max_new_tokens) < int(max_new_tokens):
+        return int(max_new_tokens)
+    return min(
+        max(int(max_new_tokens) * 2, int(max_new_tokens) + 512),
+        int(retry_cap),
+    )
+
+
+def _generate_with_retry_for_final_response(
     model: Any,
     tokenizer: Any,
     prompt_texts: Sequence[str],
@@ -116,40 +209,81 @@ def _generate_text_batch(
     device: torch.device,
     max_length: int,
     max_new_tokens: int,
-) -> List[str]:
+    initial_max_new_tokens: int,
+    require_final_response: bool,
+    retry_cap: int = RETRY_MAX_NEW_TOKENS_CAP,
+) -> List[Dict[str, Any]]:
     if not prompt_texts:
         return []
-    runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
-    xla_model = getattr(model, "_codex_xla_model", None)
-    previous_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"
-    encoded = tokenizer(
-        list(prompt_texts),
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-    )
-    tokenizer.padding_side = previous_padding_side
-    encoded = {key: value.to(device) for key, value in encoded.items()}
 
-    with torch.inference_mode():
-        generated = model.generate(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            repetition_penalty=1.0,
-            use_cache=True,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-    if runtime_backend == "tpu" and xla_model is not None:
-        xla_model.mark_step()
-    prompt_width = int(encoded["input_ids"].size(1))
-    return [
-        tokenizer.decode(generated[row_idx, prompt_width:], skip_special_tokens=True)
-        for row_idx in range(len(prompt_texts))
+    first_max_new_tokens = _resolve_first_pass_max_new_tokens(
+        max_new_tokens,
+        initial_max_new_tokens,
+        require_final_response,
+    )
+
+    raw_texts, prompt_seq_lens = _generate_text_batch_with_info(
+        model,
+        tokenizer,
+        prompt_texts,
+        device=device,
+        max_length=max_length,
+        max_new_tokens=first_max_new_tokens,
+    )
+    final_texts = [
+        strip_qwen_thinking_content(raw, require_final_response=require_final_response)
+        for raw in raw_texts
     ]
+    used_max_new_tokens = [int(first_max_new_tokens)] * len(prompt_texts)
+    retried_flags = [False] * len(prompt_texts)
+
+    if require_final_response:
+        retry_indexes = [
+            idx
+            for idx, (raw, final) in enumerate(zip(raw_texts, final_texts))
+            if raw.strip() and not final
+        ]
+        if retry_indexes:
+            retry_max_new_tokens = _resolve_retry_max_new_tokens(
+                first_max_new_tokens,
+                max_new_tokens,
+                retry_cap=retry_cap,
+            )
+            if retry_max_new_tokens > first_max_new_tokens:
+                retry_prompt_texts = [prompt_texts[idx] for idx in retry_indexes]
+                retry_raw_texts, _ = _generate_text_batch_with_info(
+                    model,
+                    tokenizer,
+                    retry_prompt_texts,
+                    device=device,
+                    max_length=max_length,
+                    max_new_tokens=retry_max_new_tokens,
+                )
+                for local_idx, original_idx in enumerate(retry_indexes):
+                    raw_texts[original_idx] = retry_raw_texts[local_idx]
+                    final_texts[original_idx] = strip_qwen_thinking_content(
+                        retry_raw_texts[local_idx],
+                        require_final_response=require_final_response,
+                    )
+                    used_max_new_tokens[original_idx] = int(retry_max_new_tokens)
+                    retried_flags[original_idx] = True
+
+    results: List[Dict[str, Any]] = []
+    for idx in range(len(prompt_texts)):
+        raw = raw_texts[idx]
+        final = final_texts[idx]
+        incomplete = bool(require_final_response and raw.strip() and not final)
+        results.append(
+            {
+                "raw_text": raw,
+                "final_text": final,
+                "used_max_new_tokens": int(used_max_new_tokens[idx]),
+                "retried_for_final_response": bool(retried_flags[idx]),
+                "incomplete_final_response": incomplete,
+                "possibly_truncated_prompt": bool(prompt_seq_lens[idx] >= int(max_length)),
+            }
+        )
+    return results
 
 
 def evaluate_pan(
@@ -233,6 +367,30 @@ def _continuation_nll(
     return float((loss_per_token * active_mask.to(loss_per_token.dtype)).sum().item())
 
 
+def _mmlu_final_answer_instruction() -> str:
+    return (
+        "Please reason step by step, then finish with a single line in this exact format:\n"
+        "Final Answer: X\n"
+        "where X is one of A, B, C, or D."
+    )
+
+
+def _gsm8k_final_answer_instruction() -> str:
+    return (
+        "Please reason step by step, then finish with a single line in this exact format:\n"
+        "Final Answer: <number>\n"
+        "Return only the numeric value on that line."
+    )
+
+
+def _code_final_answer_instruction() -> str:
+    return (
+        "After your reasoning, output the final solution as a single Python code block "
+        "(```python ... ```) containing the complete implementation. Do not include "
+        "example usage or tests inside the code block."
+    )
+
+
 def _render_official_mmlu_chat_prompt(example: MCQExample) -> str:
     option_labels = [chr(ord("A") + idx) for idx in range(len(example.choices))]
     option_lines = "\n".join(
@@ -242,8 +400,13 @@ def _render_official_mmlu_chat_prompt(example: MCQExample) -> str:
     return (
         "The following is a multiple-choice question. "
         "Please choose the most suitable one among A, B, C and D as the answer to this question.\n\n"
-        f"{example.question}\n{option_lines}"
+        f"{example.question}\n{option_lines}\n\n"
+        f"{_mmlu_final_answer_instruction()}"
     )
+
+
+def _build_gsm8k_prompt(example: GSM8KExample) -> str:
+    return f"{example.question}\n\n{_gsm8k_final_answer_instruction()}"
 
 
 def _safe_numeric_eval(text: str) -> float:
@@ -290,7 +453,8 @@ def _build_humaneval_official_prompt(example: CodeExample) -> str:
     return (
         f"Write a Python function `{signature}` to solve the following problem:\n"
         f"{description}\n"
-        f"{prompt_text}"
+        f"{prompt_text}\n\n"
+        f"{_code_final_answer_instruction()}"
     )
 
 
@@ -350,16 +514,18 @@ def _extract_humaneval_completion(
 
 
 def _build_mbpp_officialish_prompt(example: CodeExample) -> str:
+    header: str
     if example.entry_point:
-        return (
+        header = (
             f"Write a Python function `{example.entry_point}` to solve the following problem:\n"
             f"{example.prompt}"
         )
-    return (
-        "Write Python code to solve the following problem. "
-        "Return only Python code.\n"
-        f"{example.prompt}"
-    )
+    else:
+        header = (
+            "Write Python code to solve the following problem. Return only Python code.\n"
+            f"{example.prompt}"
+        )
+    return f"{header}\n\n{_code_final_answer_instruction()}"
 
 
 def _extract_mbpp_code(
@@ -406,9 +572,12 @@ def evaluate_mcq(
     max_length: int,
     max_new_tokens: int,
     batch_size: int = 1,
+    initial_max_new_tokens: int = 0,
 ) -> Dict[str, Any]:
     device = _resolve_device(model)
     correct = 0
+    num_incomplete = 0
+    num_truncated_prompts = 0
     predictions: List[Dict[str, Any]] = []
     use_thinking_generation = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
     if use_thinking_generation:
@@ -431,24 +600,33 @@ def evaluate_mcq(
                 prompt_payloads.append((example, option_labels, choice_map, prompt_text))
                 prompt_texts.append(prompt_text)
 
-            generated_texts = _generate_text_batch(
+            generation_results = _generate_with_retry_for_final_response(
                 model,
                 tokenizer,
                 prompt_texts,
                 device=device,
                 max_length=max_length,
                 max_new_tokens=max_new_tokens,
+                initial_max_new_tokens=initial_max_new_tokens,
+                require_final_response=True,
             )
             for row_idx, (example, option_labels, choice_map, _prompt_text) in enumerate(prompt_payloads):
-                generated_text = generated_texts[row_idx]
-                final_text = strip_qwen_thinking_content(
-                    generated_text,
-                    require_final_response=True,
-                )
-                predicted_label = extract_official_mmlu_prediction(
-                    final_text,
-                    option_labels,
-                    choice_map,
+                gen_info = generation_results[row_idx]
+                generated_text = gen_info["raw_text"]
+                final_text = gen_info["final_text"]
+                incomplete = bool(gen_info["incomplete_final_response"])
+                if incomplete:
+                    num_incomplete += 1
+                if gen_info["possibly_truncated_prompt"]:
+                    num_truncated_prompts += 1
+                predicted_label = (
+                    ""
+                    if incomplete
+                    else extract_official_mmlu_prediction(
+                        final_text,
+                        option_labels,
+                        choice_map,
+                    )
                 )
                 predicted_index = option_labels.index(predicted_label) if predicted_label in option_labels else -1
                 is_correct = int(predicted_index == int(example.answer_index))
@@ -465,17 +643,28 @@ def evaluate_mcq(
                         "generated_text": generated_text,
                         "final_text": final_text,
                         "choice_map": choice_map,
+                        "incomplete_final_response": incomplete,
+                        "retried_for_final_response": bool(gen_info["retried_for_final_response"]),
+                        "used_max_new_tokens": int(gen_info["used_max_new_tokens"]),
+                        "possibly_truncated_prompt": bool(gen_info["possibly_truncated_prompt"]),
                     }
                 )
         total = len(examples)
+        effective = max(total - num_incomplete, 0)
         return {
             "status": "ok",
             "num_samples": total,
             "num_correct": correct,
+            "num_incomplete": num_incomplete,
+            "num_effective": effective,
+            "num_possibly_truncated_prompts": num_truncated_prompts,
             "accuracy": 0.0 if total == 0 else correct / total,
+            "accuracy_effective": 0.0 if effective == 0 else correct / effective,
+            "incomplete_final_response_rate": 0.0 if total == 0 else num_incomplete / total,
             "predictions": predictions,
         }
 
+    # Loglikelihood path (thinking disabled): score each option via continuation NLL.
     for example in examples:
         prompt = _render_official_mmlu_chat_prompt(example)
         option_labels = [chr(ord("A") + idx) for idx in range(len(example.choices))]
@@ -483,6 +672,7 @@ def evaluate_mcq(
         prompt_text = render_qwen_generation_prompt(
             tokenizer,
             build_qwen_messages(prompt),
+            enable_thinking=False,
         )
         scores = {
             label: -_continuation_nll(
@@ -517,7 +707,12 @@ def evaluate_mcq(
         "status": "ok",
         "num_samples": total,
         "num_correct": correct,
+        "num_incomplete": 0,
+        "num_effective": total,
+        "num_possibly_truncated_prompts": 0,
         "accuracy": 0.0 if total == 0 else correct / total,
+        "accuracy_effective": 0.0 if total == 0 else correct / total,
+        "incomplete_final_response_rate": 0.0,
         "predictions": predictions,
     }
 
@@ -530,9 +725,12 @@ def evaluate_gsm8k(
     max_length: int,
     max_new_tokens: int,
     batch_size: int = 1,
+    initial_max_new_tokens: int = 0,
 ) -> Dict[str, Any]:
     device = _resolve_device(model)
     correct = 0
+    num_incomplete = 0
+    num_truncated_prompts = 0
     predictions: List[Dict[str, Any]] = []
     require_final_response = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
     effective_batch_size = max(1, int(batch_size))
@@ -541,25 +739,32 @@ def evaluate_gsm8k(
         prompt_texts = [
             render_qwen_generation_prompt(
                 tokenizer,
-                build_qwen_messages(example.question),
+                build_qwen_messages(_build_gsm8k_prompt(example)),
             )
             for example in batch_examples
         ]
-        generated_texts = _generate_text_batch(
+        generation_results = _generate_with_retry_for_final_response(
             model,
             tokenizer,
             prompt_texts,
             device=device,
             max_length=max_length,
             max_new_tokens=max_new_tokens,
+            initial_max_new_tokens=initial_max_new_tokens,
+            require_final_response=require_final_response,
         )
         for row_idx, example in enumerate(batch_examples):
-            generated_text = generated_texts[row_idx]
-            final_text = strip_qwen_thinking_content(
-                generated_text,
-                require_final_response=require_final_response,
+            gen_info = generation_results[row_idx]
+            generated_text = gen_info["raw_text"]
+            final_text = gen_info["final_text"]
+            incomplete = bool(gen_info["incomplete_final_response"])
+            if incomplete:
+                num_incomplete += 1
+            if gen_info["possibly_truncated_prompt"]:
+                num_truncated_prompts += 1
+            prediction = (
+                "" if incomplete else extract_official_gsm8k_prediction(final_text)
             )
-            prediction = extract_official_gsm8k_prediction(final_text)
             is_correct = int(_gsm8k_answers_match(example.final_answer, prediction))
             correct += is_correct
             predictions.append(
@@ -571,15 +776,25 @@ def evaluate_gsm8k(
                     "correct": bool(is_correct),
                     "generated_text": generated_text,
                     "final_text": final_text,
+                    "incomplete_final_response": incomplete,
+                    "retried_for_final_response": bool(gen_info["retried_for_final_response"]),
+                    "used_max_new_tokens": int(gen_info["used_max_new_tokens"]),
+                    "possibly_truncated_prompt": bool(gen_info["possibly_truncated_prompt"]),
                 }
             )
 
     total = len(examples)
+    effective = max(total - num_incomplete, 0)
     return {
         "status": "ok",
         "num_samples": total,
         "num_correct": correct,
+        "num_incomplete": num_incomplete,
+        "num_effective": effective,
+        "num_possibly_truncated_prompts": num_truncated_prompts,
         "accuracy": 0.0 if total == 0 else correct / total,
+        "accuracy_effective": 0.0 if effective == 0 else correct / effective,
+        "incomplete_final_response_rate": 0.0 if total == 0 else num_incomplete / total,
         "predictions": predictions,
     }
 
@@ -652,25 +867,13 @@ def _truncate_to_longest_python_prefix(text: str) -> str:
     return candidate
 
 
-def _assemble_humaneval_program(example: CodeExample, generated_text: str) -> str:
-    require_final_response = bool(getattr(example, "requires_final_response", False))
-    completion = _extract_humaneval_completion(
-        generated_text,
-        example.entry_point,
-        require_final_response=require_final_response,
-    )
+def _assemble_humaneval_program(example: CodeExample, completion: str) -> str:
     candidate_code = _truncate_to_longest_python_prefix(str(example.prompt) + completion)
     tests_blob = "\n\n".join(example.tests)
     return f"{candidate_code}\n\n{tests_blob}\n\ncheck({example.entry_point})\n"
 
 
-def _assemble_mbpp_program(example: CodeExample, generated_text: str) -> str:
-    require_final_response = bool(getattr(example, "requires_final_response", False))
-    candidate_code = _extract_mbpp_code(
-        generated_text,
-        example.entry_point,
-        require_final_response=require_final_response,
-    )
+def _assemble_mbpp_program(example: CodeExample, candidate_code: str) -> str:
     candidate_code = _trim_to_code_start(candidate_code)
     candidate_code = _truncate_to_longest_python_prefix(candidate_code)
     tests_blob = "\n".join(example.tests)
@@ -687,10 +890,13 @@ def evaluate_code_generation(
     max_new_tokens: int,
     exec_timeout_seconds: int,
     batch_size: int = 1,
+    initial_max_new_tokens: int = 0,
 ) -> Dict[str, Any]:
     device = _resolve_device(model)
     passed = 0
     executable = 0
+    num_incomplete = 0
+    num_truncated_prompts = 0
     predictions: List[Dict[str, Any]] = []
     dataset_key = str(dataset_name).strip().lower()
     require_final_response = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
@@ -714,62 +920,120 @@ def evaluate_code_generation(
                 )
             )
 
-        generated_texts = _generate_text_batch(
+        generation_results = _generate_with_retry_for_final_response(
             model,
             tokenizer,
             prompt_texts,
             device=device,
             max_length=max_length,
             max_new_tokens=max_new_tokens,
+            initial_max_new_tokens=initial_max_new_tokens,
+            require_final_response=require_final_response,
         )
         for row_idx, example in enumerate(batch_examples):
-            generated_text = generated_texts[row_idx]
+            gen_info = generation_results[row_idx]
+            generated_text = gen_info["raw_text"]
+            final_text_only = gen_info["final_text"]
+            incomplete = bool(gen_info["incomplete_final_response"])
+            if gen_info["possibly_truncated_prompt"]:
+                num_truncated_prompts += 1
+
+            prediction_base: Dict[str, Any] = {
+                "task_id": example.task_id,
+                "prompt": example.prompt,
+                "entry_point": example.entry_point,
+                "generated_text": generated_text,
+                "final_text": final_text_only,
+                "incomplete_final_response": incomplete,
+                "retried_for_final_response": bool(gen_info["retried_for_final_response"]),
+                "used_max_new_tokens": int(gen_info["used_max_new_tokens"]),
+                "possibly_truncated_prompt": bool(gen_info["possibly_truncated_prompt"]),
+            }
+
+            if dataset_key == "humaneval" and not example.entry_point:
+                prediction_base.update({"passed": False, "error": "Missing entry_point"})
+                predictions.append(prediction_base)
+                continue
+
+            if incomplete:
+                num_incomplete += 1
+                prediction_base.update(
+                    {
+                        "passed": False,
+                        "error": "incomplete_final_response",
+                        "sanitized_code": "",
+                        "assembled_program": "",
+                    }
+                )
+                predictions.append(prediction_base)
+                continue
+
             if dataset_key == "humaneval":
-                if not example.entry_point:
-                    predictions.append(
+                completion = _extract_humaneval_completion(
+                    generated_text,
+                    example.entry_point,
+                    require_final_response=require_final_response,
+                )
+                if not completion.strip():
+                    num_incomplete += 1
+                    prediction_base.update(
                         {
-                            "task_id": example.task_id,
-                            "prompt": example.prompt,
-                            "entry_point": example.entry_point,
                             "passed": False,
-                            "error": "Missing entry_point",
-                            "generated_text": generated_text,
+                            "error": "empty_completion",
+                            "sanitized_code": "",
+                            "assembled_program": "",
                         }
                     )
+                    predictions.append(prediction_base)
                     continue
-                program = _assemble_humaneval_program(example, generated_text)
+                program = _assemble_humaneval_program(example, completion)
             else:
-                program = _assemble_mbpp_program(example, generated_text)
+                candidate_code = _extract_mbpp_code(
+                    generated_text,
+                    example.entry_point,
+                    require_final_response=require_final_response,
+                )
+                if not candidate_code.strip():
+                    num_incomplete += 1
+                    prediction_base.update(
+                        {
+                            "passed": False,
+                            "error": "empty_completion",
+                            "sanitized_code": "",
+                            "assembled_program": "",
+                        }
+                    )
+                    predictions.append(prediction_base)
+                    continue
+                program = _assemble_mbpp_program(example, candidate_code)
 
             executable += 1
             task_passed, error_text = _run_code_program(program, exec_timeout_seconds)
             passed += int(task_passed)
-            predictions.append(
+            prediction_base.update(
                 {
-                    "task_id": example.task_id,
-                    "prompt": example.prompt,
-                    "entry_point": example.entry_point,
                     "passed": bool(task_passed),
                     "error": error_text,
-                    "generated_text": generated_text,
                     "sanitized_code": sanitize_code_generation(
-                        generated_text,
-                        require_final_response=require_final_response,
-                    ),
-                    "final_text": strip_qwen_thinking_content(
                         generated_text,
                         require_final_response=require_final_response,
                     ),
                     "assembled_program": program,
                 }
             )
+            predictions.append(prediction_base)
 
+    total = len(examples)
     return {
         "status": "ok",
-        "num_samples": len(examples),
+        "num_samples": total,
         "num_executable": executable,
         "num_passed": passed,
-        "pass_at_1": 0.0 if executable == 0 else passed / executable,
+        "num_incomplete": num_incomplete,
+        "num_possibly_truncated_prompts": num_truncated_prompts,
+        "pass_at_1": 0.0 if total == 0 else passed / total,
+        "pass_at_1_effective": 0.0 if executable == 0 else passed / executable,
+        "incomplete_final_response_rate": 0.0 if total == 0 else num_incomplete / total,
         "predictions": predictions,
     }
 

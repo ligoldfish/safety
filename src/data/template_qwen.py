@@ -58,14 +58,12 @@ _QWEN_RESPONSE_LINE_RE = re.compile(
 
 def _resolve_enable_thinking(tokenizer: Any, enable_thinking: bool | None) -> bool:
     if enable_thinking is False:
-        raise ValueError("Non-thinking chat template mode is no longer supported for Qwen3.5.")
+        return False
     if enable_thinking is True:
         return True
     inherited = getattr(tokenizer, "_codex_chat_template_enable_thinking", None)
-    if inherited is False:
-        raise ValueError("Non-thinking chat template mode is no longer supported for Qwen3.5.")
     if inherited is None:
-        return True
+        return False
     return bool(inherited)
 
 
@@ -84,7 +82,7 @@ def build_qwen_messages(
 def render_qwen_generation_prompt(
     tokenizer: Any,
     messages: Sequence[Dict[str, str]],
-    enable_thinking: bool | None = True,
+    enable_thinking: bool | None = None,
 ) -> str:
     resolved_enable_thinking = _resolve_enable_thinking(tokenizer, enable_thinking)
     if hasattr(tokenizer, "apply_chat_template"):
@@ -111,7 +109,7 @@ def render_qwen_supervised_text(
     tokenizer: Any,
     messages: Sequence[Dict[str, str]],
     assistant_text: str,
-    enable_thinking: bool | None = True,
+    enable_thinking: bool | None = None,
 ) -> str:
     full_messages = list(messages) + [{"role": "assistant", "content": assistant_text}]
     resolved_enable_thinking = _resolve_enable_thinking(tokenizer, enable_thinking)
@@ -133,7 +131,7 @@ def render_qwen_supervised_text(
 def render_qwen_final_response_prefix(
     tokenizer: Any,
     messages: Sequence[Dict[str, str]],
-    enable_thinking: bool | None = True,
+    enable_thinking: bool | None = None,
 ) -> str:
     return render_qwen_supervised_text(
         tokenizer=tokenizer,
