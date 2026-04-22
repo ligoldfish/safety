@@ -5,6 +5,4 @@ __pycache__/
 *.pyc
 *.pyo
 pan_results.json
-external/opencompass/
 *.pdf
-configs/*_launcher_*.yaml
