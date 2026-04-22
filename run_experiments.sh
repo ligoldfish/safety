@@ -12,11 +12,21 @@ DEVICE=""
 VISIBLE_DEVICES=""
 EXPERIMENTS=()
 EFFECTIVE_DEVICE_ID="0"
+OPENCOMPASS_DIR="${OPENCOMPASS_DIR:-}"
+OPENCOMPASS_DATASETS="${OPENCOMPASS_DATASETS:-mmlu gsm8k humaneval mbpp}"
+SKIP_OPENCOMPASS="0"
+
+# Auto-pick the co-located OpenCompass clone under external/opencompass when present.
+if [[ -z "${OPENCOMPASS_DIR}" && -f "${PROJECT_ROOT}/external/opencompass/run.py" ]]; then
+  OPENCOMPASS_DIR="${PROJECT_ROOT}/external/opencompass"
+fi
 
 usage() {
   cat <<'EOF'
 Usage:
-  bash /root/run_experiments.sh --device <npu|tpu> --visible-devices <ids> <exp1> [exp2] ...
+  bash /root/run_experiments.sh --device <npu|tpu> --visible-devices <ids> \
+    [--opencompass-dir <path>] [--opencompass-datasets "<ds1 ds2 ...>"] [--skip-opencompass] \
+    <exp1> [exp2] ...
 
 Experiments:
   nosft_1b
@@ -28,6 +38,15 @@ Experiments:
   full
   smoke
   all
+
+OpenCompass:
+  --opencompass-dir <path>         Path to a cloned OpenCompass repo. When set, general-capability
+                                   eval (MMLU/GSM8K/HumanEval/MBPP) runs automatically after each
+                                   experiment's safety eval. Environment variable OPENCOMPASS_DIR
+                                   also works.
+  --opencompass-datasets "<list>"  Space-separated dataset names forwarded to OpenCompass. Default:
+                                   "mmlu gsm8k humaneval mbpp".
+  --skip-opencompass               Explicitly skip OpenCompass even if --opencompass-dir is set.
 EOF
 }
 
@@ -41,6 +60,18 @@ parse_args() {
       --visible-devices)
         VISIBLE_DEVICES="$2"
         shift 2
+        ;;
+      --opencompass-dir)
+        OPENCOMPASS_DIR="$2"
+        shift 2
+        ;;
+      --opencompass-datasets)
+        OPENCOMPASS_DATASETS="$2"
+        shift 2
+        ;;
+      --skip-opencompass)
+        SKIP_OPENCOMPASS="1"
+        shift
         ;;
       -h|--help)
         usage
@@ -96,11 +127,25 @@ run_launcher() {
   local subcommand="$1"
   shift
 
-  run_cmd "${PYTHON_BIN}" scripts/15_run_oneclick.py "${subcommand}" \
-    --device "${DEVICE}" \
-    --device-id "${EFFECTIVE_DEVICE_ID}" \
-    --num-devices 1 \
-    "$@"
+  local -a launcher_args=(
+    "${subcommand}"
+    --device "${DEVICE}"
+    --device-id "${EFFECTIVE_DEVICE_ID}"
+    --num-devices 1
+  )
+  if [[ "${SKIP_OPENCOMPASS}" == "1" ]]; then
+    launcher_args+=(--skip-opencompass)
+  elif [[ -n "${OPENCOMPASS_DIR}" ]]; then
+    launcher_args+=(--opencompass-dir "${OPENCOMPASS_DIR}")
+    if [[ -n "${OPENCOMPASS_DATASETS}" ]]; then
+      # Split dataset list on whitespace so argparse nargs="+" receives multiple values.
+      # shellcheck disable=SC2206
+      local -a oc_ds=(${OPENCOMPASS_DATASETS})
+      launcher_args+=(--opencompass-datasets "${oc_ds[@]}")
+    fi
+  fi
+
+  run_cmd "${PYTHON_BIN}" scripts/15_run_oneclick.py "${launcher_args[@]}" "$@"
 }
 
 run_nosft_1b() { run_launcher nosft --model 1b; }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -42,7 +43,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--max-out-len", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--num-gpus", type=int, default=1)
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=-1,
+        help=(
+            "Number of accelerators (CUDA GPUs or Ascend NPUs) exposed per task. "
+            "0 selects CPU-only. When left at -1, the launcher auto-selects 1 on "
+            "hosts with a visible accelerator (CUDA or ASCEND) and 0 otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=("auto", "cuda", "npu", "cpu"),
+        help=(
+            "Target accelerator backend. 'auto' detects ASCEND_RT_VISIBLE_DEVICES / "
+            "CUDA_VISIBLE_DEVICES from the environment."
+        ),
+    )
+    parser.add_argument(
+        "--torch-dtype",
+        default="torch.float16",
+        help=(
+            "torch dtype string accepted by OpenCompass (_set_model_kwargs_torch_dtype): "
+            "'torch.float16' (default, matches training dtype), 'torch.bfloat16', "
+            "'torch.float', or 'auto'."
+        ),
+    )
+    parser.add_argument(
+        "--attn-impl",
+        default="eager",
+        choices=("eager", "sdpa", "flash_attention_2", "auto"),
+        help=(
+            "Attention implementation forwarded to from_pretrained via model-kwargs. "
+            "'eager' is the most portable and lossless on NPU; 'auto' lets transformers pick."
+        ),
+    )
     parser.add_argument(
         "--hf-type",
         default="chat",
@@ -71,6 +108,40 @@ def _resolve_opencompass_entry(opencompass_dir: Path) -> Path:
     )
 
 
+def _detect_backend(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    has_ascend = bool(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip())
+    has_cuda = bool(os.environ.get("CUDA_VISIBLE_DEVICES", "").strip())
+    if has_ascend and not has_cuda:
+        return "npu"
+    if has_cuda:
+        return "cuda"
+    return "cpu"
+
+
+def _default_num_gpus(requested: int, backend: str) -> int:
+    if requested >= 0:
+        return requested
+    return 0 if backend == "cpu" else 1
+
+
+def _build_model_kwargs_tokens(backend: str, attn_impl: str, torch_dtype: str) -> list[str]:
+    # Each list entry becomes a separate argv token for mmengine DictAction (nargs='+').
+    # Tokens are strings of form key=value; do NOT join with spaces (DictAction parses
+    # each argv token individually via split('=', 1)).
+    tokens = ["trust_remote_code=True"]
+    if backend == "cpu":
+        tokens.append("device_map=cpu")
+    else:
+        tokens.append("device_map=auto")
+    if attn_impl != "auto":
+        tokens.append(f"attn_implementation={attn_impl}")
+    if torch_dtype:
+        tokens.append(f"torch_dtype={torch_dtype}")
+    return tokens
+
+
 def main() -> None:
     args = parse_args()
     merged_model_dir = Path(args.merged_model_dir).resolve()
@@ -80,6 +151,10 @@ def main() -> None:
     run_py = _resolve_opencompass_entry(opencompass_dir)
     work_dir = Path(args.work_dir).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
+    backend = _detect_backend(args.device)
+    num_gpus = _default_num_gpus(args.num_gpus, backend)
+    model_kwargs_tokens = _build_model_kwargs_tokens(backend, args.attn_impl, args.torch_dtype)
+    tokenizer_kwargs_tokens = ["trust_remote_code=True", "use_fast=True"]
 
     cmd = [
         sys.executable,
@@ -91,9 +166,9 @@ def main() -> None:
         "--tokenizer-path",
         str(merged_model_dir),
         "--model-kwargs",
-        "device_map='auto' trust_remote_code=True",
+        *model_kwargs_tokens,
         "--tokenizer-kwargs",
-        "trust_remote_code=True use_fast=True",
+        *tokenizer_kwargs_tokens,
         "--max-seq-len",
         str(args.max_seq_len),
         "--max-out-len",
@@ -101,7 +176,7 @@ def main() -> None:
         "--batch-size",
         str(args.batch_size),
         "--hf-num-gpus",
-        str(args.num_gpus),
+        str(num_gpus),
         "--work-dir",
         str(work_dir),
         "--datasets",
@@ -118,15 +193,32 @@ def main() -> None:
         "entry": str(run_py),
         "work_dir": str(work_dir),
         "datasets": list(args.datasets),
+        "hf_num_gpus": num_gpus,
+        "backend": backend,
+        "attn_impl": args.attn_impl,
+        "torch_dtype": args.torch_dtype,
+        "model_kwargs_tokens": model_kwargs_tokens,
         "command": cmd,
     }
     (work_dir / "opencompass_invocation.json").write_text(
         json.dumps(invocation, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print("Running OpenCompass:")
+    print(f"Running OpenCompass (backend={backend}, num_gpus={num_gpus}):")
     print("  " + " ".join(cmd))
-    subprocess.run(cmd, check=True, cwd=str(opencompass_dir))
+    env = os.environ.copy()
+    if backend == "npu":
+        # Ensure torch_npu is auto-loaded so mmengine.device.is_npu_available() sees it.
+        # Do NOT set TORCH_DEVICE_BACKEND_AUTOLOAD=0 on NPU — it disables torch_npu.
+        env.pop("TORCH_DEVICE_BACKEND_AUTOLOAD", None)
+        # Propagate the user-selected devices; opencompass LocalRunner reads this.
+        if "ASCEND_RT_VISIBLE_DEVICES" not in env:
+            env["ASCEND_RT_VISIBLE_DEVICES"] = "0"
+    elif backend == "cpu":
+        # Force opencompass onto the CPU path; block torch_npu auto-loading on Ascend hosts.
+        env.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+    subprocess.run(cmd, check=True, cwd=str(opencompass_dir), env=env)
 
 
 if __name__ == "__main__":

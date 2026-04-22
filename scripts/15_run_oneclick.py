@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.baselines import load_distill_config, load_sft_config
+from src.baselines import load_distill_config, load_eval_config, load_sft_config
 from src.utils.config import load_phase1_config, load_phasef_config
 
 
@@ -104,6 +104,26 @@ def parse_args() -> argparse.Namespace:
             "--dry-run",
             action="store_true",
             help="Print the commands without executing them.",
+        )
+        target_parser.add_argument(
+            "--opencompass-dir",
+            default="",
+            help=(
+                "Path to a cloned OpenCompass repo. When set, the launcher automatically runs "
+                "general-capability eval (MMLU/GSM8K/HumanEval/MBPP) after each experiment's safety eval. "
+                "Leave empty or use --skip-opencompass to skip this step."
+            ),
+        )
+        target_parser.add_argument(
+            "--opencompass-datasets",
+            nargs="+",
+            default=["mmlu", "gsm8k", "humaneval", "mbpp"],
+            help="Datasets forwarded to scripts/17_eval_opencompass.py --datasets.",
+        )
+        target_parser.add_argument(
+            "--skip-opencompass",
+            action="store_true",
+            help="Skip the OpenCompass general-capability eval even when --opencompass-dir is provided.",
         )
 
     nosft_parser = subparsers.add_parser("nosft", help="Run no-SFT benchmark evaluation.")
@@ -193,6 +213,122 @@ def _build_env_overrides(device: str, device_id: int) -> dict[str, str]:
             return {"ASCEND_RT_VISIBLE_DEVICES": inherited_visible_devices}
         return {"ASCEND_RT_VISIBLE_DEVICES": str(device_id)}
     return {}
+
+
+def _should_run_opencompass(opencompass_dir: str, skip_opencompass: bool) -> bool:
+    if skip_opencompass:
+        print("[INFO] OpenCompass step skipped (--skip-opencompass).")
+        return False
+    if not opencompass_dir:
+        print("[INFO] --opencompass-dir not provided; skipping OpenCompass general-capability eval.")
+        return False
+    if not Path(opencompass_dir).expanduser().exists():
+        print(f"[WARN] OpenCompass dir not found: {opencompass_dir}; skipping.")
+        return False
+    return True
+
+
+def _run_merge_lora(
+    *,
+    eval_config: Path,
+    manifest_path: Path,
+    checkpoint_path: Path,
+    merged_dir: Path,
+    dry_run: bool,
+    env_overrides: dict[str, str] | None = None,
+) -> None:
+    _run_script(
+        "16_merge_lora_for_opencompass.py",
+        [
+            "--config",
+            str(eval_config),
+            "--adapter-manifest",
+            str(manifest_path),
+            "--adapter-checkpoint",
+            str(checkpoint_path),
+            "--output-dir",
+            str(merged_dir),
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+
+def _run_opencompass_eval(
+    *,
+    merged_model_dir: Path,
+    work_dir: Path,
+    opencompass_dir: str,
+    datasets: Sequence[str],
+    dry_run: bool,
+    env_overrides: dict[str, str] | None = None,
+) -> None:
+    _run_script(
+        "17_eval_opencompass.py",
+        [
+            "--merged-model-dir",
+            str(merged_model_dir),
+            "--opencompass-dir",
+            str(Path(opencompass_dir).expanduser()),
+            "--work-dir",
+            str(work_dir),
+            "--datasets",
+            *datasets,
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+
+def _run_opencompass_for_adapter(
+    *,
+    eval_config: Path,
+    training_output_root: Path,
+    checkpoint_path: Path,
+    opencompass_dir: str,
+    datasets: Sequence[str],
+    dry_run: bool,
+    env_overrides: dict[str, str] | None = None,
+) -> None:
+    merged_dir = training_output_root / "merged_hf"
+    work_dir = training_output_root / "opencompass"
+    _run_merge_lora(
+        eval_config=eval_config,
+        manifest_path=training_output_root / "manifest.json",
+        checkpoint_path=checkpoint_path,
+        merged_dir=merged_dir,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    _run_opencompass_eval(
+        merged_model_dir=merged_dir,
+        work_dir=work_dir,
+        opencompass_dir=opencompass_dir,
+        datasets=datasets,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+
+def _run_opencompass_for_base_model(
+    *,
+    eval_config_path: Path,
+    opencompass_dir: str,
+    datasets: Sequence[str],
+    dry_run: bool,
+    env_overrides: dict[str, str] | None = None,
+) -> None:
+    eval_cfg = load_eval_config(eval_config_path)
+    base_model_dir = Path(eval_cfg.model.path).resolve()
+    work_dir = Path(eval_cfg.output.output_root) / "opencompass"
+    _run_opencompass_eval(
+        merged_model_dir=base_model_dir,
+        work_dir=work_dir,
+        opencompass_dir=opencompass_dir,
+        datasets=datasets,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
 
 
 def _override_model_runtime(model_payload: dict[str, Any], device: str, device_id: int) -> None:
@@ -285,7 +421,17 @@ def _run_phase1_precompute(
         )
 
 
-def _run_baseline_nosft(device: str, model_size: str, *, device_id: int, num_devices: int, dry_run: bool) -> None:
+def _run_baseline_nosft(
+    device: str,
+    model_size: str,
+    *,
+    device_id: int,
+    num_devices: int,
+    dry_run: bool,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+) -> None:
     _validate_device_request(num_devices)
     eval_config = _make_runtime_override_config(
         _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)]),
@@ -299,9 +445,27 @@ def _run_baseline_nosft(device: str, model_size: str, *, device_id: int, num_dev
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
+    if _should_run_opencompass(opencompass_dir, skip_opencompass):
+        _run_opencompass_for_base_model(
+            eval_config_path=eval_config,
+            opencompass_dir=opencompass_dir,
+            datasets=opencompass_datasets,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
 
 
-def _run_baseline_sft(device: str, model_size: str, *, device_id: int, num_devices: int, dry_run: bool) -> None:
+def _run_baseline_sft(
+    device: str,
+    model_size: str,
+    *,
+    device_id: int,
+    num_devices: int,
+    dry_run: bool,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+) -> None:
     _validate_device_request(num_devices)
     train_config = _make_runtime_override_config(
         _resolve(BASELINE_SFT_CONFIGS[(device, model_size)]),
@@ -341,9 +505,28 @@ def _run_baseline_sft(device: str, model_size: str, *, device_id: int, num_devic
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
+    if _should_run_opencompass(opencompass_dir, skip_opencompass):
+        _run_opencompass_for_adapter(
+            eval_config=eval_config,
+            training_output_root=Path(cfg.output.output_root),
+            checkpoint_path=checkpoint_path,
+            opencompass_dir=opencompass_dir,
+            datasets=opencompass_datasets,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
 
 
-def _run_baseline_distill(device: str, *, device_id: int, num_devices: int, dry_run: bool) -> None:
+def _run_baseline_distill(
+    device: str,
+    *,
+    device_id: int,
+    num_devices: int,
+    dry_run: bool,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+) -> None:
     _validate_device_request(num_devices)
     train_config = _make_runtime_override_config(
         _resolve(BASELINE_DISTILL_CONFIGS[device]),
@@ -383,6 +566,16 @@ def _run_baseline_distill(device: str, *, device_id: int, num_devices: int, dry_
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
+    if _should_run_opencompass(opencompass_dir, skip_opencompass):
+        _run_opencompass_for_adapter(
+            eval_config=eval_config,
+            training_output_root=Path(cfg.output.output_root),
+            checkpoint_path=checkpoint_path,
+            opencompass_dir=opencompass_dir,
+            datasets=opencompass_datasets,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
 
 
 def _run_adapter_eval(
@@ -393,6 +586,9 @@ def _run_adapter_eval(
     device_id: int,
     dry_run: bool,
     env_overrides: dict[str, str] | None = None,
+    opencompass_dir: str = "",
+    opencompass_datasets: Sequence[str] = (),
+    skip_opencompass: bool = True,
 ) -> None:
     eval_config = _make_runtime_override_config(
         _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)]),
@@ -418,9 +614,28 @@ def _run_adapter_eval(
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
+    if _should_run_opencompass(opencompass_dir, skip_opencompass):
+        _run_opencompass_for_adapter(
+            eval_config=eval_config,
+            training_output_root=training_output_root,
+            checkpoint_path=checkpoint_path,
+            opencompass_dir=opencompass_dir,
+            datasets=opencompass_datasets,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
 
 
-def _run_random_baseline(device: str, *, device_id: int, num_devices: int, dry_run: bool) -> None:
+def _run_random_baseline(
+    device: str,
+    *,
+    device_id: int,
+    num_devices: int,
+    dry_run: bool,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+) -> None:
     _validate_device_request(num_devices)
     phase1_config = _make_runtime_override_config(
         _resolve(RANDOM_PIPELINE_CONFIGS[device]["phase1"]),
@@ -472,10 +687,23 @@ def _run_random_baseline(device: str, *, device_id: int, num_devices: int, dry_r
         device_id=device_id,
         dry_run=dry_run,
         env_overrides=env_overrides,
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
     )
 
 
-def _run_full_pipeline(device: str, *, device_id: int, num_devices: int, smoke: bool, dry_run: bool) -> None:
+def _run_full_pipeline(
+    device: str,
+    *,
+    device_id: int,
+    num_devices: int,
+    smoke: bool,
+    dry_run: bool,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+) -> None:
     _validate_device_request(num_devices)
     config_map = SMOKE_PIPELINE_CONFIGS if smoke else FULL_PIPELINE_CONFIGS
     phase1_config = _make_runtime_override_config(
@@ -509,6 +737,9 @@ def _run_full_pipeline(device: str, *, device_id: int, num_devices: int, smoke: 
         device_id=device_id,
         dry_run=dry_run,
         env_overrides=env_overrides,
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
     )
 
     if not dry_run:
@@ -525,6 +756,11 @@ def _run_full_pipeline(device: str, *, device_id: int, num_devices: int, smoke: 
 
 def main() -> None:
     args = parse_args()
+    oc_kwargs = {
+        "opencompass_dir": args.opencompass_dir,
+        "opencompass_datasets": args.opencompass_datasets,
+        "skip_opencompass": args.skip_opencompass,
+    }
     if args.command == "nosft":
         _run_baseline_nosft(
             args.device,
@@ -532,6 +768,7 @@ def main() -> None:
             device_id=args.device_id,
             num_devices=args.num_devices,
             dry_run=args.dry_run,
+            **oc_kwargs,
         )
         return
     if args.command == "sft":
@@ -541,6 +778,7 @@ def main() -> None:
             device_id=args.device_id,
             num_devices=args.num_devices,
             dry_run=args.dry_run,
+            **oc_kwargs,
         )
         return
     if args.command == "distill":
@@ -549,6 +787,7 @@ def main() -> None:
             device_id=args.device_id,
             num_devices=args.num_devices,
             dry_run=args.dry_run,
+            **oc_kwargs,
         )
         return
     if args.command == "random":
@@ -557,6 +796,7 @@ def main() -> None:
             device_id=args.device_id,
             num_devices=args.num_devices,
             dry_run=args.dry_run,
+            **oc_kwargs,
         )
         return
     if args.command == "full":
@@ -566,6 +806,7 @@ def main() -> None:
             num_devices=args.num_devices,
             smoke=False,
             dry_run=args.dry_run,
+            **oc_kwargs,
         )
         return
     if args.command == "smoke":
@@ -575,6 +816,7 @@ def main() -> None:
             num_devices=args.num_devices,
             smoke=True,
             dry_run=args.dry_run,
+            **oc_kwargs,
         )
         return
     raise ValueError(f"Unsupported command: {args.command}")
