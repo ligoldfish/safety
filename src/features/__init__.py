@@ -1,6 +1,5 @@
 from .first_gen_token import (
     build_chat_batch,
-    build_response_prefix_batch,
     extract_last_position_hidden,
     gather_final_response_prefix_representations,
     gather_first_generated_token_representations,
@@ -19,7 +18,6 @@ __all__ = [
     "SemanticBasisResult",
     "SafeSubspaceResult",
     "build_chat_batch",
-    "build_response_prefix_batch",
     "build_layer_pairs",
     "build_semantic_basis_from_lm_head",
     "build_teacher_safe_subspace",

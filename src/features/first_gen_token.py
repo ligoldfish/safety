@@ -4,29 +4,7 @@ from typing import Any, Dict, List, Sequence
 
 import torch
 
-from src.data.template_qwen import render_qwen_final_response_prefix
-
-
-def build_response_prefix_batch(
-    tokenizer: Any,
-    messages_batch: Sequence[Sequence[Dict[str, str]]],
-    max_length: int,
-    device: torch.device | str | None = None,
-) -> tuple[Dict[str, torch.Tensor], List[str]]:
-    prefix_texts = [
-        render_qwen_final_response_prefix(tokenizer=tokenizer, messages=messages)
-        for messages in messages_batch
-    ]
-    encoded = tokenizer(
-        prefix_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-    )
-    if device is not None:
-        encoded = {key: value.to(device) for key, value in encoded.items()}
-    return encoded, prefix_texts
+from src.data.template_qwen import render_qwen_generation_prompt
 
 
 def build_chat_batch(
@@ -35,12 +13,20 @@ def build_chat_batch(
     max_length: int,
     device: torch.device | str | None = None,
 ) -> tuple[Dict[str, torch.Tensor], List[str]]:
-    return build_response_prefix_batch(
-        tokenizer=tokenizer,
-        messages_batch=messages_batch,
+    prompt_texts = [
+        render_qwen_generation_prompt(tokenizer=tokenizer, messages=messages)
+        for messages in messages_batch
+    ]
+    encoded = tokenizer(
+        prompt_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
         max_length=max_length,
-        device=device,
     )
+    if device is not None:
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+    return encoded, prompt_texts
 
 
 def _last_non_padding_positions(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -70,18 +56,26 @@ def extract_last_position_hidden(
 
 
 @torch.no_grad()
-def gather_final_response_prefix_representations(
+def gather_first_generated_token_representations(
     model: Any,
     tokenizer: Any,
     messages_batch: Sequence[Sequence[Dict[str, str]]],
     max_length: int,
 ) -> tuple[List[torch.Tensor], List[str], torch.Tensor]:
+    """Gather each layer's hidden state at the first-assistant-token prediction position.
+
+    The prompt is rendered with ``apply_chat_template(..., add_generation_prompt=True)``
+    so the final non-padding token corresponds to the position whose next-token
+    distribution is the first generated token. This matches the original proposal's
+    "first generated token hidden state" semantics (Pan-style).
+    """
+
     try:
         device = next(model.parameters()).device
     except StopIteration:
         device = torch.device("cpu")
 
-    encoded, prefix_texts = build_response_prefix_batch(
+    encoded, prompt_texts = build_chat_batch(
         tokenizer=tokenizer,
         messages_batch=messages_batch,
         max_length=max_length,
@@ -104,19 +98,10 @@ def gather_final_response_prefix_representations(
     )
     last_positions = _last_non_padding_positions(encoded["attention_mask"]).detach().cpu()
     layer_hiddens = [tensor.detach().cpu() for tensor in layer_hiddens]
-    return layer_hiddens, prefix_texts, last_positions
+    return layer_hiddens, prompt_texts, last_positions
 
 
-@torch.no_grad()
-def gather_first_generated_token_representations(
-    model: Any,
-    tokenizer: Any,
-    messages_batch: Sequence[Sequence[Dict[str, str]]],
-    max_length: int,
-) -> tuple[List[torch.Tensor], List[str], torch.Tensor]:
-    return gather_final_response_prefix_representations(
-        model=model,
-        tokenizer=tokenizer,
-        messages_batch=messages_batch,
-        max_length=max_length,
-    )
+# Backward-compatible alias retained so older callers (e.g., previously-generated
+# shards described as "final_response_prefix") keep importing without breakage.
+# New code must use gather_first_generated_token_representations.
+gather_final_response_prefix_representations = gather_first_generated_token_representations

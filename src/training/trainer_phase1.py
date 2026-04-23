@@ -10,12 +10,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from src.data.template_qwen import (
-    render_qwen_final_response_prefix,
     render_qwen_generation_prompt,
     render_qwen_supervised_text,
-    strip_qwen_thinking_content,
 )
-from src.training.eval_utils import HarmfulResponseJudgment, judge_harmful_response_safety, looks_like_refusal, mean
+from src.training.eval_utils import looks_like_refusal, mean
 from src.training.losses import cosine_layer_alignment_loss
 from src.utils.io import ensure_dir, read_jsonl, write_json
 
@@ -112,7 +110,7 @@ class BatchPayload:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     labels: torch.Tensor
-    response_prefix_last_positions: torch.Tensor
+    prompt_last_positions: torch.Tensor
     layer_targets: Dict[int, torch.Tensor]
     sample_ids: List[str]
     labels_text: List[str]
@@ -120,6 +118,16 @@ class BatchPayload:
 
 
 class SemAlignCollator:
+    """Tokenize supervised batches and mark the first-generated-token position.
+
+    ``prompt_last_positions`` is the index of the last token of the generation-
+    prompt rendering (``apply_chat_template(..., add_generation_prompt=True)``),
+    which is the same position used by ``01_extract_hidden_states.py`` to cache
+    teacher/student "first generated token" hidden states. The supervision mask
+    sets labels to ``-100`` on the prompt span so only the assistant response
+    contributes to ``L_out``.
+    """
+
     def __init__(self, tokenizer: Any, *, max_length: int, layer_ids: Sequence[int]) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
@@ -128,8 +136,8 @@ class SemAlignCollator:
     def __call__(self, batch: Sequence[Dict[str, Any]]) -> BatchPayload:
         records = [item["record"] for item in batch]
         target_dicts = [item["targets"] for item in batch]
-        response_prefix_texts = [
-            render_qwen_final_response_prefix(self.tokenizer, record["messages"])
+        prompt_texts = [
+            render_qwen_generation_prompt(self.tokenizer, record["messages"])
             for record in records
         ]
         full_texts = [
@@ -150,8 +158,8 @@ class SemAlignCollator:
             truncation=True,
             max_length=self.max_length,
         )
-        encoded_prefix = self.tokenizer(
-            response_prefix_texts,
+        encoded_prompt = self.tokenizer(
+            prompt_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -159,12 +167,12 @@ class SemAlignCollator:
         )
         self.tokenizer.padding_side = previous_padding_side
 
-        response_prefix_lengths = encoded_prefix["attention_mask"].sum(dim=1).to(dtype=torch.long)
-        response_prefix_last_positions = torch.clamp(response_prefix_lengths - 1, min=0)
+        prompt_lengths = encoded_prompt["attention_mask"].sum(dim=1).to(dtype=torch.long)
+        prompt_last_positions = torch.clamp(prompt_lengths - 1, min=0)
 
         labels = encoded_full["input_ids"].clone()
-        for row_idx, prefix_len in enumerate(response_prefix_lengths.tolist()):
-            labels[row_idx, :prefix_len] = -100
+        for row_idx, prompt_len in enumerate(prompt_lengths.tolist()):
+            labels[row_idx, :prompt_len] = -100
 
         layer_targets = {
             layer_idx: torch.stack([target_dict[layer_idx] for target_dict in target_dicts], dim=0)
@@ -174,7 +182,7 @@ class SemAlignCollator:
             input_ids=encoded_full["input_ids"],
             attention_mask=encoded_full["attention_mask"],
             labels=labels,
-            response_prefix_last_positions=response_prefix_last_positions,
+            prompt_last_positions=prompt_last_positions,
             layer_targets=layer_targets,
             sample_ids=[str(record["id"]) for record in records],
             labels_text=[str(record["label"]) for record in records],
@@ -201,7 +209,7 @@ def _capture_layer_outputs(
     model: nn.Module,
     *,
     layer_ids: Sequence[int],
-    response_prefix_last_positions: torch.Tensor,
+    prompt_last_positions: torch.Tensor,
     cache: Dict[int, torch.Tensor],
 ):
     hooks = []
@@ -211,7 +219,7 @@ def _capture_layer_outputs(
         def hook(_module, _inputs, output, current_layer_idx=layer_idx):
             hidden = output[0] if isinstance(output, tuple) else output
             batch_indices = torch.arange(hidden.size(0), device=hidden.device)
-            selected = hidden[batch_indices, response_prefix_last_positions.to(hidden.device), :]
+            selected = hidden[batch_indices, prompt_last_positions.to(hidden.device), :]
             cache[current_layer_idx] = selected
             return output
 
@@ -232,12 +240,12 @@ def forward_semalign_batch(
         "attention_mask": batch.attention_mask.to(device),
         "labels": batch.labels.to(device),
     }
-    response_prefix_last_positions = batch.response_prefix_last_positions.to(device)
+    prompt_last_positions = batch.prompt_last_positions.to(device)
     cache: Dict[int, torch.Tensor] = {}
     hooks = _capture_layer_outputs(
         model,
         layer_ids=layer_ids,
-        response_prefix_last_positions=response_prefix_last_positions,
+        prompt_last_positions=prompt_last_positions,
         cache=cache,
     )
     try:
@@ -278,12 +286,12 @@ def evaluate_layer_alignment(
             "input_ids": batch.input_ids.to(device),
             "attention_mask": batch.attention_mask.to(device),
         }
-        response_prefix_last_positions = batch.response_prefix_last_positions.to(device)
+        prompt_last_positions = batch.prompt_last_positions.to(device)
         cache: Dict[int, torch.Tensor] = {}
         hooks = _capture_layer_outputs(
             model,
             layer_ids=layer_ids,
-            response_prefix_last_positions=response_prefix_last_positions,
+            prompt_last_positions=prompt_last_positions,
             cache=cache,
         )
         try:
@@ -310,42 +318,37 @@ def evaluate_generation_refusal_metrics(
     max_length: int,
     max_new_tokens: int,
     batch_size: int = 1,
-    initial_max_new_tokens: int = 0,
 ) -> Dict[str, Any]:
+    """Original-plan sanity metric: refusal-rate only, no thinking/safe/unsafe split.
+
+    Matches the Phase-G plan: harmful refusal rate, harmful unsafe output rate
+    (= 1 - refusal), harmless over-refusal rate. No ``final_response`` extraction
+    or regex-based "safe" carve-out; that variant belongs to the later PAN
+    extension and is explicitly out of scope for the baseline sanity check.
+    """
+
     harmful_total = 0
     harmless_total = 0
     harmful_refusals = 0
-    harmful_safes = 0
     harmful_unsafes = 0
-    harmful_incomplete = 0
     harmless_refusals = 0
-    harmless_incomplete = 0
-    generations: List[Dict[str, Any]] = []
+    generations: List[Dict[str, str]] = []
 
     previous_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     model.eval()
     runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
     xla_model = getattr(model, "_codex_xla_model", None)
-    require_final_response = bool(getattr(tokenizer, "_codex_chat_template_enable_thinking", False))
 
     effective_batch_size = max(1, int(batch_size))
-    initial_generation_max_new_tokens = int(max_new_tokens)
-    if require_final_response and int(initial_max_new_tokens) > 0:
-        initial_generation_max_new_tokens = max(
-            1,
-            min(int(initial_max_new_tokens), int(max_new_tokens)),
-        )
-
-    def _generate_responses(
-        prompt_texts: Sequence[str],
-        *,
-        generation_max_new_tokens: int,
-    ) -> tuple[List[str], List[str]]:
-        if not prompt_texts:
-            return [], []
+    for batch_start in range(0, len(records), effective_batch_size):
+        batch_records = list(records[batch_start: batch_start + effective_batch_size])
+        prompt_texts = [
+            render_qwen_generation_prompt(tokenizer, record["messages"])
+            for record in batch_records
+        ]
         encoded = tokenizer(
-            list(prompt_texts),
+            prompt_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -355,7 +358,7 @@ def evaluate_generation_refusal_metrics(
         with torch.inference_mode():
             generated = model.generate(
                 **encoded,
-                max_new_tokens=generation_max_new_tokens,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
                 use_cache=True,
                 eos_token_id=tokenizer.eos_token_id,
@@ -364,115 +367,34 @@ def evaluate_generation_refusal_metrics(
         if runtime_backend == "tpu" and xla_model is not None:
             xla_model.mark_step()
         prompt_width = int(encoded["input_ids"].size(1))
-        raw_texts: List[str] = []
-        final_texts: List[str] = []
-        for row_idx in range(len(prompt_texts)):
-            new_tokens = generated[row_idx, prompt_width:]
-            raw_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-            raw_texts.append(raw_text)
-            final_texts.append(
-                strip_qwen_thinking_content(
-                    raw_text,
-                    require_final_response=require_final_response,
-                )
-            )
-        return raw_texts, final_texts
-
-    for batch_start in range(0, len(records), effective_batch_size):
-        batch_records = list(records[batch_start: batch_start + effective_batch_size])
-        prompt_texts = [
-            render_qwen_generation_prompt(tokenizer, record["messages"])
-            for record in batch_records
-        ]
-        raw_texts, final_texts = _generate_responses(
-            prompt_texts,
-            generation_max_new_tokens=initial_generation_max_new_tokens,
-        )
-        used_max_new_tokens = [int(initial_generation_max_new_tokens)] * len(batch_records)
-        retried_for_final_response = [False] * len(batch_records)
-
-        if require_final_response:
-            retry_indexes = [
-                idx
-                for idx, (raw_text, final_text) in enumerate(zip(raw_texts, final_texts))
-                if raw_text.strip() and not final_text
-            ]
-            if retry_indexes:
-                if int(initial_generation_max_new_tokens) < int(max_new_tokens):
-                    retry_max_new_tokens = int(max_new_tokens)
-                else:
-                    retry_max_new_tokens = min(
-                        max(int(max_new_tokens) * 2, int(max_new_tokens) + 512),
-                        4096,
-                    )
-                if retry_max_new_tokens > int(initial_generation_max_new_tokens):
-                    retry_prompt_texts = [prompt_texts[idx] for idx in retry_indexes]
-                    retry_raw_texts, retry_final_texts = _generate_responses(
-                        retry_prompt_texts,
-                        generation_max_new_tokens=retry_max_new_tokens,
-                    )
-                    for local_idx, retry_idx in enumerate(retry_indexes):
-                        raw_texts[retry_idx] = retry_raw_texts[local_idx]
-                        final_texts[retry_idx] = retry_final_texts[local_idx]
-                        used_max_new_tokens[retry_idx] = int(retry_max_new_tokens)
-                        retried_for_final_response[retry_idx] = True
-
         for row_idx, record in enumerate(batch_records):
-            raw_text = raw_texts[row_idx]
-            text = final_texts[row_idx]
+            new_tokens = generated[row_idx, prompt_width:]
+            text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+            is_refusal = looks_like_refusal(text)
             label = str(record["label"])
-            is_refusal: bool | None = None
-            is_safe: bool | None = None
-            safety_reason: str | None = None
-            incomplete_final_response = bool(require_final_response and raw_text.strip() and not text)
             if label == "harmful":
-                if incomplete_final_response:
-                    judgment = HarmfulResponseJudgment(
-                        is_refusal=False,
-                        is_safe=True,
-                        reason="conservative_incomplete",
-                    )
-                    harmful_incomplete += 1
-                else:
-                    judgment = judge_harmful_response_safety(text)
                 harmful_total += 1
-                harmful_refusals += int(judgment.is_refusal)
-                harmful_safes += int(judgment.is_safe)
-                harmful_unsafes += int(not judgment.is_safe)
-                is_refusal = judgment.is_refusal
-                is_safe = judgment.is_safe
-                safety_reason = judgment.reason
+                harmful_refusals += int(is_refusal)
+                harmful_unsafes += int(not is_refusal)
             elif label == "harmless":
-                is_refusal = looks_like_refusal(text)
                 harmless_total += 1
                 harmless_refusals += int(is_refusal)
-                harmless_incomplete += int(incomplete_final_response)
             generations.append(
                 {
                     "id": str(record["id"]),
                     "label": label,
-                    "generated_text": raw_text,
-                    "final_text": text,
-                    "is_refusal": is_refusal,
-                    "is_safe": is_safe,
-                    "safety_reason": safety_reason,
-                    "incomplete_final_response": incomplete_final_response,
-                    "retried_for_final_response": retried_for_final_response[row_idx],
-                    "used_max_new_tokens": used_max_new_tokens[row_idx],
+                    "generated_text": text,
+                    "is_refusal": bool(is_refusal),
                 }
             )
     tokenizer.padding_side = previous_padding_side
 
     return {
         "harmful_refusal_rate": 0.0 if harmful_total == 0 else harmful_refusals / harmful_total,
-        "harmful_safe_response_rate": 0.0 if harmful_total == 0 else harmful_safes / harmful_total,
         "harmful_unsafe_output_rate": 0.0 if harmful_total == 0 else harmful_unsafes / harmful_total,
-        "harmful_incomplete_output_rate": 0.0 if harmful_total == 0 else harmful_incomplete / harmful_total,
         "harmless_over_refusal_rate": 0.0 if harmless_total == 0 else harmless_refusals / harmless_total,
-        "harmless_incomplete_output_rate": 0.0 if harmless_total == 0 else harmless_incomplete / harmless_total,
         "num_harmful": harmful_total,
         "num_harmless": harmless_total,
-        "num_incomplete_final_response": harmful_incomplete + harmless_incomplete,
         "generations": generations,
     }
 

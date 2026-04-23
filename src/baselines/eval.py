@@ -294,7 +294,7 @@ def evaluate_pan(
     max_length: int,
     max_new_tokens: int,
     batch_size: int = 1,
-    initial_max_new_tokens: int = 0,
+    initial_max_new_tokens: int = 0,  # retained for config/YAML compatibility; ignored here
 ) -> Dict[str, Any]:
     device = _resolve_device(model)
     metrics = evaluate_generation_refusal_metrics(
@@ -305,7 +305,6 @@ def evaluate_pan(
         max_length=max_length,
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
-        initial_max_new_tokens=initial_max_new_tokens,
     )
     metrics["status"] = "ok"
     metrics["num_samples"] = len(records)

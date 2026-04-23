@@ -288,7 +288,6 @@ def main() -> None:
         )
         epoch_metrics = {
             "harmful_refusal_rate": generation_metrics["harmful_refusal_rate"],
-            "harmful_safe_response_rate": generation_metrics["harmful_safe_response_rate"],
             "harmful_unsafe_output_rate": generation_metrics["harmful_unsafe_output_rate"],
             "harmless_over_refusal_rate": generation_metrics["harmless_over_refusal_rate"],
             "layer_target_cosine_mean": layer_target_cosine_mean,
@@ -305,7 +304,6 @@ def main() -> None:
             "epoch_complete",
             epoch=epoch,
             harmful_refusal_rate=epoch_metrics["harmful_refusal_rate"],
-            harmful_safe_response_rate=epoch_metrics["harmful_safe_response_rate"],
             harmful_unsafe_output_rate=epoch_metrics["harmful_unsafe_output_rate"],
             harmless_over_refusal_rate=epoch_metrics["harmless_over_refusal_rate"],
             active_target_cosine_mean=epoch_metrics["active_target_cosine_mean"],

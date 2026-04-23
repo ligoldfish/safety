@@ -16,7 +16,6 @@ class _FakeTokenizer:
         self.padding_side = "left"
         self.eos_token_id = 0
         self.pad_token_id = 0
-        self._codex_chat_template_enable_thinking = True
         self._text_to_id: dict[str, int] = {}
         self._id_to_text: dict[int, str] = {}
         self._next_id = 1
@@ -62,11 +61,19 @@ class _FakeTokenizer:
             values = token_ids.tolist()
         else:
             values = list(token_ids)
-        return "".join(self._id_to_text.get(int(token_id), "") for token_id in values if int(token_id) != 0)
+        return "".join(
+            self._id_to_text.get(int(token_id), "")
+            for token_id in values
+            if int(token_id) != 0
+        )
 
 
 class _FakeModel(torch.nn.Module):
-    def __init__(self, tokenizer: _FakeTokenizer, outputs: dict[tuple[str, int], str]) -> None:
+    def __init__(
+        self,
+        tokenizer: _FakeTokenizer,
+        outputs: dict[str, str],
+    ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.outputs = outputs
@@ -92,12 +99,18 @@ class _FakeModel(torch.nn.Module):
         for row_idx in range(int(input_ids.size(0))):
             prompt_token_ids = [
                 int(token_id)
-                for token_id, mask_value in zip(input_ids[row_idx].tolist(), attention_mask[row_idx].tolist())
+                for token_id, mask_value in zip(
+                    input_ids[row_idx].tolist(),
+                    attention_mask[row_idx].tolist(),
+                )
                 if int(mask_value) == 1 and int(token_id) != 0
             ]
-            prompt_text = "".join(self.tokenizer._id_to_text[int(token_id)] for token_id in prompt_token_ids)
+            prompt_text = "".join(
+                self.tokenizer._id_to_text[int(token_id)]
+                for token_id in prompt_token_ids
+            )
             prompts.append(prompt_text)
-            output_text = self.outputs[(prompt_text, int(max_new_tokens))]
+            output_text = self.outputs[prompt_text]
             output_token_rows.append([self.tokenizer._encode_piece(output_text)])
 
         self.generate_calls.append(
@@ -125,28 +138,41 @@ class _FakeModel(torch.nn.Module):
         return generated
 
 
-class PanEvalBatchingTests(unittest.TestCase):
-    def test_pan_eval_batches_first_pass_and_retries_only_incomplete(self):
+class RefusalOnlyEvaluatorTests(unittest.TestCase):
+    """Phase-G sanity evaluator: refusal-only metrics.
+
+    Contract enforced:
+    - Returns exactly the refusal-only keys used by scripts 09 / 10 / 13 / 14:
+      ``harmful_refusal_rate``, ``harmful_unsafe_output_rate``,
+      ``harmless_over_refusal_rate``, ``num_harmful``, ``num_harmless``,
+      ``generations``. No ``harmful_safe_response_rate`` or thinking-era
+      retry/incomplete fields.
+    """
+
+    def _patch_prompt_renderer(self):
+        original = trainer_phase1.render_qwen_generation_prompt
+        trainer_phase1.render_qwen_generation_prompt = (
+            lambda _tokenizer, messages: str(messages[-1]["content"])
+        )
+        return original
+
+    def test_returns_refusal_only_fields(self):
         tokenizer = _FakeTokenizer()
         outputs = {
-            ("prompt-1", 2): "Thinking Process:\n1. Plan the refusal.",
-            (
-                "prompt-2",
-                2,
-            ): "Here's a thinking process that leads to the suggested response:\n\n2. **Final Output Generation:**\n   * \"I can't help with that.\"\n",
-            (
-                "prompt-1",
-                8,
-            ): "Here's a thinking process that leads to the suggested response:\n\n2. **Final Output Generation:**\n   * \"I can't help with that.\"\n",
+            "prompt-harmful-refused": "I cannot help with that request.",
+            "prompt-harmful-unsafe": "Sure, step 1: bypass the lock, step 2: steal the target.",
+            "prompt-harmless-answer": "Here is a friendly recipe for cookies.",
+            "prompt-harmless-overrefused": "I'm sorry, but I cannot help with that.",
         }
         model = _FakeModel(tokenizer, outputs)
         records = [
-            {"id": "1", "label": "harmful", "messages": [{"role": "user", "content": "prompt-1"}]},
-            {"id": "2", "label": "harmful", "messages": [{"role": "user", "content": "prompt-2"}]},
+            {"id": "h1", "label": "harmful", "messages": [{"role": "user", "content": "prompt-harmful-refused"}]},
+            {"id": "h2", "label": "harmful", "messages": [{"role": "user", "content": "prompt-harmful-unsafe"}]},
+            {"id": "b1", "label": "harmless", "messages": [{"role": "user", "content": "prompt-harmless-answer"}]},
+            {"id": "b2", "label": "harmless", "messages": [{"role": "user", "content": "prompt-harmless-overrefused"}]},
         ]
 
-        original_render_prompt = trainer_phase1.render_qwen_generation_prompt
-        trainer_phase1.render_qwen_generation_prompt = lambda _tokenizer, messages: str(messages[-1]["content"])
+        original_render_prompt = self._patch_prompt_renderer()
         try:
             metrics = trainer_phase1.evaluate_generation_refusal_metrics(
                 model,
@@ -154,25 +180,66 @@ class PanEvalBatchingTests(unittest.TestCase):
                 records,
                 device=torch.device("cpu"),
                 max_length=32,
-                max_new_tokens=8,
+                max_new_tokens=4,
                 batch_size=2,
-                initial_max_new_tokens=2,
             )
         finally:
             trainer_phase1.render_qwen_generation_prompt = original_render_prompt
 
-        self.assertEqual(len(model.generate_calls), 2)
+        expected_keys = {
+            "harmful_refusal_rate",
+            "harmful_unsafe_output_rate",
+            "harmless_over_refusal_rate",
+            "num_harmful",
+            "num_harmless",
+            "generations",
+        }
+        self.assertEqual(set(metrics.keys()), expected_keys)
+        # No thinking-era / safe-response fields must be present.
+        for dead_key in (
+            "harmful_safe_response_rate",
+            "harmful_incomplete_output_rate",
+            "retried_for_final_response",
+            "used_max_new_tokens",
+        ):
+            self.assertNotIn(dead_key, metrics)
+        for gen in metrics["generations"]:
+            for dead_key in ("retried_for_final_response", "used_max_new_tokens"):
+                self.assertNotIn(dead_key, gen)
+
+        self.assertEqual(metrics["num_harmful"], 2)
+        self.assertEqual(metrics["num_harmless"], 2)
+        self.assertAlmostEqual(metrics["harmful_refusal_rate"], 0.5)
+        self.assertAlmostEqual(metrics["harmful_unsafe_output_rate"], 0.5)
+        self.assertAlmostEqual(metrics["harmless_over_refusal_rate"], 0.5)
+
+    def test_single_pass_generation_no_retry(self):
+        """Refusal-only evaluator must do exactly one generate() call per batch
+        — no thinking-era retry pass with a different ``max_new_tokens``."""
+
+        tokenizer = _FakeTokenizer()
+        outputs = {"p1": "I cannot help.", "p2": "Sure, here you go."}
+        model = _FakeModel(tokenizer, outputs)
+        records = [
+            {"id": "1", "label": "harmful", "messages": [{"role": "user", "content": "p1"}]},
+            {"id": "2", "label": "harmful", "messages": [{"role": "user", "content": "p2"}]},
+        ]
+        original_render_prompt = self._patch_prompt_renderer()
+        try:
+            trainer_phase1.evaluate_generation_refusal_metrics(
+                model,
+                tokenizer,
+                records,
+                device=torch.device("cpu"),
+                max_length=32,
+                max_new_tokens=4,
+                batch_size=2,
+            )
+        finally:
+            trainer_phase1.render_qwen_generation_prompt = original_render_prompt
+        self.assertEqual(len(model.generate_calls), 1)
         self.assertEqual(model.generate_calls[0]["batch_size"], 2)
-        self.assertEqual(model.generate_calls[0]["max_new_tokens"], 2)
-        self.assertEqual(model.generate_calls[1]["batch_size"], 1)
-        self.assertEqual(model.generate_calls[1]["max_new_tokens"], 8)
-        self.assertAlmostEqual(metrics["harmful_refusal_rate"], 1.0)
-        self.assertAlmostEqual(metrics["harmful_safe_response_rate"], 1.0)
-        self.assertAlmostEqual(metrics["harmful_incomplete_output_rate"], 0.0)
-        self.assertTrue(metrics["generations"][0]["retried_for_final_response"])
-        self.assertEqual(metrics["generations"][0]["used_max_new_tokens"], 8)
-        self.assertFalse(metrics["generations"][1]["retried_for_final_response"])
-        self.assertEqual(metrics["generations"][1]["used_max_new_tokens"], 2)
+        self.assertEqual(model.generate_calls[0]["max_new_tokens"], 4)
 
 
 if __name__ == "__main__":

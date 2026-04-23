@@ -142,6 +142,15 @@ def main() -> None:
             "top_k": args.top_k,
             "vocab_chunk_size": args.vocab_chunk_size,
             "key_layers": [] if key_layers is None else key_layers,
+            "decomposition_semantics": (
+                "For each sample and each teacher key layer l, we compute "
+                "a = S_T @ h_safe / ||h_safe||_2 (V-dim semantic coefficient "
+                "vector), then keep the top-{k} entries by |a_i|. h_safe is "
+                "the safe component from step 06 (UU^T h), so we decompose "
+                "*only the safety subspace projection*, not the full hidden "
+                "state. Stored values are raw coefficients; indices are vocab "
+                "token ids."
+            ).format(k=args.top_k),
             "files": manifest_files,
         },
     )

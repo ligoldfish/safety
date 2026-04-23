@@ -106,12 +106,28 @@ def parse_args() -> argparse.Namespace:
             help="Print the commands without executing them.",
         )
         target_parser.add_argument(
+            "--enable-opencompass",
+            action="store_true",
+            help=(
+                "Explicit gate for OpenCompass general-capability eval. Default: disabled. "
+                "Even when enabled, --opencompass-dir must point at a cloned OpenCompass repo."
+            ),
+        )
+        target_parser.add_argument(
             "--opencompass-dir",
             default="",
             help=(
-                "Path to a cloned OpenCompass repo. When set, the launcher automatically runs "
-                "general-capability eval (MMLU/GSM8K/HumanEval/MBPP) after each experiment's safety eval. "
-                "Leave empty or use --skip-opencompass to skip this step."
+                "Path to a cloned OpenCompass repo. Required when --enable-opencompass is set. "
+                "When omitted (or --skip-opencompass is passed), only PAN safety eval runs and "
+                "general datasets stay disabled in the final summary."
+            ),
+        )
+        target_parser.add_argument(
+            "--opencompass-config",
+            default="",
+            help=(
+                "Optional extra config/path forwarded verbatim to scripts/17_eval_opencompass.py "
+                "(via --extra-args). Reserved for future OpenCompass YAML configs; ignored when empty."
             ),
         )
         target_parser.add_argument(
@@ -123,7 +139,10 @@ def parse_args() -> argparse.Namespace:
         target_parser.add_argument(
             "--skip-opencompass",
             action="store_true",
-            help="Skip the OpenCompass general-capability eval even when --opencompass-dir is provided.",
+            help=(
+                "Force-skip OpenCompass general-capability eval even when --enable-opencompass "
+                "or --opencompass-dir is provided."
+            ),
         )
 
     nosft_parser = subparsers.add_parser("nosft", help="Run no-SFT benchmark evaluation.")
@@ -215,17 +234,60 @@ def _build_env_overrides(device: str, device_id: int) -> dict[str, str]:
     return {}
 
 
-def _should_run_opencompass(opencompass_dir: str, skip_opencompass: bool) -> bool:
+def _should_run_opencompass(
+    opencompass_dir: str,
+    skip_opencompass: bool,
+    enable_opencompass: bool = False,
+) -> bool:
     if skip_opencompass:
         print("[INFO] OpenCompass step skipped (--skip-opencompass).")
         return False
+    if not enable_opencompass and not opencompass_dir:
+        # Default path: OpenCompass disabled. General datasets should show up in
+        # the final summary as ``disabled`` rather than as placeholders.
+        print("[INFO] OpenCompass disabled by default (--enable-opencompass not set).")
+        return False
     if not opencompass_dir:
-        print("[INFO] --opencompass-dir not provided; skipping OpenCompass general-capability eval.")
+        print(
+            "[WARN] --enable-opencompass was set but --opencompass-dir is empty; "
+            "skipping OpenCompass general-capability eval."
+        )
         return False
     if not Path(opencompass_dir).expanduser().exists():
         print(f"[WARN] OpenCompass dir not found: {opencompass_dir}; skipping.")
         return False
     return True
+
+
+def _run_final_merge(
+    *,
+    pan_summary_path: Path,
+    opencompass_work_dir: Path | None,
+    output_path: Path,
+    dry_run: bool,
+    env_overrides: dict[str, str] | None = None,
+) -> None:
+    """Merge the PAN summary with the OpenCompass work_dir into final_summary.json.
+
+    When ``opencompass_work_dir`` is None the merge still runs so the resulting
+    ``final_summary.json`` explicitly records ``opencompass.enabled = false``
+    rather than silently omitting general datasets.
+    """
+
+    args = [
+        "--pan-summary",
+        str(pan_summary_path),
+        "--output",
+        str(output_path),
+    ]
+    if opencompass_work_dir is not None:
+        args.extend(["--opencompass-work-dir", str(opencompass_work_dir)])
+    _run_script(
+        "18_merge_opencompass_summary.py",
+        args,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
 
 
 def _run_merge_lora(
@@ -289,7 +351,7 @@ def _run_opencompass_for_adapter(
     datasets: Sequence[str],
     dry_run: bool,
     env_overrides: dict[str, str] | None = None,
-) -> None:
+) -> Path:
     merged_dir = training_output_root / "merged_hf"
     work_dir = training_output_root / "opencompass"
     _run_merge_lora(
@@ -308,6 +370,7 @@ def _run_opencompass_for_adapter(
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
+    return work_dir
 
 
 def _run_opencompass_for_base_model(
@@ -317,7 +380,7 @@ def _run_opencompass_for_base_model(
     datasets: Sequence[str],
     dry_run: bool,
     env_overrides: dict[str, str] | None = None,
-) -> None:
+) -> Path:
     eval_cfg = load_eval_config(eval_config_path)
     base_model_dir = Path(eval_cfg.model.path).resolve()
     work_dir = Path(eval_cfg.output.output_root) / "opencompass"
@@ -329,6 +392,7 @@ def _run_opencompass_for_base_model(
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
+    return work_dir
 
 
 def _override_model_runtime(model_payload: dict[str, Any], device: str, device_id: int) -> None:
@@ -431,6 +495,8 @@ def _run_baseline_nosft(
     opencompass_dir: str,
     opencompass_datasets: Sequence[str],
     skip_opencompass: bool,
+    enable_opencompass: bool,
+    opencompass_config: str = "",  # reserved; not forwarded yet
 ) -> None:
     _validate_device_request(num_devices)
     eval_config = _make_runtime_override_config(
@@ -445,14 +511,24 @@ def _run_baseline_nosft(
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
-    if _should_run_opencompass(opencompass_dir, skip_opencompass):
-        _run_opencompass_for_base_model(
+    eval_cfg = load_eval_config(eval_config)
+    pan_output_root = Path(eval_cfg.output.output_root)
+    oc_work_dir: Path | None = None
+    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
+        oc_work_dir = _run_opencompass_for_base_model(
             eval_config_path=eval_config,
             opencompass_dir=opencompass_dir,
             datasets=opencompass_datasets,
             dry_run=dry_run,
             env_overrides=env_overrides,
         )
+    _run_final_merge(
+        pan_summary_path=pan_output_root / "summary.json",
+        opencompass_work_dir=oc_work_dir,
+        output_path=pan_output_root / "final_summary.json",
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
 
 
 def _run_baseline_sft(
@@ -465,6 +541,8 @@ def _run_baseline_sft(
     opencompass_dir: str,
     opencompass_datasets: Sequence[str],
     skip_opencompass: bool,
+    enable_opencompass: bool,
+    opencompass_config: str = "",
 ) -> None:
     _validate_device_request(num_devices)
     train_config = _make_runtime_override_config(
@@ -490,6 +568,7 @@ def _run_baseline_sft(
         checkpoint_path = Path(cfg.output.output_root) / "checkpoints" / f"epoch_{cfg.optim.epochs:03d}.pt"
     else:
         checkpoint_path = _latest_checkpoint_path(Path(cfg.output.output_root))
+    pan_output_root = Path(cfg.output.output_root) / "eval_suite"
     _run_script(
         "12_eval_baseline_suite.py",
         [
@@ -500,13 +579,14 @@ def _run_baseline_sft(
             "--adapter-checkpoint",
             str(checkpoint_path),
             "--output-dir",
-            str(Path(cfg.output.output_root) / "eval_suite"),
+            str(pan_output_root),
         ],
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
-    if _should_run_opencompass(opencompass_dir, skip_opencompass):
-        _run_opencompass_for_adapter(
+    oc_work_dir: Path | None = None
+    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
+        oc_work_dir = _run_opencompass_for_adapter(
             eval_config=eval_config,
             training_output_root=Path(cfg.output.output_root),
             checkpoint_path=checkpoint_path,
@@ -515,6 +595,13 @@ def _run_baseline_sft(
             dry_run=dry_run,
             env_overrides=env_overrides,
         )
+    _run_final_merge(
+        pan_summary_path=pan_output_root / "summary.json",
+        opencompass_work_dir=oc_work_dir,
+        output_path=pan_output_root / "final_summary.json",
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
 
 
 def _run_baseline_distill(
@@ -526,6 +613,8 @@ def _run_baseline_distill(
     opencompass_dir: str,
     opencompass_datasets: Sequence[str],
     skip_opencompass: bool,
+    enable_opencompass: bool,
+    opencompass_config: str = "",
 ) -> None:
     _validate_device_request(num_devices)
     train_config = _make_runtime_override_config(
@@ -551,6 +640,7 @@ def _run_baseline_distill(
         checkpoint_path = Path(cfg.output.output_root) / "checkpoints" / f"epoch_{cfg.optim.epochs:03d}.pt"
     else:
         checkpoint_path = _latest_checkpoint_path(Path(cfg.output.output_root))
+    pan_output_root = Path(cfg.output.output_root) / "eval_suite"
     _run_script(
         "12_eval_baseline_suite.py",
         [
@@ -561,13 +651,14 @@ def _run_baseline_distill(
             "--adapter-checkpoint",
             str(checkpoint_path),
             "--output-dir",
-            str(Path(cfg.output.output_root) / "eval_suite"),
+            str(pan_output_root),
         ],
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
-    if _should_run_opencompass(opencompass_dir, skip_opencompass):
-        _run_opencompass_for_adapter(
+    oc_work_dir: Path | None = None
+    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
+        oc_work_dir = _run_opencompass_for_adapter(
             eval_config=eval_config,
             training_output_root=Path(cfg.output.output_root),
             checkpoint_path=checkpoint_path,
@@ -576,6 +667,13 @@ def _run_baseline_distill(
             dry_run=dry_run,
             env_overrides=env_overrides,
         )
+    _run_final_merge(
+        pan_summary_path=pan_output_root / "summary.json",
+        opencompass_work_dir=oc_work_dir,
+        output_path=pan_output_root / "final_summary.json",
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
 
 
 def _run_adapter_eval(
@@ -589,6 +687,7 @@ def _run_adapter_eval(
     opencompass_dir: str = "",
     opencompass_datasets: Sequence[str] = (),
     skip_opencompass: bool = True,
+    enable_opencompass: bool = False,
 ) -> None:
     eval_config = _make_runtime_override_config(
         _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)]),
@@ -599,6 +698,7 @@ def _run_adapter_eval(
         checkpoint_path = training_output_root / "checkpoints" / "epoch_999.pt"
     else:
         checkpoint_path = _latest_checkpoint_path(training_output_root)
+    pan_output_root = training_output_root / "eval_suite"
     _run_script(
         "12_eval_baseline_suite.py",
         [
@@ -609,13 +709,14 @@ def _run_adapter_eval(
             "--adapter-checkpoint",
             str(checkpoint_path),
             "--output-dir",
-            str(training_output_root / "eval_suite"),
+            str(pan_output_root),
         ],
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
-    if _should_run_opencompass(opencompass_dir, skip_opencompass):
-        _run_opencompass_for_adapter(
+    oc_work_dir: Path | None = None
+    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
+        oc_work_dir = _run_opencompass_for_adapter(
             eval_config=eval_config,
             training_output_root=training_output_root,
             checkpoint_path=checkpoint_path,
@@ -624,6 +725,13 @@ def _run_adapter_eval(
             dry_run=dry_run,
             env_overrides=env_overrides,
         )
+    _run_final_merge(
+        pan_summary_path=pan_output_root / "summary.json",
+        opencompass_work_dir=oc_work_dir,
+        output_path=pan_output_root / "final_summary.json",
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
 
 
 def _run_random_baseline(
@@ -635,6 +743,8 @@ def _run_random_baseline(
     opencompass_dir: str,
     opencompass_datasets: Sequence[str],
     skip_opencompass: bool,
+    enable_opencompass: bool,
+    opencompass_config: str = "",
 ) -> None:
     _validate_device_request(num_devices)
     phase1_config = _make_runtime_override_config(
@@ -690,6 +800,7 @@ def _run_random_baseline(
         opencompass_dir=opencompass_dir,
         opencompass_datasets=opencompass_datasets,
         skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
     )
 
 
@@ -703,6 +814,8 @@ def _run_full_pipeline(
     opencompass_dir: str,
     opencompass_datasets: Sequence[str],
     skip_opencompass: bool,
+    enable_opencompass: bool,
+    opencompass_config: str = "",
 ) -> None:
     _validate_device_request(num_devices)
     config_map = SMOKE_PIPELINE_CONFIGS if smoke else FULL_PIPELINE_CONFIGS
@@ -740,6 +853,7 @@ def _run_full_pipeline(
         opencompass_dir=opencompass_dir,
         opencompass_datasets=opencompass_datasets,
         skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
     )
 
     if not dry_run:
@@ -760,6 +874,8 @@ def main() -> None:
         "opencompass_dir": args.opencompass_dir,
         "opencompass_datasets": args.opencompass_datasets,
         "skip_opencompass": args.skip_opencompass,
+        "enable_opencompass": bool(getattr(args, "enable_opencompass", False)),
+        "opencompass_config": getattr(args, "opencompass_config", "") or "",
     }
     if args.command == "nosft":
         _run_baseline_nosft(

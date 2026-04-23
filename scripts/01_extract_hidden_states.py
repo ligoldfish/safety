@@ -127,7 +127,7 @@ def _save_shard(
     sample_ids: List[str] = []
     labels: List[str] = []
     source_datasets: List[str] = []
-    response_prefix_token_counts: List[int] = []
+    prompt_token_counts: List[int] = []
 
     for batch in chunked(shard_records, batch_size):
         messages_batch = [record["messages"] for record in batch]
@@ -146,18 +146,17 @@ def _save_shard(
         sample_ids.extend(record["id"] for record in batch)
         labels.extend(record["label"] for record in batch)
         source_datasets.extend(record["source_dataset"] for record in batch)
-        response_prefix_token_counts.extend((last_positions + 1).tolist())
+        prompt_token_counts.extend((last_positions + 1).tolist())
 
     payload = {
         "model_name": model_cfg.name,
         "model_path": model_cfg.path,
-        "feature_type": "final_response_prefix_hidden_state",
+        "feature_type": "first_generated_token_hidden_state",
         "layer_indices": list(range(len(hidden_by_layer))),
         "sample_ids": sample_ids,
         "labels": labels,
         "source_datasets": source_datasets,
-        "response_prefix_token_counts": response_prefix_token_counts,
-        "prompt_token_counts": response_prefix_token_counts,
+        "prompt_token_counts": prompt_token_counts,
         "hidden_by_layer": {
             layer_idx: torch.cat(tensors, dim=0)
             for layer_idx, tensors in hidden_by_layer.items()
@@ -173,7 +172,7 @@ def main() -> None:
             "PyTorch is required for hidden-state extraction. Install torch in the active Python environment first."
         )
 
-    from src.features.first_gen_token import gather_final_response_prefix_representations
+    from src.features.first_gen_token import gather_first_generated_token_representations
     from src.models.hf_loader import load_hf_model
 
     cfg = load_phase1_config(args.config)
@@ -232,7 +231,7 @@ def main() -> None:
             shard_idx=shard_idx,
             shard_dir=shard_dir,
             model_cfg=model_cfg,
-            gather_fn=gather_final_response_prefix_representations,
+            gather_fn=gather_first_generated_token_representations,
             tokenizer=tokenizer,
             model=model,
             max_length=cfg.extraction.max_length,

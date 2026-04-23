@@ -11,10 +11,12 @@ class SafeSubspaceResult:
     k: int
     basis: torch.Tensor
     singular_values: torch.Tensor
-    mean_diff: torch.Tensor
+    mean_diff: torch.Tensor  # harmful_mean - harmless_mean (per 方案详述 r_l)
     explained_ratio_topk: torch.Tensor
     harmful_count: int
     harmless_count: int
+    harmful_mean: torch.Tensor
+    harmless_mean: torch.Tensor
 
 
 def build_teacher_safe_subspace(
@@ -24,6 +26,24 @@ def build_teacher_safe_subspace(
     harmless_hidden: torch.Tensor,
     k: int = 8,
 ) -> SafeSubspaceResult:
+    """Build the teacher safe subspace for a single key layer.
+
+    Semantics (方案详述 §4.1-§4.3):
+
+    - ``harmless_mean = mean(h^{harmless}_l)``
+    - ``harmful_mean  = mean(h^{harmful}_l)``
+    - ``mean_diff = harmful_mean - harmless_mean``  (the "r_l" direction)
+    - ``Delta_l = harmful_hidden - harmless_mean``  (each row is h^{harmful}_i - mu^{harmless}_l)
+    - ``Delta_l = U diag(sigma) V^T`` via thin SVD.
+    - ``basis`` holds the top-k right singular vectors of ``Delta_l`` (columns
+      of ``V``), so ``basis.T @ basis = I_k`` (orthonormal). It defines the
+      *delta safety subspace*, i.e., the subspace of harmful-vs-harmless
+      differences — it is NOT "the pure mean_diff direction".
+
+    We additionally persist ``harmful_mean`` and ``harmless_mean`` so that
+    downstream scripts (``06`` projection, ``07`` semantic decomposition) can
+    be audited against the subspace origin without ambiguity.
+    """
     if harmful_hidden.ndim != 2 or harmless_hidden.ndim != 2:
         raise ValueError("harmful_hidden and harmless_hidden must have shape [N, d].")
     if harmful_hidden.size(1) != harmless_hidden.size(1):
@@ -54,4 +74,6 @@ def build_teacher_safe_subspace(
         explained_ratio_topk=explained_ratio_topk,
         harmful_count=int(harmful_hidden.size(0)),
         harmless_count=int(harmless_hidden.size(0)),
+        harmful_mean=harmful_mean,
+        harmless_mean=harmless_mean,
     )

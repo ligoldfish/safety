@@ -111,12 +111,26 @@ def main() -> None:
             {
                 "layer_idx": result.layer_idx,
                 "k": result.k,
+                # basis: [d, k]. Orthonormal columns spanning the "delta safety
+                # subspace" (top-k right singular vectors of Delta_l =
+                # harmful_hidden - harmless_mean). It is NOT a scalar multiple
+                # of mean_diff; it is the subspace of harmful-vs-harmless
+                # differences.
                 "basis": result.basis,
                 "singular_values": result.singular_values,
+                # mean_diff: d-vector. harmful_mean - harmless_mean (the r_l
+                # direction from 方案详述 §3.2). Useful as a sanity-check
+                # target direction; not itself the training target.
                 "mean_diff": result.mean_diff,
+                "harmful_mean": result.harmful_mean,
+                "harmless_mean": result.harmless_mean,
                 "explained_ratio_top8": result.explained_ratio_topk,
                 "harmful_count": result.harmful_count,
                 "harmless_count": result.harmless_count,
+                "subspace_definition": (
+                    "basis = top-{k} right singular vectors of "
+                    "Delta_l where Delta_l[i] = h_harmful[i] - mean(h_harmless)"
+                ).format(k=result.k),
             },
             layer_path,
         )

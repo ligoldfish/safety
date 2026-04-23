@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import torch
@@ -10,12 +11,23 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.baselines.train import SupervisedCollator
-from src.data.template_qwen import render_qwen_final_response_prefix, render_qwen_supervised_text
+from src.data.template_qwen import (
+    render_qwen_generation_prompt,
+    render_qwen_supervised_text,
+)
 from src.phase_b.hidden_states import load_hidden_state_split
 from src.training.trainer_phase1 import SemAlignCollator
 
 
 class FakeQwenTokenizer:
+    """Minimal Qwen-like tokenizer.
+
+    Chat template mirrors ``add_generation_prompt=True`` -> ends with an
+    ``<A>`` marker. ``add_generation_prompt=False`` keeps the assistant
+    body plus ``<E>``. One character -> one token so text length equals
+    token-count, letting us verify boundary positions directly.
+    """
+
     def __init__(self) -> None:
         self.padding_side = "left"
         self.pad_token_id = 0
@@ -25,22 +37,23 @@ class FakeQwenTokenizer:
         messages,
         tokenize=False,
         add_generation_prompt=False,
-        enable_thinking=True,
+        enable_thinking=False,
     ):
+        del enable_thinking
         if tokenize:
             raise NotImplementedError("This fake tokenizer only supports tokenize=False.")
-        if enable_thinking is not True:
-            raise ValueError("FakeQwenTokenizer only supports thinking mode.")
-
-        non_assistant = [f"{msg['role']}:{msg['content']}" for msg in messages if msg["role"] != "assistant"]
+        non_assistant = [
+            f"{msg['role']}:{msg['content']}"
+            for msg in messages
+            if msg["role"] != "assistant"
+        ]
         prefix = "<|>".join(non_assistant)
         if add_generation_prompt:
-            return prefix + "<A><think>\n"
-
+            return prefix + "<A>"
         assistant_text = ""
         if messages and messages[-1]["role"] == "assistant":
             assistant_text = str(messages[-1]["content"])
-        return prefix + "<A><think>\n\n</think>\n\n" + assistant_text + "<E>"
+        return prefix + "<A>" + assistant_text + "<E>"
 
     def __call__(
         self,
@@ -50,6 +63,7 @@ class FakeQwenTokenizer:
         truncation=True,
         max_length=1024,
     ):
+        del return_tensors
         if isinstance(texts, str):
             texts = [texts]
         token_rows = []
@@ -88,28 +102,28 @@ def _build_record() -> dict:
     }
 
 
-class ThinkingPipelinePositionTests(unittest.TestCase):
-    def test_supervised_collator_masks_thinking_prefix_tokens(self):
+class FirstGeneratedTokenPositionTests(unittest.TestCase):
+    def test_supervised_collator_masks_generation_prompt_tokens(self):
         tokenizer = FakeQwenTokenizer()
-        setattr(tokenizer, "_codex_chat_template_enable_thinking", True)
         record = _build_record()
-        prefix_text = render_qwen_final_response_prefix(tokenizer, record["messages"], enable_thinking=True)
-        full_text = render_qwen_supervised_text(tokenizer, record["messages"], record["target_response"], enable_thinking=True)
-        self.assertGreater(len(full_text), len(prefix_text))
+        prompt_text = render_qwen_generation_prompt(tokenizer, record["messages"])
+        full_text = render_qwen_supervised_text(
+            tokenizer, record["messages"], record["target_response"]
+        )
+        self.assertGreater(len(full_text), len(prompt_text))
 
         collator = SupervisedCollator(tokenizer, max_length=1024)
         batch = collator([record])
 
-        prefix_len = len(prefix_text)
+        prompt_len = len(prompt_text)
         labels = batch.labels[0]
-        self.assertTrue(torch.all(labels[:prefix_len] == -100))
-        self.assertNotEqual(int(labels[prefix_len].item()), -100)
+        self.assertTrue(torch.all(labels[:prompt_len] == -100))
+        self.assertNotEqual(int(labels[prompt_len].item()), -100)
 
-    def test_semalign_collator_aligns_on_final_response_prefix(self):
+    def test_semalign_collator_aligns_on_generation_prompt_last_token(self):
         tokenizer = FakeQwenTokenizer()
-        setattr(tokenizer, "_codex_chat_template_enable_thinking", True)
         record = _build_record()
-        prefix_text = render_qwen_final_response_prefix(tokenizer, record["messages"], enable_thinking=True)
+        prompt_text = render_qwen_generation_prompt(tokenizer, record["messages"])
 
         collator = SemAlignCollator(tokenizer, max_length=1024, layer_ids=[0])
         batch = collator(
@@ -121,26 +135,54 @@ class ThinkingPipelinePositionTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(int(batch.response_prefix_last_positions[0].item()), len(prefix_text) - 1)
-        prefix_len = len(prefix_text)
-        self.assertTrue(torch.all(batch.labels[0, :prefix_len] == -100))
-        self.assertNotEqual(int(batch.labels[0, prefix_len].item()), -100)
+        # prompt_last_positions is the index of the last token of
+        # apply_chat_template(..., add_generation_prompt=True), i.e. the
+        # first-generated-token capture position matching 01_extract_hidden_states.
+        self.assertEqual(int(batch.prompt_last_positions[0].item()), len(prompt_text) - 1)
+        prompt_len = len(prompt_text)
+        self.assertTrue(torch.all(batch.labels[0, :prompt_len] == -100))
+        self.assertNotEqual(int(batch.labels[0, prompt_len].item()), -100)
 
-    def test_hidden_state_loader_rejects_legacy_feature_type(self):
+
+class HiddenStateLoaderStrictnessTests(unittest.TestCase):
+    def _write_shard(self, split_dir: Path, feature_type: str) -> None:
+        torch.save(
+            {
+                "feature_type": feature_type,
+                "sample_ids": ["sample-1"],
+                "labels": ["harmful"],
+                "hidden_by_layer": {"0": torch.zeros(1, 2)},
+            },
+            split_dir / "part_000.pt",
+        )
+
+    def test_loader_accepts_canonical_feature_type_by_default(self):
         with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as tmpdir:
             split_dir = Path(tmpdir)
-            torch.save(
-                {
-                    "feature_type": "first_generated_token_hidden_state",
-                    "sample_ids": ["sample-1"],
-                    "labels": ["harmful"],
-                    "hidden_by_layer": {"0": torch.zeros(1, 2)},
-                },
-                split_dir / "part_000.pt",
-            )
+            self._write_shard(split_dir, "first_generated_token_hidden_state")
+            split = load_hidden_state_split(split_dir)
+            self.assertFalse(split.legacy_final_response_prefix)
+            self.assertEqual(split.labels, ["harmful"])
 
-            with self.assertRaisesRegex(ValueError, "thinking-on final-response-prefix pipeline"):
+    def test_loader_rejects_legacy_final_response_prefix_by_default(self):
+        with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as tmpdir:
+            split_dir = Path(tmpdir)
+            self._write_shard(split_dir, "final_response_prefix_hidden_state")
+            with self.assertRaisesRegex(ValueError, "Legacy hidden-state shard"):
                 load_hidden_state_split(split_dir)
+
+    def test_loader_accepts_legacy_shard_when_explicitly_opted_in(self):
+        with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as tmpdir:
+            split_dir = Path(tmpdir)
+            self._write_shard(split_dir, "final_response_prefix_hidden_state")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                split = load_hidden_state_split(
+                    split_dir,
+                    allow_legacy_final_response_prefix=True,
+                )
+            self.assertTrue(split.legacy_final_response_prefix)
+            self.assertTrue(any("LEGACY final_response_prefix" in str(w.message) for w in caught))
 
 
 if __name__ == "__main__":

@@ -165,6 +165,15 @@ def main() -> None:
             "safe_subspace_dir": str(safe_subspace_dir),
             "key_layers": key_layers,
             "storage_dtype": args.storage_dtype,
+            "projection_semantics": (
+                "safe_component_by_layer[l] = h @ U @ U^T where U is the "
+                "layer-l teacher delta safety basis from step 03 (columns are "
+                "top-k right singular vectors of Delta_l = harmful_hidden - "
+                "harmless_mean, NOT scalar multiples of mean_diff). "
+                "safe_coeff_by_layer[l] = h @ U are the 8 coordinates in that "
+                "subspace; residual = h - safe_component lives in the orthogonal "
+                "complement."
+            ),
             "orthogonality_check_mean_abs": orthogonality_checks,
             "energy_decomposition_mean_abs": energy_checks,
             "files": manifest_files,
