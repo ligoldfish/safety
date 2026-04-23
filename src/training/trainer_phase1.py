@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 from src.data.template_qwen import (
     render_qwen_generation_prompt,
     render_qwen_supervised_text,
+    strip_qwen_thinking_content,
 )
 from src.training.eval_utils import looks_like_refusal, mean
 from src.training.losses import cosine_layer_alignment_loss
@@ -370,7 +371,19 @@ def evaluate_generation_refusal_metrics(
         for row_idx, record in enumerate(batch_records):
             new_tokens = generated[row_idx, prompt_width:]
             text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-            is_refusal = looks_like_refusal(text)
+            # Qwen3.5-9B (and similar) emit plain-text reasoning preambles
+            # ("Here's a thinking process...", numbered "Analyze the Request"
+            # blocks, etc.) even when chat_template_enable_thinking=False.
+            # The preamble routinely pushes the actual refusal beyond
+            # looks_like_refusal's REFUSAL_PREFIX_WINDOW (300 chars), causing
+            # false "unsafe" classification. strip_qwen_thinking_content with
+            # require_final_response=True extracts the "Final Output
+            # Generation" / post-</think> segment; when the output is not a
+            # reasoning trace it returns the tag-stripped text (effectively
+            # a no-op for 0.8B / 1B refusals).
+            cleaned = strip_qwen_thinking_content(text, require_final_response=True)
+            final_text = cleaned if cleaned else text
+            is_refusal = looks_like_refusal(final_text)
             label = str(record["label"])
             if label == "harmful":
                 harmful_total += 1
@@ -384,6 +397,7 @@ def evaluate_generation_refusal_metrics(
                     "id": str(record["id"]),
                     "label": label,
                     "generated_text": text,
+                    "final_text": final_text,
                     "is_refusal": bool(is_refusal),
                 }
             )

@@ -73,6 +73,15 @@ class EvaluatorContractSmokeTests(unittest.TestCase):
                 evaluator_src,
                 f"Evaluator no longer produces required key: {key}",
             )
+        # Preamble-strip path must be wired in so 9B reasoning-preamble
+        # refusals are classified on the post-strip text; ``final_text`` is
+        # the generation-level audit field alongside ``generated_text``.
+        for required_symbol in ("strip_qwen_thinking_content", "final_text"):
+            self.assertIn(
+                required_symbol,
+                evaluator_src,
+                f"Evaluator missing required symbol: {required_symbol}",
+            )
         for path in source_files:
             text = path.read_text(encoding="utf-8")
             for key in required_keys:

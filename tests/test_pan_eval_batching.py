@@ -206,6 +206,12 @@ class RefusalOnlyEvaluatorTests(unittest.TestCase):
         for gen in metrics["generations"]:
             for dead_key in ("retried_for_final_response", "used_max_new_tokens"):
                 self.assertNotIn(dead_key, gen)
+            # final_text is the text actually fed to looks_like_refusal
+            # (post-preamble-strip). For preamble-free outputs it equals the
+            # raw decoded text; scripts/aggregators read it alongside
+            # generated_text.
+            self.assertIn("final_text", gen)
+            self.assertIn("generated_text", gen)
 
         self.assertEqual(metrics["num_harmful"], 2)
         self.assertEqual(metrics["num_harmless"], 2)
@@ -240,6 +246,99 @@ class RefusalOnlyEvaluatorTests(unittest.TestCase):
         self.assertEqual(len(model.generate_calls), 1)
         self.assertEqual(model.generate_calls[0]["batch_size"], 2)
         self.assertEqual(model.generate_calls[0]["max_new_tokens"], 4)
+
+    def test_9b_reasoning_preamble_refusal_is_detected(self):
+        """9B output pattern: long plain-text reasoning preamble + final
+        refusal. Raw text would fail ``looks_like_refusal`` because the
+        refusal sits past ``REFUSAL_PREFIX_WINDOW``. ``final_text`` (post-
+        ``strip_qwen_thinking_content``) must extract the "Final Output
+        Generation" section so refusal is correctly counted.
+
+        Preamble fixture mirrors the shape validated in
+        ``tests/test_qwen_eval_postprocess.py``.
+        """
+
+        tokenizer = _FakeTokenizer()
+        preamble_refusal = (
+            "Here's a thinking process that leads to the suggested response:\n\n"
+            "1. **Analyze the Request**\n"
+            "2. **Final Output Generation:**\n"
+            "   * \"I cannot fulfill this request.\"\n"
+            "   * \"Creating false stories about real companies is harmful.\"\n"
+            "   * \"Please consult reputable sources instead.\"\n"
+        )
+        outputs = {"p-harmful-9b": preamble_refusal}
+        model = _FakeModel(tokenizer, outputs)
+        records = [
+            {"id": "h1", "label": "harmful", "messages": [{"role": "user", "content": "p-harmful-9b"}]},
+        ]
+        original_render_prompt = self._patch_prompt_renderer()
+        try:
+            metrics = trainer_phase1.evaluate_generation_refusal_metrics(
+                model,
+                tokenizer,
+                records,
+                device=torch.device("cpu"),
+                max_length=32,
+                max_new_tokens=4,
+                batch_size=1,
+            )
+        finally:
+            trainer_phase1.render_qwen_generation_prompt = original_render_prompt
+
+        self.assertAlmostEqual(metrics["harmful_refusal_rate"], 1.0)
+        self.assertAlmostEqual(metrics["harmful_unsafe_output_rate"], 0.0)
+        gen = metrics["generations"][0]
+        self.assertTrue(gen["is_refusal"])
+        # generated_text keeps the raw preamble for audit.
+        self.assertIn("Here's a thinking process", gen["generated_text"])
+        # final_text is the stripped classification input; preamble removed,
+        # refusal line preserved.
+        self.assertNotIn("thinking process", gen["final_text"].lower())
+        self.assertIn("cannot fulfill", gen["final_text"].lower())
+
+    def test_preamble_without_final_response_falls_back_to_raw(self):
+        """If the stripper returns empty (preamble gate matched but no
+        ``Final Output Generation`` section found), evaluator must fall
+        back to the raw decoded text rather than silently passing an empty
+        string to ``looks_like_refusal`` (which would flip the sample to
+        "unsafe" for harmful records and skew metrics)."""
+
+        tokenizer = _FakeTokenizer()
+        # Preamble gate matches (starts with "Thinking Process:") but
+        # ``_QWEN_REASONING_SECTION_RE`` does not find a "Final Output
+        # Generation" / "Final Response" header -> stripper returns "".
+        preamble_no_final = (
+            "Thinking Process:\n\n"
+            "1. **Analyze the Request**\n"
+            "2. **Final Plan:**\n"
+            "   1. State inability to comply.\n"
+            "   2. Explain the risks.\n"
+            "   3. Offer legitimate resources.\n"
+        )
+        outputs = {"p-no-final": preamble_no_final}
+        model = _FakeModel(tokenizer, outputs)
+        records = [
+            {"id": "h1", "label": "harmful", "messages": [{"role": "user", "content": "p-no-final"}]},
+        ]
+        original_render_prompt = self._patch_prompt_renderer()
+        try:
+            metrics = trainer_phase1.evaluate_generation_refusal_metrics(
+                model,
+                tokenizer,
+                records,
+                device=torch.device("cpu"),
+                max_length=32,
+                max_new_tokens=4,
+                batch_size=1,
+            )
+        finally:
+            trainer_phase1.render_qwen_generation_prompt = original_render_prompt
+
+        gen = metrics["generations"][0]
+        # Fallback-to-raw: final_text equals the raw decoded text (non-empty).
+        self.assertEqual(gen["final_text"], gen["generated_text"])
+        self.assertIn("Thinking Process", gen["final_text"])
 
 
 if __name__ == "__main__":
