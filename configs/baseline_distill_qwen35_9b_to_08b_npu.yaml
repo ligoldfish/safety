@@ -6,20 +6,20 @@ teacher:
   chat_template_enable_thinking: false
   device_map: ""
   torch_dtype: float32
-  runtime_backend: tpu
-  runtime_device: xla
+  runtime_backend: npu
+  runtime_device: npu:0
   trust_remote_code: true
   local_files_only: true
   attn_implementation: ""
 
 student:
-  name: Qwen3.5-1B
-  path: ../models/Qwen3.5-1B
+  name: Qwen3.5-0.8B
+  path: ../models/Qwen3.5-0.8B
   chat_template_enable_thinking: false
   device_map: ""
   torch_dtype: float32
-  runtime_backend: tpu
-  runtime_device: xla
+  runtime_backend: npu
+  runtime_device: npu:0
   trust_remote_code: true
   local_files_only: true
   attn_implementation: ""
@@ -31,19 +31,17 @@ data:
 
 lora:
   rank: 8
-  alpha: 16.0
-  dropout: 0.0
+  alpha: 8.0
+  dropout: 0.05
   target_modules:
     - self_attn.v_proj
     - self_attn.o_proj
-    - mlp.up_proj
-    - mlp.down_proj
 
 optim:
-  epochs: 3
+  epochs: 1
   batch_size: 8
   micro_batch_size: 1
-  learning_rate: 0.0003
+  learning_rate: 0.00005
   weight_decay: 0.0
   max_length: 1024
   max_new_tokens: 512
@@ -55,5 +53,6 @@ distill:
   soft_loss_weight: 0.5
 
 output:
-  output_root: ../outputs/baselines/distill_qwen35_9b_to_1b_tpu
+  output_root: ../outputs/baselines/distill_qwen35_9b_to_08b_npu
+
 

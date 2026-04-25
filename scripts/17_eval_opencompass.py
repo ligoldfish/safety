@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -8,7 +9,8 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_DATASETS = ("mmlu", "gsm8k", "humaneval", "mbpp")
+DEFAULT_DATASETS = ("mmlu_gen", "gsm8k_gen", "humaneval_gen", "mbpp_gen")
+SUPPORTED_DATASETS = frozenset(DEFAULT_DATASETS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -142,8 +144,32 @@ def _build_model_kwargs_tokens(backend: str, attn_impl: str, torch_dtype: str) -
     return tokens
 
 
+def _validate_requested_datasets(datasets: list[str]) -> None:
+    unknown = sorted({dataset for dataset in datasets if dataset not in SUPPORTED_DATASETS})
+    if unknown:
+        supported = ", ".join(sorted(SUPPORTED_DATASETS))
+        raise ValueError(
+            f"Unsupported OpenCompass dataset(s): {', '.join(unknown)}. "
+            f"Supported datasets: {supported}."
+        )
+
+
+def _ensure_humaneval_dependency(datasets: list[str]) -> None:
+    if "humaneval_gen" not in datasets:
+        return
+    if importlib.util.find_spec("human_eval") is not None:
+        return
+    raise ModuleNotFoundError(
+        "Dataset 'humaneval_gen' requires the 'human_eval' package, but it is not installed. "
+        "Install it in the current environment before running OpenCompass with HumanEval."
+    )
+
+
 def main() -> None:
     args = parse_args()
+    requested_datasets = [str(dataset) for dataset in args.datasets]
+    _validate_requested_datasets(requested_datasets)
+    _ensure_humaneval_dependency(requested_datasets)
     merged_model_dir = Path(args.merged_model_dir).resolve()
     if not merged_model_dir.exists():
         raise FileNotFoundError(f"Merged model dir not found: {merged_model_dir}")
@@ -154,7 +180,11 @@ def main() -> None:
     backend = _detect_backend(args.device)
     num_gpus = _default_num_gpus(args.num_gpus, backend)
     model_kwargs_tokens = _build_model_kwargs_tokens(backend, args.attn_impl, args.torch_dtype)
-    tokenizer_kwargs_tokens = ["trust_remote_code=True", "use_fast=True"]
+    # Qwen3.5 fast tokenizers on our current transformers/OpenCompass stack can
+    # expose a backend object without ``batch_encode_plus``, while the bundled
+    # HuggingFace wrapper still calls that legacy API. Default to the slow
+    # tokenizer for compatibility across 0.8B/9B local runs.
+    tokenizer_kwargs_tokens = ["trust_remote_code=True", "use_fast=False"]
 
     cmd = [
         sys.executable,
@@ -180,7 +210,7 @@ def main() -> None:
         "--work-dir",
         str(work_dir),
         "--datasets",
-        *args.datasets,
+        *requested_datasets,
     ]
     extra = list(args.extra_args or [])
     if extra and extra[0] == "--":
@@ -192,7 +222,7 @@ def main() -> None:
         "opencompass_dir": str(opencompass_dir),
         "entry": str(run_py),
         "work_dir": str(work_dir),
-        "datasets": list(args.datasets),
+        "datasets": requested_datasets,
         "hf_num_gpus": num_gpus,
         "backend": backend,
         "attn_impl": args.attn_impl,

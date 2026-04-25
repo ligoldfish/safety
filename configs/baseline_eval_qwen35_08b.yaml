@@ -1,16 +1,16 @@
 seed: 42
 
 model:
-  name: Qwen3.5-1B
-  path: ../models/Qwen3.5-1B
-  device_map: ""
-  torch_dtype: float32
+  name: Qwen3.5-0.8B
+  path: ../models/Qwen3.5-0.8B
+  device_map: auto
+  torch_dtype: bfloat16
   chat_template_enable_thinking: false
-  runtime_backend: npu
-  runtime_device: npu:0
+  runtime_backend: ""
+  runtime_device: ""
   trust_remote_code: true
   local_files_only: true
-  attn_implementation: ""
+  attn_implementation: sdpa
 
 adapter:
   manifest_path: ""
@@ -70,4 +70,4 @@ runtime:
   batch_size: 1
 
 output:
-  output_root: ../outputs/baselines/no_sft_qwen35_1b_npu
+  output_root: ../outputs/baselines/no_sft_qwen35_08b

@@ -1,18 +1,21 @@
 seed: 42
+
 model:
-  name: Qwen3.5-1B
-  path: ../models/Qwen3.5-1B
-  device_map: ''
-  torch_dtype: float32
+  name: Qwen3.5-0.8B
+  path: ../models/Qwen3.5-0.8B
+  device_map: ""
+  torch_dtype: bfloat16
   chat_template_enable_thinking: false
-  runtime_backend: npu
-  runtime_device: npu:0
+  runtime_backend: tpu
+  runtime_device: xla
   trust_remote_code: true
   local_files_only: true
-  attn_implementation: ''
+  attn_implementation: ""
+
 adapter:
-  manifest_path: ''
-  checkpoint_path: ''
+  manifest_path: ""
+  checkpoint_path: ""
+
 datasets:
   pan:
     path: ../data/processed/pan_test_set.jsonl
@@ -61,8 +64,10 @@ datasets:
     max_new_tokens: 1024
     initial_max_new_tokens: 0
     exec_timeout_seconds: 3
+
 runtime:
   max_length: 2048
   batch_size: 1
+
 output:
-  output_root: ../outputs/baselines/no_sft_qwen35_1b_npu
+  output_root: ../outputs/baselines/no_sft_qwen35_08b_tpu

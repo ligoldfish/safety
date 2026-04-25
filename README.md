@@ -147,7 +147,7 @@ The workspace now also includes a reusable baseline stack for:
 
 - `no-sft`: direct evaluation of the base model on PAN, MMLU, GSM8K, HumanEval, and MBPP
 - `sft`: PAN-only supervised fine-tuning with LoRA, then the same evaluation suite
-- `distill`: PAN-only teacher-student distillation from Qwen3.5-9B to Qwen3.5-1B, then the same evaluation suite
+- `distill`: PAN-only teacher-student distillation from Qwen3.5-9B to Qwen3.5-0.8B, then the same evaluation suite
 
 ### New Entry Points
 
@@ -158,11 +158,11 @@ The workspace now also includes a reusable baseline stack for:
 
 ### New Configs
 
-- `configs/baseline_eval_qwen35_1b.yaml`
+- `configs/baseline_eval_qwen35_08b.yaml`
 - `configs/baseline_eval_qwen35_9b.yaml`
-- `configs/baseline_sft_qwen35_1b.yaml`
+- `configs/baseline_sft_qwen35_08b.yaml`
 - `configs/baseline_sft_qwen35_9b.yaml`
-- `configs/baseline_distill_qwen35_9b_to_1b.yaml`
+- `configs/baseline_distill_qwen35_9b_to_08b.yaml`
 
 ### Dataset Notes
 
@@ -197,17 +197,17 @@ If one of those paths is missing, `scripts/12_eval_baseline_suite.py` writes a p
 
 The new configs are prepared for:
 
-- `models/Qwen3.5-1B`
+- `models/Qwen3.5-0.8B`
 - `models/Qwen3.5-9B`
 
-The current workspace README still points to the existing `Qwen3.5-0.8B` experiment. Update the new baseline configs if your local 1B / 9B directories use different names.
+Update the baseline configs if your local `0.8B` / `9B` directories use different names.
 
 ### Example Commands
 
 One-click launcher:
 
 ```powershell
-D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\15_run_oneclick.py nosft --device npu --device-id 0 --model 1b
+D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\15_run_oneclick.py nosft --device npu --device-id 0 --model 0.8b
 D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\15_run_oneclick.py sft --device tpu --device-id 1 --model 9b
 D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\15_run_oneclick.py distill --device npu --device-id 2
 D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\15_run_oneclick.py random --device tpu --device-id 0
@@ -217,7 +217,7 @@ D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\15_run_oneclick.py sm
 
 ### Device Control Notes
 
-- `--device npu --device-id 3` binds the run to `npu:3`
+- `--device npu --device-id 3` exposes physical NPU `3` via `ASCEND_RT_VISIBLE_DEVICES=3`, and the process then runs on logical `npu:0`
 - `--device tpu --device-id 2` binds the run to `xla:2`
 - `--num-devices` is exposed on the launcher, but the current code path is still single-process single-device, so only `--num-devices 1` is supported right now
 - the launcher writes a temporary runtime-override config before execution, so you do not need to hand-edit the original NPU / TPU YAML files just to change card IDs
@@ -225,14 +225,14 @@ D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\15_run_oneclick.py sm
 Direct evaluation without SFT:
 
 ```powershell
-D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\12_eval_baseline_suite.py --config D:\safety\configs\baseline_eval_qwen35_1b.yaml
+D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\12_eval_baseline_suite.py --config D:\safety\configs\baseline_eval_qwen35_08b.yaml
 D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\12_eval_baseline_suite.py --config D:\safety\configs\baseline_eval_qwen35_9b.yaml
 ```
 
 PAN SFT:
 
 ```powershell
-D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\13_train_pan_sft.py --config D:\safety\configs\baseline_sft_qwen35_1b.yaml
+D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\13_train_pan_sft.py --config D:\safety\configs\baseline_sft_qwen35_08b.yaml
 D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\13_train_pan_sft.py --config D:\safety\configs\baseline_sft_qwen35_9b.yaml
 ```
 
@@ -240,24 +240,24 @@ Evaluate an SFT checkpoint:
 
 ```powershell
 D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\12_eval_baseline_suite.py `
-  --config D:\safety\configs\baseline_eval_qwen35_1b.yaml `
-  --adapter-manifest D:\safety\outputs\baselines\sft_qwen35_1b\manifest.json `
-  --adapter-checkpoint D:\safety\outputs\baselines\sft_qwen35_1b\checkpoints\epoch_003.pt `
-  --output-dir D:\safety\outputs\baselines\sft_qwen35_1b\eval_suite
+  --config D:\safety\configs\baseline_eval_qwen35_08b.yaml `
+  --adapter-manifest D:\safety\outputs\baselines\sft_qwen35_08b\manifest.json `
+  --adapter-checkpoint D:\safety\outputs\baselines\sft_qwen35_08b\checkpoints\epoch_001.pt `
+  --output-dir D:\safety\outputs\baselines\sft_qwen35_08b\eval_suite
 ```
 
-PAN distillation (9B -> 1B):
+PAN distillation (9B -> 0.8B):
 
 ```powershell
-D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\14_train_pan_distill.py --config D:\safety\configs\baseline_distill_qwen35_9b_to_1b.yaml
+D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\14_train_pan_distill.py --config D:\safety\configs\baseline_distill_qwen35_9b_to_08b.yaml
 ```
 
 Evaluate a distillation checkpoint:
 
 ```powershell
 D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\12_eval_baseline_suite.py `
-  --config D:\safety\configs\baseline_eval_qwen35_1b.yaml `
-  --adapter-manifest D:\safety\outputs\baselines\distill_qwen35_9b_to_1b\manifest.json `
-  --adapter-checkpoint D:\safety\outputs\baselines\distill_qwen35_9b_to_1b\checkpoints\epoch_003.pt `
-  --output-dir D:\safety\outputs\baselines\distill_qwen35_9b_to_1b\eval_suite
+  --config D:\safety\configs\baseline_eval_qwen35_08b.yaml `
+  --adapter-manifest D:\safety\outputs\baselines\distill_qwen35_9b_to_08b\manifest.json `
+  --adapter-checkpoint D:\safety\outputs\baselines\distill_qwen35_9b_to_08b\checkpoints\epoch_001.pt `
+  --output-dir D:\safety\outputs\baselines\distill_qwen35_9b_to_08b\eval_suite
 ```

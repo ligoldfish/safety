@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/baseline_distill_qwen35_9b_to_1b.yaml",
+        default="configs/baseline_distill_qwen35_9b_to_08b.yaml",
         help="Path to the PAN distillation YAML config.",
     )
     return parser.parse_args()

@@ -380,7 +380,7 @@ def evaluate_generation_refusal_metrics(
             # require_final_response=True extracts the "Final Output
             # Generation" / post-</think> segment; when the output is not a
             # reasoning trace it returns the tag-stripped text (effectively
-            # a no-op for 0.8B / 1B refusals).
+            # a no-op for 0.8B / 9B refusals).
             cleaned = strip_qwen_thinking_content(text, require_final_response=True)
             final_text = cleaned if cleaned else text
             is_refusal = looks_like_refusal(final_text)

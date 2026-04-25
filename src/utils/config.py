@@ -144,23 +144,23 @@ class PhaseFInputConfig:
 @dataclass
 class PhaseFLoRAConfig:
     rank: int = 8
-    alpha: float = 16.0
-    dropout: float = 0.0
+    alpha: float = 8.0
+    dropout: float = 0.05
     target_modules: List[str] = field(
-        default_factory=lambda: ["self_attn.v_proj", "self_attn.o_proj", "mlp.up_proj", "mlp.down_proj"]
+        default_factory=lambda: ["self_attn.v_proj", "self_attn.o_proj"]
     )
 
 
 @dataclass
 class PhaseFOptimConfig:
-    epochs: int = 3
+    epochs: int = 1
     batch_size: int = 16
     micro_batch_size: int = 0
-    learning_rate: float = 3e-4
+    learning_rate: float = 5e-5
     weight_decay: float = 0.0
     layer_loss_weight: float = 0.5
     max_length: int = 1024
-    max_new_tokens: int = 64
+    max_new_tokens: int = 256
     log_every_steps: int = 1
 
 

@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/baseline_eval_qwen35_1b.yaml",
+        default="configs/baseline_eval_qwen35_08b.yaml",
         help="Path to the baseline evaluation YAML config.",
     )
     parser.add_argument(

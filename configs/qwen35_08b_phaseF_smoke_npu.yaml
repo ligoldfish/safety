@@ -20,19 +20,17 @@ inputs:
 
 lora:
   rank: 8
-  alpha: 16.0
-  dropout: 0.0
+  alpha: 8.0
+  dropout: 0.05
   target_modules:
     - self_attn.v_proj
     - self_attn.o_proj
-    - mlp.up_proj
-    - mlp.down_proj
 
 optim:
   epochs: 1
   batch_size: 8
   micro_batch_size: 2
-  learning_rate: 0.0003
+  learning_rate: 0.00005
   weight_decay: 0.0
   layer_loss_weight: 0.5
   max_length: 1024
@@ -46,4 +44,3 @@ target:
 
 output:
   output_root: ../outputs/qwen35_08b_phase1_smoke_npu/training
-

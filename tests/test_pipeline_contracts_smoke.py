@@ -178,5 +178,43 @@ class MergedSummaryIsolationSmokeTests(unittest.TestCase):
         self.assertEqual(merged["opencompass"]["results"], {})
 
 
+class OneClickConfigSmokeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = _load_script_module(
+            "15_run_oneclick.py",
+            "script_15_run_oneclick",
+        )
+
+    def test_08b_eval_uses_dedicated_08b_entrypoints(self):
+        expected = {
+            ("npu", "0.8b"): PROJECT_ROOT / "configs" / "baseline_eval_qwen35_08b_npu.yaml",
+            ("tpu", "0.8b"): PROJECT_ROOT / "configs" / "baseline_eval_qwen35_08b_tpu.yaml",
+        }
+        for key, path in expected.items():
+            self.assertIn(key, self.module.BASELINE_EVAL_CONFIGS)
+            self.assertEqual(PROJECT_ROOT / self.module.BASELINE_EVAL_CONFIGS[key], path)
+            self.assertTrue(path.exists(), f"Missing eval config target for {key}: {path}")
+        self.assertEqual(
+            set(self.module.BASELINE_EVAL_CONFIGS),
+            {
+                ("npu", "0.8b"),
+                ("tpu", "0.8b"),
+                ("npu", "9b"),
+                ("tpu", "9b"),
+            },
+        )
+
+    def test_default_baseline_script_configs_point_to_existing_08b_files(self):
+        expected_defaults = {
+            "12_eval_baseline_suite.py": "configs/baseline_eval_qwen35_08b.yaml",
+            "13_train_pan_sft.py": "configs/baseline_sft_qwen35_08b.yaml",
+            "14_train_pan_distill.py": "configs/baseline_distill_qwen35_9b_to_08b.yaml",
+        }
+        for script_name, config_path in expected_defaults.items():
+            script_text = (PROJECT_ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+            self.assertIn(config_path, script_text, f"{script_name} default config should point to {config_path}")
+            self.assertTrue((PROJECT_ROOT / config_path).exists(), f"Missing default config for {script_name}: {config_path}")
+
+
 if __name__ == "__main__":
     unittest.main()

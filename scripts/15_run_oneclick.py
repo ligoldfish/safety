@@ -21,22 +21,22 @@ from src.utils.config import load_phase1_config, load_phasef_config
 
 
 BASELINE_EVAL_CONFIGS = {
-    ("npu", "1b"): "configs/baseline_eval_qwen35_1b_npu.yaml",
-    ("tpu", "1b"): "configs/baseline_eval_qwen35_1b_tpu.yaml",
+    ("npu", "0.8b"): "configs/baseline_eval_qwen35_08b_npu.yaml",
+    ("tpu", "0.8b"): "configs/baseline_eval_qwen35_08b_tpu.yaml",
     ("npu", "9b"): "configs/baseline_eval_qwen35_9b_npu.yaml",
     ("tpu", "9b"): "configs/baseline_eval_qwen35_9b_tpu.yaml",
 }
 
 BASELINE_SFT_CONFIGS = {
-    ("npu", "1b"): "configs/baseline_sft_qwen35_1b_npu.yaml",
-    ("tpu", "1b"): "configs/baseline_sft_qwen35_1b_tpu.yaml",
+    ("npu", "0.8b"): "configs/baseline_sft_qwen35_08b_npu.yaml",
+    ("tpu", "0.8b"): "configs/baseline_sft_qwen35_08b_tpu.yaml",
     ("npu", "9b"): "configs/baseline_sft_qwen35_9b_npu.yaml",
     ("tpu", "9b"): "configs/baseline_sft_qwen35_9b_tpu.yaml",
 }
 
 BASELINE_DISTILL_CONFIGS = {
-    "npu": "configs/baseline_distill_qwen35_9b_to_1b_npu.yaml",
-    "tpu": "configs/baseline_distill_qwen35_9b_to_1b_tpu.yaml",
+    "npu": "configs/baseline_distill_qwen35_9b_to_08b_npu.yaml",
+    "tpu": "configs/baseline_distill_qwen35_9b_to_08b_tpu.yaml",
 }
 
 FULL_PIPELINE_CONFIGS = {
@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
         target_parser.add_argument(
             "--opencompass-datasets",
             nargs="+",
-            default=["mmlu", "gsm8k", "humaneval", "mbpp"],
+            default=["mmlu_gen", "gsm8k_gen", "humaneval_gen", "mbpp_gen"],
             help="Datasets forwarded to scripts/17_eval_opencompass.py --datasets.",
         )
         target_parser.add_argument(
@@ -146,11 +146,11 @@ def parse_args() -> argparse.Namespace:
         )
 
     nosft_parser = subparsers.add_parser("nosft", help="Run no-SFT benchmark evaluation.")
-    nosft_parser.add_argument("--model", choices=["1b", "9b"], required=True)
+    nosft_parser.add_argument("--model", choices=["0.8b", "9b"], required=True)
     add_common_flags(nosft_parser)
 
     sft_parser = subparsers.add_parser("sft", help="Run PAN SFT and then benchmark evaluation.")
-    sft_parser.add_argument("--model", choices=["1b", "9b"], required=True)
+    sft_parser.add_argument("--model", choices=["0.8b", "9b"], required=True)
     add_common_flags(sft_parser)
 
     distill_parser = subparsers.add_parser("distill", help="Run PAN distillation and then benchmark evaluation.")
@@ -623,7 +623,7 @@ def _run_baseline_distill(
         device_id=device_id,
     )
     eval_config = _make_runtime_override_config(
-        _resolve(BASELINE_EVAL_CONFIGS[(device, "1b")]),
+        _resolve(BASELINE_EVAL_CONFIGS[(device, "0.8b")]),
         device=device,
         device_id=device_id,
     )
@@ -792,7 +792,7 @@ def _run_random_baseline(
     )
     _run_adapter_eval(
         device=device,
-        model_size="1b",
+        model_size="0.8b",
         training_output_root=Path(phasef_cfg.output.output_root),
         device_id=device_id,
         dry_run=dry_run,
@@ -845,7 +845,7 @@ def _run_full_pipeline(
     _run_script("11_make_tables.py", ["--config", str(phase1_config)], dry_run=dry_run, env_overrides=env_overrides)
     _run_adapter_eval(
         device=device,
-        model_size="1b",
+        model_size="0.8b",
         training_output_root=Path(phasef_cfg.output.output_root),
         device_id=device_id,
         dry_run=dry_run,

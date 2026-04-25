@@ -80,27 +80,25 @@ class SupervisedDataConfig:
 @dataclass
 class BaselineLoRAConfig:
     rank: int = 8
-    alpha: float = 16.0
-    dropout: float = 0.0
+    alpha: float = 8.0
+    dropout: float = 0.05
     target_modules: list[str] = field(
         default_factory=lambda: [
             "self_attn.v_proj",
             "self_attn.o_proj",
-            "mlp.up_proj",
-            "mlp.down_proj",
         ]
     )
 
 
 @dataclass
 class BaselineOptimConfig:
-    epochs: int = 3
+    epochs: int = 1
     batch_size: int = 8
     micro_batch_size: int = 1
-    learning_rate: float = 3e-4
+    learning_rate: float = 5e-5
     weight_decay: float = 0.0
     max_length: int = 1024
-    max_new_tokens: int = 64
+    max_new_tokens: int = 256
     log_every_steps: int = 1
 
 

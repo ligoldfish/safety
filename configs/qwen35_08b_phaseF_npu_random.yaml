@@ -20,23 +20,21 @@ inputs:
 
 lora:
   rank: 8
-  alpha: 16.0
-  dropout: 0.0
+  alpha: 8.0
+  dropout: 0.05
   target_modules:
     - self_attn.v_proj
     - self_attn.o_proj
-    - mlp.up_proj
-    - mlp.down_proj
 
 optim:
-  epochs: 3
+  epochs: 1
   batch_size: 16
   micro_batch_size: 2
-  learning_rate: 0.0003
+  learning_rate: 0.00005
   weight_decay: 0.0
   layer_loss_weight: 0.5
   max_length: 1024
-  max_new_tokens: 48
+  max_new_tokens: 256
   log_every_steps: 1
 
 target:

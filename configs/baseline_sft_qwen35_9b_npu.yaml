@@ -19,19 +19,17 @@ data:
 
 lora:
   rank: 8
-  alpha: 16.0
-  dropout: 0.0
+  alpha: 8.0
+  dropout: 0.05
   target_modules:
     - self_attn.v_proj
     - self_attn.o_proj
-    - mlp.up_proj
-    - mlp.down_proj
 
 optim:
-  epochs: 3
+  epochs: 2
   batch_size: 8
   micro_batch_size: 1
-  learning_rate: 0.0003
+  learning_rate: 0.0001
   weight_decay: 0.0
   max_length: 1024
   max_new_tokens: 512
