@@ -294,8 +294,15 @@ def evaluate_pan(
     max_length: int,
     max_new_tokens: int,
     batch_size: int = 1,
-    initial_max_new_tokens: int = 0,  # retained for config/YAML compatibility; ignored here
+    initial_max_new_tokens: int = 0,
 ) -> Dict[str, Any]:
+    """Run PAN refusal-rate eval. ``initial_max_new_tokens`` (when >0 and <
+    ``max_new_tokens``) is used for a budgeted first pass; samples whose
+    Qwen reasoning preamble truncated before the final-response section get
+    re-generated at the full budget so they are not silently misclassified
+    as ``unsafe``.
+    """
+
     device = _resolve_device(model)
     metrics = evaluate_generation_refusal_metrics(
         model,
@@ -305,6 +312,7 @@ def evaluate_pan(
         max_length=max_length,
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
+        initial_max_new_tokens=initial_max_new_tokens,
     )
     metrics["status"] = "ok"
     metrics["num_samples"] = len(records)

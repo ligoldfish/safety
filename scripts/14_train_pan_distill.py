@@ -304,9 +304,13 @@ def main() -> None:
             **val_loss_metrics,
             "harmful_refusal_rate": generation_metrics["harmful_refusal_rate"],
             "harmful_unsafe_output_rate": generation_metrics["harmful_unsafe_output_rate"],
+            "harmful_safe_non_refusal_rate": generation_metrics["harmful_safe_non_refusal_rate"],
+            "harmful_strict_unsafe_rate": generation_metrics["harmful_strict_unsafe_rate"],
             "harmless_over_refusal_rate": generation_metrics["harmless_over_refusal_rate"],
             "num_harmful": generation_metrics["num_harmful"],
             "num_harmless": generation_metrics["num_harmless"],
+            "num_preamble_retries": generation_metrics["num_preamble_retries"],
+            "num_preamble_unresolved": generation_metrics["num_preamble_unresolved"],
         }
         val_metrics[f"epoch_{epoch}"] = epoch_metrics
         write_val_metrics(val_metrics_path, val_metrics)
