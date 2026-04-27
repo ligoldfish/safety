@@ -498,8 +498,12 @@ class HuggingFacewithChatTemplate(BaseModel):
         outputs = self.model.generate(**tokens, **generation_kwargs)
         outputs = outputs[:, tokens['input_ids'].shape[1]:]
 
-        # step-3: decode the output
-        decodeds = self.tokenizer.batch_decode(outputs)
+        # step-3: decode the output. skip_special_tokens=True so trailing
+        # <|im_end|> / <|endoftext|> markers do not leak into pred text and
+        # then trip MBPPEvaluator / HumanEvalEvaluator's compile() step. The
+        # base-model wrapper below already passes skip_special_tokens=True;
+        # the chat-wrapper path was inconsistent and inflated `failed`.
+        decodeds = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
         for stop in stopping_criteria:
             decodeds = [t.split(stop)[0] for t in decodeds]
 

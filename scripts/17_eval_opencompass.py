@@ -53,7 +53,18 @@ def parse_args() -> argparse.Namespace:
             "Qwen3.5 (32k native context)."
         ),
     )
-    parser.add_argument("--max-out-len", type=int, default=1024)
+    parser.add_argument(
+        "--max-out-len",
+        type=int,
+        default=None,
+        help=(
+            "Per-task generation budget. Default unset so each dataset's own "
+            "infer_cfg.max_out_len wins (mbpp/humaneval ship 512, mmlu ship 50, "
+            "etc.). Forcing a global 1024 lets code-task outputs run long enough "
+            "to degenerate into repetition loops, which then fail the syntax-parse "
+            "stage of MBPPEvaluator and inflate `failed`."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--num-gpus",
@@ -229,8 +240,6 @@ def main() -> None:
         *tokenizer_kwargs_tokens,
         "--max-seq-len",
         str(args.max_seq_len),
-        "--max-out-len",
-        str(args.max_out_len),
         "--batch-size",
         str(args.batch_size),
         "--hf-num-gpus",
@@ -240,6 +249,8 @@ def main() -> None:
         "--datasets",
         *requested_datasets,
     ]
+    if args.max_out_len is not None:
+        cmd.extend(["--max-out-len", str(args.max_out_len)])
     generation_kwargs_tokens = list(args.generation_kwargs or [])
     if generation_kwargs_tokens:
         cmd.extend(["--generation-kwargs", *generation_kwargs_tokens])

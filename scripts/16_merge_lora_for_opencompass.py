@@ -115,6 +115,17 @@ def main() -> None:
 
     model.save_pretrained(output_dir, safe_serialization=True)
     tokenizer.save_pretrained(output_dir)
+    # Persist the base model's GenerationConfig (eos_token_id list, pad token,
+    # default sampling) so OpenCompass's HuggingFacewithChatTemplate can pick
+    # up correct stop tokens via GenerationConfig.from_pretrained(merged_dir).
+    # Without this file OC silently falls back to no extra stop words and the
+    # model runs to max_out_len, triggering repetition loops on small models.
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is not None:
+        try:
+            generation_config.save_pretrained(output_dir)
+        except Exception as exc:  # pragma: no cover - defensive, logged not raised
+            log_kv(logger, "generation_config_save_failed", error=str(exc))
 
     summary = {
         "model_name": cfg.model.name,
