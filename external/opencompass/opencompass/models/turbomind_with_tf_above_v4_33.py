@@ -141,7 +141,20 @@ class TurboMindModelwithChatTemplate(BaseModel):
             messages = _format_with_fast_chat_template(messages, self.fastchat_template)
         else:
             # NOTE: DeepSeek-R1 series model's chat template will add <think> after the
-            messages = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) for m in messages]
+            # PAN-tuned Qwen3.5 students were trained with enable_thinking=False; the
+            # template default is True so we force-disable to avoid train/eval drift.
+            try:
+                messages = [
+                    self.tokenizer.apply_chat_template(
+                        m, add_generation_prompt=True, tokenize=False, enable_thinking=False
+                    )
+                    for m in messages
+                ]
+            except TypeError:
+                messages = [
+                    self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False)
+                    for m in messages
+                ]
             # LMDeploy tokenize prompts by AutoTokenizer with its default parameter "add_special_token=True"
             # OC add bos_token in the prompt, which requires tokenizing prompts using "add_speicial_token=False"
             # But LMDeploy doesn't have "add_speicial_token" in the pipeline API. So, we remove bos_token
@@ -199,7 +212,12 @@ class TurboMindModelwithChatTemplate(BaseModel):
             int: Length of the input tokens
         """
         m = _convert_chat_messages([prompt])[0]
-        t = self.tokenizer.apply_chat_template(m, add_generation_prompt=True, return_dict=True)
+        try:
+            t = self.tokenizer.apply_chat_template(
+                m, add_generation_prompt=True, return_dict=True, enable_thinking=False
+            )
+        except TypeError:
+            t = self.tokenizer.apply_chat_template(m, add_generation_prompt=True, return_dict=True)
         return len(t['input_ids'])
 
     def _build_pipe(self, model_path, backend, engine_config):

@@ -77,6 +77,10 @@ class VLLMwithChatTemplate(BaseModel):
         self.stop_words = list(set(stop_words + self._get_potential_stop_words(path)))
         self.lora_path = lora_path
         self.chat_template_kwargs = chat_template_kwargs or {}
+        # PAN-tuned Qwen3.5 students were trained with enable_thinking=False;
+        # leaving the template default (True) at eval triggers train/eval drift.
+        # Force False unless caller explicitly opted into thinking mode.
+        self.chat_template_kwargs.setdefault('enable_thinking', False)
 
     def _load_model(self, path: str, added_model_kwargs: dict = dict()):
         import ray
@@ -172,5 +176,10 @@ class VLLMwithChatTemplate(BaseModel):
             int: Length of the input tokens
         """
         m = _convert_chat_messages([prompt])[0]
-        t = self.tokenizer.apply_chat_template(m, add_generation_prompt=True, return_dict=True)
+        try:
+            t = self.tokenizer.apply_chat_template(
+                m, add_generation_prompt=True, return_dict=True, **self.chat_template_kwargs
+            )
+        except TypeError:
+            t = self.tokenizer.apply_chat_template(m, add_generation_prompt=True, return_dict=True)
         return len(t['input_ids'])

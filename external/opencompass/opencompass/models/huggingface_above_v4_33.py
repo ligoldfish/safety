@@ -440,7 +440,24 @@ class HuggingFacewithChatTemplate(BaseModel):
             messages = _format_with_fast_chat_template(messages, self.fastchat_template)
             tokens = self.tokenizer(messages, **tokenize_kwargs)
         else:
-            messages = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) for m in messages]
+            # Qwen3 / Qwen3.5 chat template defaults enable_thinking=True, which
+            # injects a <think>...</think> prelude. PAN-tuned students were
+            # trained with enable_thinking=False, so wrapping eval prompts with
+            # thinking-mode markers triggers train/eval distribution drift and
+            # collapses GSM8K to ~7%. Force False whenever the template accepts it.
+            try:
+                messages = [
+                    self.tokenizer.apply_chat_template(
+                        m, add_generation_prompt=True, tokenize=False, enable_thinking=False
+                    )
+                    for m in messages
+                ]
+            except TypeError:
+                # Older / non-Qwen tokenizers reject the kwarg; fall back.
+                messages = [
+                    self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False)
+                    for m in messages
+                ]
             tokenize_kwargs['add_special_tokens'] = False
             tokens = self.tokenizer(messages, **tokenize_kwargs)
 
@@ -490,7 +507,12 @@ class HuggingFacewithChatTemplate(BaseModel):
 
     def get_token_len(self, prompt: str) -> int:
         m = _convert_chat_messages([prompt])[0]
-        t = self.tokenizer.apply_chat_template(m, add_generation_prompt=True, return_dict=True)
+        try:
+            t = self.tokenizer.apply_chat_template(
+                m, add_generation_prompt=True, return_dict=True, enable_thinking=False
+            )
+        except TypeError:
+            t = self.tokenizer.apply_chat_template(m, add_generation_prompt=True, return_dict=True)
         return len(t['input_ids'])
 
 def  _convert_base_messages(inputs):

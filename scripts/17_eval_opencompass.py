@@ -42,7 +42,17 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_DATASETS),
         help="Dataset names to run (forwarded to opencompass --datasets).",
     )
-    parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=4096,
+        help=(
+            "Max prompt+context length forwarded to OpenCompass. 2048 truncates "
+            "GSM8K 8-shot CoT and long-passage MMLU subjects (professional_law, "
+            "high_school_us_history, etc.). 4096 fits all bundled datasets on "
+            "Qwen3.5 (32k native context)."
+        ),
+    )
     parser.add_argument("--max-out-len", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
@@ -66,11 +76,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--torch-dtype",
-        default="torch.float16",
+        default="auto",
         help=(
             "torch dtype string accepted by OpenCompass (_set_model_kwargs_torch_dtype): "
-            "'torch.float16' (default, matches training dtype), 'torch.bfloat16', "
-            "'torch.float', or 'auto'."
+            "'auto' (default, reads from config.json — Qwen3.5 native is bf16), "
+            "'torch.float16' (overflows on 9B logits), 'torch.bfloat16' (NPU-native), "
+            "or 'torch.float'."
         ),
     )
     parser.add_argument(
@@ -86,7 +97,24 @@ def parse_args() -> argparse.Namespace:
         "--hf-type",
         default="chat",
         choices=("chat", "base"),
-        help="Whether to treat the model as a chat or base HF model inside OpenCompass.",
+        help=(
+            "Whether to treat the model as a chat or base HF model inside OpenCompass. "
+            "MUST be 'base' for un-tuned Qwen3.5 base checkpoints — wrapping the prompt "
+            "in ChatML on a base model collapses generation to single tokens "
+            "(GSM8K drops to ~7%%). Keep 'chat' for PAN-tuned / SFT / distill students."
+        ),
+    )
+    parser.add_argument(
+        "--generation-kwargs",
+        nargs="+",
+        default=["do_sample=False", "repetition_penalty=1.05"],
+        help=(
+            "Tokens of form key=value forwarded to OpenCompass --generation-kwargs. "
+            "Default disables sampling and adds a small repetition penalty so 0.8B / "
+            "9B base models do not collapse into deterministic loops "
+            "('I'll also need to handle the case where...'). Pass an empty list to "
+            "leave generation_kwargs untouched."
+        ),
     )
     parser.add_argument(
         "--extra-args",
@@ -212,6 +240,9 @@ def main() -> None:
         "--datasets",
         *requested_datasets,
     ]
+    generation_kwargs_tokens = list(args.generation_kwargs or [])
+    if generation_kwargs_tokens:
+        cmd.extend(["--generation-kwargs", *generation_kwargs_tokens])
     extra = list(args.extra_args or [])
     if extra and extra[0] == "--":
         extra = extra[1:]
@@ -228,6 +259,10 @@ def main() -> None:
         "attn_impl": args.attn_impl,
         "torch_dtype": args.torch_dtype,
         "model_kwargs_tokens": model_kwargs_tokens,
+        "generation_kwargs_tokens": generation_kwargs_tokens,
+        "hf_type": args.hf_type,
+        "max_seq_len": args.max_seq_len,
+        "max_out_len": args.max_out_len,
         "command": cmd,
     }
     (work_dir / "opencompass_invocation.json").write_text(
