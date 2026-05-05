@@ -24,6 +24,8 @@ from src.baselines import (
     load_model_for_evaluation,
 )
 from src.baselines.eval import filter_records, placeholder_result
+from src.data.safety_eval_datasets import SAFETY_EVAL_LOADERS, SafetyEvalExample
+from src.data.template_qwen import build_qwen_messages
 from src.training import load_records
 from src.utils.io import ensure_dir, write_json
 from src.utils.logging import log_kv, setup_stage_logger
@@ -58,7 +60,122 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional explicit output directory overriding the config output root.",
     )
+    parser.add_argument(
+        "--safety-eval-datasets",
+        nargs="*",
+        default=[],
+        help=(
+            "Optional safety eval dataset loader names. Supported: "
+            f"{', '.join(sorted(SAFETY_EVAL_LOADERS))}."
+        ),
+    )
+    parser.add_argument(
+        "--safety-eval-cache-dir",
+        type=str,
+        default="",
+        help="Optional HuggingFace cache dir forwarded to safety eval dataset loaders.",
+    )
+    parser.add_argument(
+        "--safety-eval-max-samples",
+        type=int,
+        default=0,
+        help="Optional cap per safety eval dataset; 0 means full dataset.",
+    )
+    parser.add_argument(
+        "--safety-eval-placeholder-ok",
+        action="store_true",
+        help="Record placeholder safety eval results instead of failing when a named safety eval loader errors.",
+    )
     return parser.parse_args()
+
+
+def _normalize_safety_eval_label(dataset_name: str, example: SafetyEvalExample) -> str:
+    dataset_key = str(dataset_name).strip().lower()
+    if dataset_key in {"coconot_contrast"}:
+        return "harmless"
+    if dataset_key in {"beavertails_evaluation"}:
+        return "harmful"
+
+    text = " ".join(
+        [
+            str(example.label),
+            str(example.category),
+            str(example.source),
+            str(example.extra or {}),
+        ]
+    ).lower().replace("-", "_").replace(" ", "_")
+    harmless_markers = (
+        "adversarial_benign",
+        "benign",
+        "harmless",
+        "unharmful",
+        "non_harmful",
+        "not_harmful",
+    )
+    if any(marker in text for marker in harmless_markers):
+        return "harmless"
+    if "harmful" in text or "unsafe" in text or "jailbreak" in text:
+        return "harmful"
+    return "harmful"
+
+
+def _safety_eval_examples_to_records(
+    dataset_name: str,
+    examples: list[SafetyEvalExample],
+) -> list[dict]:
+    records: list[dict] = []
+    for index, example in enumerate(examples):
+        prompt = str(example.prompt).strip()
+        if not prompt:
+            continue
+        records.append(
+            {
+                "id": f"{dataset_name}_{example.sample_id or index}",
+                "messages": build_qwen_messages(prompt),
+                "label": _normalize_safety_eval_label(dataset_name, example),
+                "source": example.source,
+                "category": example.category,
+                "safety_eval_label": example.label,
+                "safety_eval_extra": example.extra or {},
+            }
+        )
+    return records
+
+
+def _run_named_safety_eval(
+    *,
+    dataset_name: str,
+    model,
+    tokenizer,
+    max_length: int,
+    max_new_tokens: int,
+    batch_size: int,
+    initial_max_new_tokens: int,
+    cache_dir: str,
+    max_samples: int,
+) -> dict:
+    if dataset_name not in SAFETY_EVAL_LOADERS:
+        supported = ", ".join(sorted(SAFETY_EVAL_LOADERS))
+        raise ValueError(f"Unknown safety eval dataset {dataset_name!r}. Supported: {supported}.")
+
+    loader = SAFETY_EVAL_LOADERS[dataset_name]
+    examples = loader(cache_dir=cache_dir or None)
+    if max_samples > 0:
+        examples = examples[:max_samples]
+    records = _safety_eval_examples_to_records(dataset_name, examples)
+    metrics = evaluate_pan(
+        model,
+        tokenizer,
+        records,
+        max_length=max_length,
+        max_new_tokens=max_new_tokens,
+        batch_size=batch_size,
+        initial_max_new_tokens=initial_max_new_tokens,
+    )
+    metrics["dataset"] = dataset_name
+    metrics["num_loaded_examples"] = len(examples)
+    metrics["num_records"] = len(records)
+    return metrics
 
 
 def main() -> None:
@@ -116,6 +233,34 @@ def main() -> None:
         else:
             raise
     write_json(output_root / "pan_results.json", results["pan"])
+
+    safety_eval_names = [str(name) for name in args.safety_eval_datasets if str(name).strip()]
+    safety_eval_results: dict[str, dict] = {}
+    for dataset_name in safety_eval_names:
+        try:
+            safety_eval_results[dataset_name] = _run_named_safety_eval(
+                dataset_name=dataset_name,
+                model=model,
+                tokenizer=tokenizer,
+                max_length=cfg.runtime.max_length,
+                max_new_tokens=pan_cfg.max_new_tokens,
+                batch_size=cfg.runtime.batch_size,
+                initial_max_new_tokens=pan_cfg.initial_max_new_tokens,
+                cache_dir=args.safety_eval_cache_dir,
+                max_samples=int(args.safety_eval_max_samples),
+            )
+        except Exception as exc:
+            if args.safety_eval_placeholder_ok:
+                safety_eval_results[dataset_name] = placeholder_result(str(exc))
+            else:
+                raise
+        write_json(
+            output_root / f"safety_eval_{dataset_name}_results.json",
+            safety_eval_results[dataset_name],
+        )
+    if safety_eval_results:
+        results["safety_eval"] = safety_eval_results
+        write_json(output_root / "safety_eval_results.json", safety_eval_results)
 
     mmlu_cfg = cfg.datasets.mmlu
     try:

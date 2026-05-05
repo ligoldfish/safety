@@ -9,7 +9,22 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_DATASETS = ("mmlu_gen", "gsm8k_gen", "humaneval_gen", "mbpp_gen")
+# Verified against the vendored copy at external/opencompass on 2026-05-04:
+#   opencompass/configs/datasets/mmlu/mmlu_gen.py        (delegates to
+#       mmlu_openai_simple_evals_gen_b618ea — chat-mode MMLU)
+#   opencompass/configs/datasets/gsm8k/gsm8k_gen.py
+#   opencompass/configs/datasets/IFEval/IFEval_gen.py    (case-sensitive)
+#   opencompass/configs/datasets/humaneval/humaneval_gen.py
+#   opencompass/configs/datasets/mbpp/mbpp_gen.py
+# OpenCompass resolves these names by filename under
+# opencompass/configs/datasets/**, so the casing must match the file on disk.
+DEFAULT_DATASETS = (
+    "mmlu_gen",
+    "gsm8k_gen",
+    "IFEval_gen",
+    "humaneval_gen",
+    "mbpp_gen",
+)
 SUPPORTED_DATASETS = frozenset(DEFAULT_DATASETS)
 
 
@@ -56,13 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-out-len",
         type=int,
-        default=None,
+        default=512,
         help=(
-            "Per-task generation budget. Default unset so each dataset's own "
-            "infer_cfg.max_out_len wins (mbpp/humaneval ship 512, mmlu ship 50, "
-            "etc.). Forcing a global 1024 lets code-task outputs run long enough "
-            "to degenerate into repetition loops, which then fail the syntax-parse "
-            "stage of MBPPEvaluator and inflate `failed`."
+            "Model-level fallback generation budget forwarded to OpenCompass. "
+            "OpenCompass only applies this to datasets whose inferencer does not "
+            "set max_out_len. The vendored mmlu_gen CoT config has no dataset-level "
+            "max_out_len, so the default 512 avoids truncating before the required "
+            "'ANSWER: X' line. GSM8K/HumanEval/MBPP/IFEval keep their explicit "
+            "dataset-level max_out_len values."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=1)
@@ -117,14 +133,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--generation-kwargs",
-        nargs="+",
-        default=["do_sample=False", "repetition_penalty=1.05"],
+        nargs="*",
+        default=[],
         help=(
             "Tokens of form key=value forwarded to OpenCompass --generation-kwargs. "
-            "Default disables sampling and adds a small repetition penalty so 0.8B / "
-            "9B base models do not collapse into deterministic loops "
-            "('I'll also need to handle the case where...'). Pass an empty list to "
-            "leave generation_kwargs untouched."
+            "Default is empty so every dataset keeps its OpenCompass infer_cfg "
+            "generation hyperparameters, including MMLU."
         ),
     )
     parser.add_argument(

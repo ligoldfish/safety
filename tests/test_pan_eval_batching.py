@@ -189,13 +189,18 @@ class RefusalOnlyEvaluatorTests(unittest.TestCase):
         expected_keys = {
             "harmful_refusal_rate",
             "harmful_unsafe_output_rate",
+            "harmful_safe_non_refusal_rate",
+            "harmful_strict_unsafe_rate",
             "harmless_over_refusal_rate",
             "num_harmful",
             "num_harmless",
+            "num_preamble_retries",
+            "num_preamble_unresolved",
             "generations",
         }
         self.assertEqual(set(metrics.keys()), expected_keys)
-        # No thinking-era / safe-response fields must be present.
+        # Top-level metrics stay refusal-only; per-generation rows may carry
+        # trace fields used by downstream debugging.
         for dead_key in (
             "harmful_safe_response_rate",
             "harmful_incomplete_output_rate",
@@ -204,8 +209,8 @@ class RefusalOnlyEvaluatorTests(unittest.TestCase):
         ):
             self.assertNotIn(dead_key, metrics)
         for gen in metrics["generations"]:
-            for dead_key in ("retried_for_final_response", "used_max_new_tokens"):
-                self.assertNotIn(dead_key, gen)
+            self.assertNotIn("retried_for_final_response", gen)
+            self.assertEqual(gen["used_max_new_tokens"], 4)
             # final_text is the text actually fed to looks_like_refusal
             # (post-preamble-strip). For preamble-free outputs it equals the
             # raw decoded text; scripts/aggregators read it alongside

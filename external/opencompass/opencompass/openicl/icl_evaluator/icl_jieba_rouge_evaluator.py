@@ -1,10 +1,21 @@
-import jieba
-from rouge_chinese import Rouge
-
 from opencompass.registry import ICL_EVALUATORS
 from opencompass.utils.text_postprocessors import general_postprocess
 
 from .icl_base_evaluator import BaseEvaluator
+
+
+def _load_chinese_rouge_dependencies():
+    try:
+        import jieba
+        from rouge_chinese import Rouge
+    except ImportError as exc:
+        raise ImportError(
+            "JiebaRougeEvaluator requires optional dependencies "
+            "'jieba' and 'rouge-chinese'. Install them in the "
+            "OpenCompass runtime environment, for example: "
+            "python -m pip install jieba rouge-chinese"
+        ) from exc
+    return jieba, Rouge
 
 
 @ICL_EVALUATORS.register_module()
@@ -27,6 +38,7 @@ class JiebaRougeEvaluator(BaseEvaluator):
         predictions = [general_postprocess(i) for i in predictions]
         references = [general_postprocess(i) for i in references]
 
+        jieba, Rouge = _load_chinese_rouge_dependencies()
         metric = Rouge()
         predictions = [' '.join(jieba.cut(i)) for i in predictions]
         references = [' '.join(jieba.cut(i)) for i in references]

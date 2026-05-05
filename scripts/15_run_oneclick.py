@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.baselines import load_distill_config, load_eval_config, load_sft_config
+from src.baselines.config import load_distill_config, load_eval_config, load_sft_config
 from src.utils.config import load_phase1_config, load_phasef_config
 
 
@@ -37,6 +37,26 @@ BASELINE_SFT_CONFIGS = {
 BASELINE_DISTILL_CONFIGS = {
     "npu": "configs/baseline_distill_qwen35_9b_to_08b_npu.yaml",
     "tpu": "configs/baseline_distill_qwen35_9b_to_08b_tpu.yaml",
+}
+
+# Safety baselines added per data-augmentation plan (2026-05-04).
+# Keyed by (device, model, baseline_name); only 0.8B has explicit configs
+# because the upstream Tülu/Safety-Tuned-LLaMAs/BeaverTails recipes were
+# specified for that scale.
+SAFETY_SFT_BASELINES = ("tulu3_safety", "safety_tuned_llamas", "beavertails")
+DEFAULT_SAFETY_EVAL_DATASETS = (
+    "wildguard_test",
+    "wildjailbreak_eval",
+    "coconot_contrast",
+    "beavertails_evaluation",
+)
+SAFETY_SFT_CONFIGS: dict[tuple[str, str, str], str] = {
+    ("npu", "0.8b", "tulu3_safety"): "configs/baseline_sft_qwen35_08b_tulu3_safety_npu.yaml",
+    ("tpu", "0.8b", "tulu3_safety"): "configs/baseline_sft_qwen35_08b_tulu3_safety_tpu.yaml",
+    ("npu", "0.8b", "safety_tuned_llamas"): "configs/baseline_sft_qwen35_08b_safety_tuned_llamas_npu.yaml",
+    ("tpu", "0.8b", "safety_tuned_llamas"): "configs/baseline_sft_qwen35_08b_safety_tuned_llamas_tpu.yaml",
+    ("npu", "0.8b", "beavertails"): "configs/baseline_sft_qwen35_08b_beavertails_npu.yaml",
+    ("tpu", "0.8b", "beavertails"): "configs/baseline_sft_qwen35_08b_beavertails_tpu.yaml",
 }
 
 FULL_PIPELINE_CONFIGS = {
@@ -133,7 +153,7 @@ def parse_args() -> argparse.Namespace:
         target_parser.add_argument(
             "--opencompass-datasets",
             nargs="+",
-            default=["mmlu_gen", "gsm8k_gen", "humaneval_gen", "mbpp_gen"],
+            default=["mmlu_gen", "gsm8k_gen", "IFEval_gen", "humaneval_gen", "mbpp_gen"],
             help="Datasets forwarded to scripts/17_eval_opencompass.py --datasets.",
         )
         target_parser.add_argument(
@@ -155,6 +175,28 @@ def parse_args() -> argparse.Namespace:
 
     distill_parser = subparsers.add_parser("distill", help="Run PAN distillation and then benchmark evaluation.")
     add_common_flags(distill_parser)
+
+    safety_parser = subparsers.add_parser(
+        "safety-sft",
+        help=(
+            "Run a safety-augmented SFT baseline on Tülu 3 safety / "
+            "Safety-Tuned LLaMAs / BeaverTails, followed by safety eval and "
+            "OpenCompass general-capability eval."
+        ),
+    )
+    safety_parser.add_argument(
+        "--baseline",
+        choices=list(SAFETY_SFT_BASELINES),
+        required=True,
+        help="Which safety SFT corpus to train on.",
+    )
+    safety_parser.add_argument("--model", choices=["0.8b"], default="0.8b")
+    safety_parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Re-materialize the safety training JSONL even when it exists.",
+    )
+    add_common_flags(safety_parser)
 
     random_parser = subparsers.add_parser(
         "random",
@@ -517,6 +559,98 @@ def _run_baseline_nosft(
     if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
         oc_work_dir = _run_opencompass_for_base_model(
             eval_config_path=eval_config,
+            opencompass_dir=opencompass_dir,
+            datasets=opencompass_datasets,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
+    _run_final_merge(
+        pan_summary_path=pan_output_root / "summary.json",
+        opencompass_work_dir=oc_work_dir,
+        output_path=pan_output_root / "final_summary.json",
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+
+def _run_safety_sft(
+    device: str,
+    *,
+    baseline_name: str,
+    model_size: str,
+    device_id: int,
+    num_devices: int,
+    dry_run: bool,
+    force_rebuild: bool,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+    enable_opencompass: bool,
+    opencompass_config: str = "",
+) -> None:
+    _validate_device_request(num_devices)
+    config_key = (device, model_size, baseline_name)
+    if config_key not in SAFETY_SFT_CONFIGS:
+        raise ValueError(
+            f"No safety SFT config registered for {config_key}. "
+            f"Known combinations: {sorted(SAFETY_SFT_CONFIGS.keys())}."
+        )
+    train_config = _make_runtime_override_config(
+        _resolve(SAFETY_SFT_CONFIGS[config_key]),
+        device=device,
+        device_id=device_id,
+    )
+    eval_config = _make_runtime_override_config(
+        _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)]),
+        device=device,
+        device_id=device_id,
+    )
+    cfg = load_sft_config(train_config)
+    env_overrides = _build_env_overrides(device, device_id)
+
+    prep_args = ["--config", str(train_config)]
+    if force_rebuild:
+        prep_args.append("--force-rebuild")
+    _run_script(
+        "19_prepare_safety_data.py",
+        prep_args,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    _run_script(
+        "13_train_pan_sft.py",
+        ["--config", str(train_config)],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    if dry_run:
+        checkpoint_path = Path(cfg.output.output_root) / "checkpoints" / f"epoch_{cfg.optim.epochs:03d}.pt"
+    else:
+        checkpoint_path = _latest_checkpoint_path(Path(cfg.output.output_root))
+    pan_output_root = Path(cfg.output.output_root) / "eval_suite"
+    _run_script(
+        "12_eval_baseline_suite.py",
+        [
+            "--config",
+            str(eval_config),
+            "--adapter-manifest",
+            str(Path(cfg.output.output_root) / "manifest.json"),
+            "--adapter-checkpoint",
+            str(checkpoint_path),
+            "--output-dir",
+            str(pan_output_root),
+            "--safety-eval-datasets",
+            *DEFAULT_SAFETY_EVAL_DATASETS,
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    oc_work_dir: Path | None = None
+    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
+        oc_work_dir = _run_opencompass_for_adapter(
+            eval_config=eval_config,
+            training_output_root=Path(cfg.output.output_root),
+            checkpoint_path=checkpoint_path,
             opencompass_dir=opencompass_dir,
             datasets=opencompass_datasets,
             dry_run=dry_run,
@@ -903,6 +1037,18 @@ def main() -> None:
             device_id=args.device_id,
             num_devices=args.num_devices,
             dry_run=args.dry_run,
+            **oc_kwargs,
+        )
+        return
+    if args.command == "safety-sft":
+        _run_safety_sft(
+            args.device,
+            baseline_name=args.baseline,
+            model_size=args.model,
+            device_id=args.device_id,
+            num_devices=args.num_devices,
+            dry_run=args.dry_run,
+            force_rebuild=bool(args.force_rebuild),
             **oc_kwargs,
         )
         return

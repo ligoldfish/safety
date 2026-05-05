@@ -6,3 +6,5 @@ __pycache__/
 *.pyo
 pan_results.json
 *.pdf
+.tmp/
+configs/*_launcher_*.yaml

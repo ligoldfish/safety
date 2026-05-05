@@ -13,7 +13,7 @@ VISIBLE_DEVICES=""
 EXPERIMENTS=()
 EFFECTIVE_DEVICE_ID="0"
 OPENCOMPASS_DIR="${OPENCOMPASS_DIR:-}"
-OPENCOMPASS_DATASETS="${OPENCOMPASS_DATASETS:-mmlu_gen gsm8k_gen humaneval_gen mbpp_gen}"
+OPENCOMPASS_DATASETS="${OPENCOMPASS_DATASETS:-mmlu_gen gsm8k_gen IFEval_gen humaneval_gen mbpp_gen}"
 SKIP_OPENCOMPASS="0"
 
 # Auto-pick the co-located OpenCompass clone under external/opencompass when present.
@@ -33,6 +33,9 @@ Experiments:
   nosft_9b
   sft_08b
   sft_9b
+  tulu3_safety
+  safety_tuned_llamas
+  beavertails
   distill
   random
   full
@@ -41,11 +44,11 @@ Experiments:
 
 OpenCompass:
   --opencompass-dir <path>         Path to a cloned OpenCompass repo. When set, general-capability
-                                   eval (MMLU/GSM8K/HumanEval/MBPP) runs automatically after each
+                                   eval (MMLU/GSM8K/IFEval/HumanEval/MBPP) runs automatically after each
                                    experiment's safety eval. Environment variable OPENCOMPASS_DIR
                                    also works.
   --opencompass-datasets "<list>"  Space-separated dataset config names forwarded to OpenCompass.
-                                   Default: "mmlu_gen gsm8k_gen humaneval_gen mbpp_gen".
+                                   Default: "mmlu_gen gsm8k_gen IFEval_gen humaneval_gen mbpp_gen".
   --skip-opencompass               Explicitly skip OpenCompass even if --opencompass-dir is set.
 EOF
 }
@@ -152,6 +155,9 @@ run_nosft_08b() { run_launcher nosft --model 0.8b; }
 run_nosft_9b() { run_launcher nosft --model 9b; }
 run_sft_08b()   { run_launcher sft --model 0.8b; }
 run_sft_9b()   { run_launcher sft --model 9b; }
+run_tulu3_safety() { run_launcher safety-sft --model 0.8b --baseline tulu3_safety; }
+run_safety_tuned_llamas() { run_launcher safety-sft --model 0.8b --baseline safety_tuned_llamas; }
+run_beavertails() { run_launcher safety-sft --model 0.8b --baseline beavertails; }
 run_distill()  { run_launcher distill; }
 run_random()   { run_launcher random; }
 run_full()     { run_launcher full; }
@@ -177,6 +183,9 @@ main() {
       nosft_9b) run_nosft_9b ;;
       sft_08b) run_sft_08b ;;
       sft_9b) run_sft_9b ;;
+      tulu3_safety) run_tulu3_safety ;;
+      safety_tuned_llamas) run_safety_tuned_llamas ;;
+      beavertails) run_beavertails ;;
       distill) run_distill ;;
       random) run_random ;;
       full) run_full ;;

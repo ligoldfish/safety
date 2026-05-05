@@ -71,10 +71,27 @@ class BaselineEvalConfig:
 
 
 @dataclass
+class SafetyDatasetConfig:
+    """Optional safety SFT dataset spec consumed at config-load time."""
+
+    name: str = ""
+    force_rebuild: bool = False
+    cache_dir: str = ""
+    source_name: str = ""
+    split: str = ""
+    sources: list[str] = field(default_factory=list)
+    repo_or_data_path: str = ""
+    file_name: str = ""
+    refusal_template: str = ""
+    system_prompt: str = ""
+
+
+@dataclass
 class SupervisedDataConfig:
     train_split: str
     val_split: str
     test_split: str = ""
+    safety_dataset: SafetyDatasetConfig = field(default_factory=SafetyDatasetConfig)
 
 
 @dataclass
@@ -214,13 +231,30 @@ def load_eval_config(path: str | Path) -> BaselineEvalConfig:
     )
 
 
+def _to_safety_dataset_config(raw: Dict[str, Any], base_dir: Path) -> SafetyDatasetConfig:
+    data = dict(raw)
+    if "repo_or_data_path" in data and data["repo_or_data_path"]:
+        data["repo_or_data_path"] = _resolve_path(str(data["repo_or_data_path"]), base_dir)
+    if "cache_dir" in data and data["cache_dir"]:
+        data["cache_dir"] = _resolve_path(str(data["cache_dir"]), base_dir)
+    if "sources" in data and data["sources"] is not None:
+        data["sources"] = [str(item) for item in data["sources"]]
+    return SafetyDatasetConfig(**data)
+
+
 def _to_supervised_data_config(raw: Dict[str, Any], base_dir: Path) -> SupervisedDataConfig:
+    safety_dataset_raw = dict(raw.pop("safety_dataset", {}) or {})
     data = _resolve_path_in_mapping(
         raw,
         base_dir,
         ["train_split", "val_split", "test_split"],
     )
-    return SupervisedDataConfig(**data)
+    return SupervisedDataConfig(
+        train_split=str(data.get("train_split", "")),
+        val_split=str(data.get("val_split", "")),
+        test_split=str(data.get("test_split", "")),
+        safety_dataset=_to_safety_dataset_config(safety_dataset_raw, base_dir),
+    )
 
 
 def load_sft_config(path: str | Path) -> BaselineSFTConfig:
