@@ -388,6 +388,19 @@ class OpenCompassConfigPresenceTests(unittest.TestCase):
         shell_text = (PROJECT_ROOT / "run_experiments.sh").read_text(encoding="utf-8")
         for name in ("tulu3_safety", "safety_tuned_llamas", "beavertails"):
             self.assertIn(name, shell_text)
+        for name in (
+            "distill_tulu3_safety",
+            "distill_safety_tuned_llamas",
+            "distill_beavertails",
+            "ours_tulu3_safety",
+            "ours_safety_tuned_llamas",
+            "ours_beavertails",
+            "safety_distill_all",
+            "safety_full_all",
+        ):
+            self.assertIn(name, shell_text)
+        self.assertIn("safety-distill", shell_text)
+        self.assertIn("safety-full", shell_text)
 
     def test_safety_eval_wired_into_baseline_suite(self) -> None:
         eval_text = (PROJECT_ROOT / "scripts" / "12_eval_baseline_suite.py").read_text(encoding="utf-8")
@@ -395,6 +408,9 @@ class OpenCompassConfigPresenceTests(unittest.TestCase):
         self.assertIn("--safety-eval-datasets", eval_text)
         oneclick_text = (PROJECT_ROOT / "scripts" / "15_run_oneclick.py").read_text(encoding="utf-8")
         self.assertIn("DEFAULT_SAFETY_EVAL_DATASETS", oneclick_text)
+        self.assertIn("DEFAULT_SAFETY_EVAL_DATASETS: tuple[str, ...] = ()", oneclick_text)
+        self.assertIn("if DEFAULT_SAFETY_EVAL_DATASETS:", oneclick_text)
+        self.assertIn('eval_args.extend(["--safety-eval-datasets", *safety_eval_datasets])', oneclick_text)
 
 
 if __name__ == "__main__":

@@ -37,9 +37,19 @@ Experiments:
   safety_tuned_llamas
   beavertails
   distill
+  distill_tulu3_safety
+  distill_safety_tuned_llamas
+  distill_beavertails
   random
   full
+  ours_tulu3_safety
+  ours_safety_tuned_llamas
+  ours_beavertails
   smoke
+  safety_sft_all
+  safety_distill_all
+  safety_full_all
+  safety_all
   all
 
 OpenCompass:
@@ -159,9 +169,39 @@ run_tulu3_safety() { run_launcher safety-sft --model 0.8b --baseline tulu3_safet
 run_safety_tuned_llamas() { run_launcher safety-sft --model 0.8b --baseline safety_tuned_llamas; }
 run_beavertails() { run_launcher safety-sft --model 0.8b --baseline beavertails; }
 run_distill()  { run_launcher distill; }
+run_distill_tulu3_safety() { run_launcher safety-distill --baseline tulu3_safety; }
+run_distill_safety_tuned_llamas() { run_launcher safety-distill --baseline safety_tuned_llamas; }
+run_distill_beavertails() { run_launcher safety-distill --baseline beavertails; }
 run_random()   { run_launcher random; }
 run_full()     { run_launcher full; }
+run_ours_tulu3_safety() { run_launcher safety-full --baseline tulu3_safety; }
+run_ours_safety_tuned_llamas() { run_launcher safety-full --baseline safety_tuned_llamas; }
+run_ours_beavertails() { run_launcher safety-full --baseline beavertails; }
 run_smoke()    { run_launcher smoke; }
+
+run_safety_sft_all() {
+  run_tulu3_safety
+  run_safety_tuned_llamas
+  run_beavertails
+}
+
+run_safety_distill_all() {
+  run_distill_tulu3_safety
+  run_distill_safety_tuned_llamas
+  run_distill_beavertails
+}
+
+run_safety_full_all() {
+  run_ours_tulu3_safety
+  run_ours_safety_tuned_llamas
+  run_ours_beavertails
+}
+
+run_safety_all() {
+  run_safety_sft_all
+  run_safety_distill_all
+  run_safety_full_all
+}
 
 run_all() {
   run_nosft_08b
@@ -187,9 +227,19 @@ main() {
       safety_tuned_llamas) run_safety_tuned_llamas ;;
       beavertails) run_beavertails ;;
       distill) run_distill ;;
+      distill_tulu3_safety|safety_distill_tulu3_safety) run_distill_tulu3_safety ;;
+      distill_safety_tuned_llamas|safety_distill_safety_tuned_llamas) run_distill_safety_tuned_llamas ;;
+      distill_beavertails|safety_distill_beavertails) run_distill_beavertails ;;
       random) run_random ;;
       full) run_full ;;
+      ours_tulu3_safety|safety_full_tulu3_safety) run_ours_tulu3_safety ;;
+      ours_safety_tuned_llamas|safety_full_safety_tuned_llamas) run_ours_safety_tuned_llamas ;;
+      ours_beavertails|safety_full_beavertails) run_ours_beavertails ;;
       smoke) run_smoke ;;
+      safety_sft_all) run_safety_sft_all ;;
+      safety_distill_all) run_safety_distill_all ;;
+      safety_full_all) run_safety_full_all ;;
+      safety_all) run_safety_all ;;
       all) run_all ;;
       *)
         echo "[ERROR] Unknown experiment: ${exp}"

@@ -44,12 +44,11 @@ BASELINE_DISTILL_CONFIGS = {
 # because the upstream Tülu/Safety-Tuned-LLaMAs/BeaverTails recipes were
 # specified for that scale.
 SAFETY_SFT_BASELINES = ("tulu3_safety", "safety_tuned_llamas", "beavertails")
-DEFAULT_SAFETY_EVAL_DATASETS = (
-    "wildguard_test",
-    "wildjailbreak_eval",
-    "coconot_contrast",
-    "beavertails_evaluation",
-)
+# Keep all one-click experiment summaries comparable while this experiment
+# matrix is still exploratory: safety-specific variants default to the same
+# PAN transfer test as the ordinary baselines. External safety suites remain
+# available via scripts/12_eval_baseline_suite.py --safety-eval-datasets.
+DEFAULT_SAFETY_EVAL_DATASETS: tuple[str, ...] = ()
 SAFETY_SFT_CONFIGS: dict[tuple[str, str, str], str] = {
     ("npu", "0.8b", "tulu3_safety"): "configs/baseline_sft_qwen35_08b_tulu3_safety_npu.yaml",
     ("tpu", "0.8b", "tulu3_safety"): "configs/baseline_sft_qwen35_08b_tulu3_safety_tpu.yaml",
@@ -845,6 +844,7 @@ def _run_safety_full(
         opencompass_datasets=opencompass_datasets,
         skip_opencompass=skip_opencompass,
         enable_opencompass=enable_opencompass,
+        safety_eval_datasets=DEFAULT_SAFETY_EVAL_DATASETS,
     )
 
 
@@ -902,18 +902,21 @@ def _run_safety_distill(
     else:
         checkpoint_path = _latest_checkpoint_path(Path(cfg.output.output_root))
     pan_output_root = Path(cfg.output.output_root) / "eval_suite"
+    eval_args = [
+        "--config",
+        str(eval_config),
+        "--adapter-manifest",
+        str(Path(cfg.output.output_root) / "manifest.json"),
+        "--adapter-checkpoint",
+        str(checkpoint_path),
+        "--output-dir",
+        str(pan_output_root),
+    ]
+    if DEFAULT_SAFETY_EVAL_DATASETS:
+        eval_args.extend(["--safety-eval-datasets", *DEFAULT_SAFETY_EVAL_DATASETS])
     _run_script(
         "12_eval_baseline_suite.py",
-        [
-            "--config",
-            str(eval_config),
-            "--adapter-manifest",
-            str(Path(cfg.output.output_root) / "manifest.json"),
-            "--adapter-checkpoint",
-            str(checkpoint_path),
-            "--output-dir",
-            str(pan_output_root),
-        ],
+        eval_args,
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
@@ -992,20 +995,21 @@ def _run_safety_sft(
     else:
         checkpoint_path = _latest_checkpoint_path(Path(cfg.output.output_root))
     pan_output_root = Path(cfg.output.output_root) / "eval_suite"
+    eval_args = [
+        "--config",
+        str(eval_config),
+        "--adapter-manifest",
+        str(Path(cfg.output.output_root) / "manifest.json"),
+        "--adapter-checkpoint",
+        str(checkpoint_path),
+        "--output-dir",
+        str(pan_output_root),
+    ]
+    if DEFAULT_SAFETY_EVAL_DATASETS:
+        eval_args.extend(["--safety-eval-datasets", *DEFAULT_SAFETY_EVAL_DATASETS])
     _run_script(
         "12_eval_baseline_suite.py",
-        [
-            "--config",
-            str(eval_config),
-            "--adapter-manifest",
-            str(Path(cfg.output.output_root) / "manifest.json"),
-            "--adapter-checkpoint",
-            str(checkpoint_path),
-            "--output-dir",
-            str(pan_output_root),
-            "--safety-eval-datasets",
-            *DEFAULT_SAFETY_EVAL_DATASETS,
-        ],
+        eval_args,
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
@@ -1186,6 +1190,7 @@ def _run_adapter_eval(
     opencompass_datasets: Sequence[str] = (),
     skip_opencompass: bool = True,
     enable_opencompass: bool = False,
+    safety_eval_datasets: Sequence[str] = (),
 ) -> None:
     eval_config = _make_runtime_override_config(
         _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)]),
@@ -1197,18 +1202,21 @@ def _run_adapter_eval(
     else:
         checkpoint_path = _latest_checkpoint_path(training_output_root)
     pan_output_root = training_output_root / "eval_suite"
+    eval_args = [
+        "--config",
+        str(eval_config),
+        "--adapter-manifest",
+        str(training_output_root / "manifest.json"),
+        "--adapter-checkpoint",
+        str(checkpoint_path),
+        "--output-dir",
+        str(pan_output_root),
+    ]
+    if safety_eval_datasets:
+        eval_args.extend(["--safety-eval-datasets", *safety_eval_datasets])
     _run_script(
         "12_eval_baseline_suite.py",
-        [
-            "--config",
-            str(eval_config),
-            "--adapter-manifest",
-            str(training_output_root / "manifest.json"),
-            "--adapter-checkpoint",
-            str(checkpoint_path),
-            "--output-dir",
-            str(pan_output_root),
-        ],
+        eval_args,
         dry_run=dry_run,
         env_overrides=env_overrides,
     )

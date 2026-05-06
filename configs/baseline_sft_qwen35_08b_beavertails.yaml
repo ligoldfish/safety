@@ -33,11 +33,11 @@ lora:
 
 optim:
   epochs: 1
-  batch_size: 8
+  batch_size: 32
   micro_batch_size: 1
-  learning_rate: 0.00005
+  learning_rate: 0.00002
   weight_decay: 0.0
-  max_length: 1024
+  max_length: 1536
   max_new_tokens: 256
   log_every_steps: 10
 
