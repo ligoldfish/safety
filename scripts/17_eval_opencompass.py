@@ -71,14 +71,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-out-len",
         type=int,
-        default=512,
+        default=1024,
         help=(
             "Model-level fallback generation budget forwarded to OpenCompass. "
             "OpenCompass only applies this to datasets whose inferencer does not "
             "set max_out_len. The vendored mmlu_gen CoT config has no dataset-level "
-            "max_out_len, so the default 512 avoids truncating before the required "
-            "'ANSWER: X' line. GSM8K/HumanEval/MBPP/IFEval keep their explicit "
-            "dataset-level max_out_len values."
+            "max_out_len, so the default 1024 covers long-CoT MMLU subjects "
+            "(professional_law / college_mathematics / formal_logic) without "
+            "truncating before the required 'ANSWER: X' line. "
+            "GSM8K/HumanEval/MBPP/IFEval keep their explicit dataset-level "
+            "max_out_len values."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=1)

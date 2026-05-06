@@ -376,7 +376,7 @@ class OpenCompassConfigPresenceTests(unittest.TestCase):
         text = spec_path.read_text(encoding="utf-8")
         self.assertIn('"IFEval_gen"', text)
         self.assertIn("default=[]", text)
-        self.assertIn("default=512", text)
+        self.assertIn("default=1024", text)
 
     def test_oneclick_and_shell_defaults_include_ifeval(self) -> None:
         oneclick_text = (PROJECT_ROOT / "scripts" / "15_run_oneclick.py").read_text(encoding="utf-8")

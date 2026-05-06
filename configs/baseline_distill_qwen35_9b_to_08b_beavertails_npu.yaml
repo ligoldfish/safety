@@ -1,0 +1,62 @@
+seed: 42
+
+teacher:
+  name: Qwen3.5-9B
+  path: ../models/Qwen3.5-9B
+  chat_template_enable_thinking: false
+  device_map: ""
+  torch_dtype: float32
+  runtime_backend: npu
+  runtime_device: npu:0
+  trust_remote_code: true
+  local_files_only: true
+  attn_implementation: ""
+
+student:
+  name: Qwen3.5-0.8B
+  path: ../models/Qwen3.5-0.8B
+  chat_template_enable_thinking: false
+  device_map: ""
+  torch_dtype: float32
+  runtime_backend: npu
+  runtime_device: npu:0
+  trust_remote_code: true
+  local_files_only: true
+  attn_implementation: ""
+
+data:
+  train_split: ../data/processed/safety/beavertails_30k_train.jsonl
+  val_split: ../data/processed/analysis_val_set.jsonl
+  test_split: ../data/processed/pan_test_set.jsonl
+  safety_dataset:
+    name: beavertails
+    source_name: PKU-Alignment/BeaverTails
+    split: 30k_train
+    refusal_template: "I can't help with requests that could cause harm or enable unsafe behavior. If your goal is legitimate or safety-related, I can help with a safer alternative, prevention guidance, or high-level information."
+    force_rebuild: false
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  target_modules:
+    - self_attn.v_proj
+    - self_attn.o_proj
+
+optim:
+  epochs: 1
+  batch_size: 32
+  micro_batch_size: 1
+  learning_rate: 0.00002
+  weight_decay: 0.0
+  max_length: 1536
+  max_new_tokens: 512
+  log_every_steps: 10
+
+distill:
+  temperature: 2.0
+  hard_loss_weight: 0.5
+  soft_loss_weight: 0.5
+
+output:
+  output_root: ../outputs/baselines/distill_qwen35_9b_to_08b_beavertails_npu

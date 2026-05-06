@@ -29,7 +29,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.baselines.config import load_sft_config
+from src.baselines.config import (
+    BaselineDistillConfig,
+    BaselineSFTConfig,
+    SupervisedDataConfig,
+    load_distill_config,
+    load_sft_config,
+)
 from src.data.safety_datasets import (
     SafetyDatasetSpec,
     materialize_safety_train_dataset,
@@ -38,13 +44,16 @@ from src.data.safety_datasets import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Materialize a safety SFT JSONL training file from upstream corpora."
+        description=(
+            "Materialize a safety SFT/distill JSONL training file from upstream "
+            "corpora. Auto-detects whether the config is an SFT or distill recipe."
+        )
     )
     parser.add_argument(
         "--config",
         required=True,
-        help="Path to a baseline SFT YAML whose data.safety_dataset block "
-        "names the dataset to build.",
+        help="Path to a baseline SFT or distill YAML whose data.safety_dataset "
+        "block names the dataset to build.",
     )
     parser.add_argument(
         "--force-rebuild",
@@ -54,17 +63,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _build_spec(config_path: Path, force_rebuild: bool) -> SafetyDatasetSpec:
-    cfg = load_sft_config(config_path)
-    safety_cfg = cfg.data.safety_dataset
+def _load_data_block(config_path: Path) -> tuple[SupervisedDataConfig, str]:
+    """Try SFT first; fall back to distill. Both share SupervisedDataConfig."""
+
+    last_exc: Exception | None = None
+    for loader, kind in ((load_sft_config, "sft"), (load_distill_config, "distill")):
+        try:
+            cfg = loader(config_path)
+        except Exception as exc:  # config schema mismatch — try the next loader
+            last_exc = exc
+            continue
+        if isinstance(cfg, (BaselineSFTConfig, BaselineDistillConfig)):
+            return cfg.data, kind
+    raise ValueError(
+        f"Could not load {config_path} as either SFT or distill config. "
+        f"Last loader error: {last_exc!r}"
+    )
+
+
+def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSpec, str]:
+    data, kind = _load_data_block(config_path)
+    safety_cfg = data.safety_dataset
     if not safety_cfg.name:
         raise ValueError(
             f"{config_path} does not declare data.safety_dataset.name; "
             "cannot determine which safety dataset to build."
         )
-    return SafetyDatasetSpec(
+    spec = SafetyDatasetSpec(
         name=safety_cfg.name,
-        output_path=cfg.data.train_split,
+        output_path=data.train_split,
         force_rebuild=force_rebuild or safety_cfg.force_rebuild,
         cache_dir=safety_cfg.cache_dir or None,
         source_name=safety_cfg.source_name or None,
@@ -75,15 +102,17 @@ def _build_spec(config_path: Path, force_rebuild: bool) -> SafetyDatasetSpec:
         refusal_template=safety_cfg.refusal_template or None,
         system_prompt=safety_cfg.system_prompt or None,
     )
+    return spec, kind
 
 
 def main() -> None:
     args = parse_args()
     config_path = Path(args.config).resolve()
-    spec = _build_spec(config_path, args.force_rebuild)
+    spec, kind = _build_spec(config_path, args.force_rebuild)
     output_path = materialize_safety_train_dataset(spec)
     summary = {
         "config_path": str(config_path),
+        "config_kind": kind,
         "dataset_name": spec.name,
         "output_path": str(output_path),
         "force_rebuild": spec.force_rebuild,
