@@ -1,17 +1,15 @@
 seed: 42
-
 model:
   name: Qwen3.5-0.8B
   path: ../models/Qwen3.5-0.8B
   chat_template_enable_thinking: false
-  device_map: ""
+  device_map: ''
   torch_dtype: bfloat16
   runtime_backend: tpu
   runtime_device: xla:0
   trust_remote_code: true
   local_files_only: true
-  attn_implementation: ""
-
+  attn_implementation: ''
 data:
   train_split: ../data/processed/safety/tulu3_safety_train.jsonl
   val_split: ../data/processed/analysis_val_set.jsonl
@@ -21,28 +19,29 @@ data:
     source_name: allenai/tulu-3-sft-mixture
     split: train
     sources:
-      - ai2-adapt-dev/tulu_v3.9_wildguardmix
-      - ai2-adapt-dev/tulu_v3.9_wildjailbreak
-      - ai2-adapt-dev/coconot_converted
+    - ai2-adapt-dev/tulu_v3.9_wildguardmix
+    - ai2-adapt-dev/tulu_v3.9_wildjailbreak
+    - ai2-adapt-dev/coconot_converted
     force_rebuild: false
-
 lora:
   rank: 8
   alpha: 8.0
   dropout: 0.05
   target_modules:
-    - self_attn.v_proj
-    - self_attn.o_proj
-
+  - self_attn.v_proj
+  - self_attn.o_proj
 optim:
   epochs: 1
   batch_size: 128
   micro_batch_size: 1
-  learning_rate: 0.000005
+  learning_rate: 0.0001
   weight_decay: 0.0
   max_length: 2048
   max_new_tokens: 256
   log_every_steps: 10
-
+  gradient_checkpointing: true
+  save_optimizer_state: false
 output:
   output_root: ../outputs/baselines/sft_qwen35_08b_tulu3_safety_tpu
+training:
+  mode: full_finetune

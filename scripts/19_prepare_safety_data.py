@@ -101,6 +101,9 @@ def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSp
         file_name=safety_cfg.file_name or None,
         refusal_template=safety_cfg.refusal_template or None,
         system_prompt=safety_cfg.system_prompt or None,
+        include_harmless_contrast=bool(safety_cfg.include_harmless_contrast),
+        harmless_file_name=safety_cfg.harmless_file_name or "alpaca_small.json",
+        dedup_prompts=bool(safety_cfg.dedup_prompts),
     )
     return spec, kind
 

@@ -84,6 +84,11 @@ class SafetyDatasetConfig:
     file_name: str = ""
     refusal_template: str = ""
     system_prompt: str = ""
+    # STL: pull alpaca_small.json as harmless contrast.
+    include_harmless_contrast: bool = False
+    harmless_file_name: str = "alpaca_small.json"
+    # BeaverTails: drop duplicate prompts (multi-response per prompt).
+    dedup_prompts: bool = True
 
 
 @dataclass
@@ -117,6 +122,22 @@ class BaselineOptimConfig:
     max_length: int = 1024
     max_new_tokens: int = 256
     log_every_steps: int = 1
+    gradient_checkpointing: bool = False
+    save_optimizer_state: bool = True
+
+
+@dataclass
+class BaselineTrainingModeConfig:
+    """Selects between LoRA adapter training and full fine-tuning.
+
+    ``mode == "lora"`` keeps the historical behaviour: inject LoRA modules,
+    freeze everything else, save only LoRA delta. ``mode == "full_finetune"``
+    drops LoRA, leaves all parameters trainable, and saves the full model
+    state dict. ``ours`` (SemAlign script 09) is unaffected -- it has no
+    BaselineTrainingModeConfig and continues to use LoRA unconditionally.
+    """
+
+    mode: str = "lora"
 
 
 @dataclass
@@ -132,6 +153,7 @@ class BaselineSFTConfig:
     lora: BaselineLoRAConfig
     optim: BaselineOptimConfig
     output: BaselineOutputConfig
+    training: BaselineTrainingModeConfig = field(default_factory=BaselineTrainingModeConfig)
 
 
 @dataclass
@@ -151,6 +173,7 @@ class BaselineDistillConfig:
     optim: BaselineOptimConfig
     distill: DistillLossConfig
     output: BaselineOutputConfig
+    training: BaselineTrainingModeConfig = field(default_factory=BaselineTrainingModeConfig)
 
 
 def _read_yaml(path: str | Path) -> Dict[str, Any]:
@@ -267,6 +290,7 @@ def load_sft_config(path: str | Path) -> BaselineSFTConfig:
         lora=BaselineLoRAConfig(**dict(raw.get("lora", {}))),
         optim=BaselineOptimConfig(**dict(raw.get("optim", {}))),
         output=_to_output_config(dict(raw["output"]), base_dir),
+        training=BaselineTrainingModeConfig(**dict(raw.get("training", {}))),
     )
 
 
@@ -282,4 +306,5 @@ def load_distill_config(path: str | Path) -> BaselineDistillConfig:
         optim=BaselineOptimConfig(**dict(raw.get("optim", {}))),
         distill=DistillLossConfig(**dict(raw.get("distill", {}))),
         output=_to_output_config(dict(raw["output"]), base_dir),
+        training=BaselineTrainingModeConfig(**dict(raw.get("training", {}))),
     )

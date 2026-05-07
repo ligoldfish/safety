@@ -1,0 +1,352 @@
+"""Build per-baseline harmful/harmless test JSONLs.
+
+Each safety baseline trains on its own corpus, so its evaluation set must
+also live inside the same dataset family to avoid cross-corpus leakage.
+This script materializes one ``data/processed/eval/<baseline>_test.jsonl``
+per baseline, in the same schema as PAN's ``pan_test_set.jsonl``:
+
+    {"id": str, "label": "harmful" | "harmless",
+     "messages": [{"role": "system"/"user", "content": str}, ...]}
+
+So that ``scripts/12_eval_baseline_suite.py`` can consume the JSONL via
+``cfg.datasets.pan.path`` without any further code changes.
+
+Per-baseline mappings:
+
+* ``pan``                  -> existing ``pan_test_set.jsonl`` (no-op).
+* ``beavertails``          -> 30k_train held-out (~10%) excluding the
+                              ids written into the training JSONL.
+                              ``is_safe=True -> harmless``,
+                              ``is_safe=False -> harmful``. Prompts are
+                              de-duplicated.
+* ``tulu3_safety``         -> WildGuardTest (``prompt_harm_label``)
+                              + WildJailbreak eval (``data_type``).
+                              Native binary on both. CoCoNot contrast is
+                              passed via launcher ``--safety-eval-datasets``.
+* ``safety_tuned_llamas``  -> STL held-out (~10%) labelled harmful, plus
+                              alpaca_small held-out (~10%) labelled
+                              harmless. Both come from the same upstream
+                              ``vinid/safety-tuned-llamas`` clone.
+
+Usage:
+    python scripts/21_build_baseline_eval_jsonls.py --baseline all
+    python scripts/21_build_baseline_eval_jsonls.py --baseline tulu3_safety --force-rebuild
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data.safety_datasets import (
+    DEFAULT_TULU3_SAFETY_SOURCES,
+    build_beavertails_records,
+    build_safety_tuned_llamas_records,
+)
+from src.data.safety_eval_datasets import (
+    SafetyEvalExample,
+    load_wildguard_test,
+    load_wildjailbreak_eval,
+)
+from src.data.template_qwen import DEFAULT_SYSTEM_PROMPT, build_qwen_messages
+from src.utils.io import ensure_dir, read_jsonl, write_jsonl
+
+
+SUPPORTED_BASELINES = ("pan", "beavertails", "tulu3_safety", "safety_tuned_llamas")
+EVAL_DIR = PROJECT_ROOT / "data" / "processed" / "eval"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build per-baseline harmful/harmless test JSONLs."
+    )
+    parser.add_argument(
+        "--baseline",
+        choices=("all", *SUPPORTED_BASELINES),
+        default="all",
+    )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Re-materialize the test JSONLs even when they already exist.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Shuffle seed for held-out splits (BeaverTails / STL).",
+    )
+    parser.add_argument(
+        "--holdout-fraction",
+        type=float,
+        default=0.1,
+        help="Fraction of records to hold out as test for in-domain baselines.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default="",
+        help="Optional HF datasets cache dir.",
+    )
+    parser.add_argument(
+        "--stl-repo-path",
+        default=str(PROJECT_ROOT / "external" / "safety-tuned-llamas"),
+        help="Path to the cloned vinid/safety-tuned-llamas repo (or a directory "
+        "containing safety_only_data_Instructions.json + alpaca_small.json).",
+    )
+    return parser.parse_args()
+
+
+def _eval_jsonl_path(baseline: str) -> Path:
+    return EVAL_DIR / f"{baseline}_test.jsonl"
+
+
+def _stamp_pan() -> Path:
+    """PAN test set is the canonical reference; no-op build."""
+
+    src = PROJECT_ROOT / "data" / "processed" / "pan_test_set.jsonl"
+    if not src.exists():
+        raise FileNotFoundError(
+            f"PAN test set missing at {src}; run scripts/00_prepare_data.py first."
+        )
+    out = _eval_jsonl_path("pan")
+    if out.resolve() == src.resolve():
+        return src
+    ensure_dir(out.parent)
+    shutil.copyfile(src, out)
+    return out
+
+
+def _build_beavertails_test(
+    *,
+    seed: int,
+    holdout_fraction: float,
+    cache_dir: Optional[str],
+) -> Path:
+    out = _eval_jsonl_path("beavertails")
+    train_jsonl = PROJECT_ROOT / "data" / "processed" / "safety" / "beavertails_30k_train.jsonl"
+    train_ids: set[str] = set()
+    if train_jsonl.exists():
+        train_ids = {row.get("id", "") for row in read_jsonl(train_jsonl)}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_jsonl = Path(tmpdir) / "bt_full.jsonl"
+        all_records = build_beavertails_records(
+            output_path=tmp_jsonl,
+            split="30k_train",
+            cache_dir=cache_dir,
+            dedup_prompts=True,
+        )
+
+    held_out = [r for r in all_records if r["id"] not in train_ids]
+    if not held_out:
+        # Fallback: training jsonl unavailable -- use full deduped set, but
+        # still hold out a fraction so the eval set is distinct.
+        held_out = list(all_records)
+    rng = random.Random(seed)
+    rng.shuffle(held_out)
+    n = max(1, int(round(len(held_out) * holdout_fraction)))
+    sliced = held_out[:n]
+
+    eval_records: List[Dict[str, Any]] = []
+    for r in sliced:
+        is_safe = bool(r.get("is_safe", False))
+        eval_records.append(
+            {
+                "id": f"bt_test_{r['id']}",
+                "label": "harmless" if is_safe else "harmful",
+                "messages": list(r["messages"]),
+                "source": r.get("source"),
+                "is_safe": is_safe,
+            }
+        )
+    write_jsonl(out, eval_records)
+    return out
+
+
+def _classify_wildguard_label(value: str) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return "harmful"
+    if text in {"unharmful", "benign", "harmless", "safe"}:
+        return "harmless"
+    if "benign" in text or "harmless" in text or "unharm" in text:
+        return "harmless"
+    return "harmful"
+
+
+def _classify_wildjailbreak_label(value: str) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return "harmful"
+    # benign and adversarial_benign both signal that the prompt itself is
+    # benign (the adversarial framing is style, not content).
+    if "benign" in text:
+        return "harmless"
+    return "harmful"
+
+
+def _examples_to_records(
+    examples: List[SafetyEvalExample],
+    *,
+    id_prefix: str,
+    classifier,
+) -> List[Dict[str, Any]]:
+    seen_prompts: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for ex in examples:
+        prompt = (ex.prompt or "").strip()
+        if not prompt or prompt in seen_prompts:
+            continue
+        seen_prompts.add(prompt)
+        label = classifier(ex.label)
+        out.append(
+            {
+                "id": f"{id_prefix}_{ex.sample_id}",
+                "label": label,
+                "messages": build_qwen_messages(prompt, system_prompt=DEFAULT_SYSTEM_PROMPT),
+                "source": ex.source,
+                "category": ex.category,
+                "raw_label": ex.label,
+            }
+        )
+    return out
+
+
+def _build_tulu3_test(*, cache_dir: Optional[str]) -> Path:
+    out = _eval_jsonl_path("tulu3_safety")
+    wgt_examples = load_wildguard_test(cache_dir=cache_dir)
+    wjb_examples = load_wildjailbreak_eval(cache_dir=cache_dir)
+    records = _examples_to_records(
+        wgt_examples,
+        id_prefix="wgt",
+        classifier=_classify_wildguard_label,
+    )
+    records.extend(
+        _examples_to_records(
+            wjb_examples,
+            id_prefix="wjb",
+            classifier=_classify_wildjailbreak_label,
+        )
+    )
+    if not records:
+        raise RuntimeError(
+            "tulu3_safety eval jsonl is empty -- check that WildGuardTest "
+            "and WildJailbreak eval are accessible."
+        )
+    write_jsonl(out, records)
+    return out
+
+
+def _build_safety_tuned_llamas_test(
+    *,
+    repo_path: Path,
+    seed: int,
+    holdout_fraction: float,
+) -> Path:
+    out = _eval_jsonl_path("safety_tuned_llamas")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_jsonl = Path(tmpdir) / "stl_full.jsonl"
+        records = build_safety_tuned_llamas_records(
+            output_path=tmp_jsonl,
+            repo_or_data_path=repo_path,
+            include_harmless_contrast=True,
+        )
+
+    harmful = [r for r in records if r.get("dataset") == "safety_tuned_llamas"]
+    harmless = [r for r in records if r.get("dataset") == "safety_tuned_llamas_harmless"]
+    if not harmful:
+        raise RuntimeError("STL harmful records missing -- builder produced zero.")
+    if not harmless:
+        raise RuntimeError(
+            "STL harmless contrast missing -- ensure alpaca_small.json is in "
+            f"{repo_path}/ or {repo_path}/data/."
+        )
+
+    rng_h = random.Random(seed)
+    rng_h.shuffle(harmful)
+    rng_b = random.Random(seed + 1)
+    rng_b.shuffle(harmless)
+    n_harmful = max(1, int(round(len(harmful) * holdout_fraction)))
+    n_harmless = max(1, int(round(len(harmless) * holdout_fraction)))
+
+    eval_records: List[Dict[str, Any]] = []
+    for r in harmful[:n_harmful]:
+        eval_records.append(
+            {
+                "id": f"stl_test_{r['id']}",
+                "label": "harmful",
+                "messages": list(r["messages"]),
+                "source": r.get("source"),
+            }
+        )
+    for r in harmless[:n_harmless]:
+        eval_records.append(
+            {
+                "id": f"stl_test_{r['id']}",
+                "label": "harmless",
+                "messages": list(r["messages"]),
+                "source": r.get("source"),
+            }
+        )
+    write_jsonl(out, eval_records)
+    return out
+
+
+def main() -> None:
+    args = parse_args()
+    targets = list(SUPPORTED_BASELINES) if args.baseline == "all" else [args.baseline]
+    EVAL_DIR.mkdir(parents=True, exist_ok=True)
+    summary: Dict[str, Any] = {"force_rebuild": args.force_rebuild, "outputs": {}}
+    cache_dir = args.cache_dir or None
+
+    for baseline in targets:
+        out_path = _eval_jsonl_path(baseline)
+        if out_path.exists() and not args.force_rebuild:
+            summary["outputs"][baseline] = {
+                "path": str(out_path.resolve()),
+                "status": "skipped (exists; pass --force-rebuild to overwrite)",
+            }
+            continue
+        if baseline == "pan":
+            written = _stamp_pan()
+        elif baseline == "beavertails":
+            written = _build_beavertails_test(
+                seed=int(args.seed),
+                holdout_fraction=float(args.holdout_fraction),
+                cache_dir=cache_dir,
+            )
+        elif baseline == "tulu3_safety":
+            written = _build_tulu3_test(cache_dir=cache_dir)
+        elif baseline == "safety_tuned_llamas":
+            written = _build_safety_tuned_llamas_test(
+                repo_path=Path(args.stl_repo_path).expanduser().resolve(),
+                seed=int(args.seed),
+                holdout_fraction=float(args.holdout_fraction),
+            )
+        else:  # pragma: no cover -- guarded by argparse choices
+            raise ValueError(f"Unknown baseline: {baseline}")
+
+        rows = read_jsonl(written)
+        labels = [str(row.get("label", "")) for row in rows]
+        summary["outputs"][baseline] = {
+            "path": str(written.resolve()),
+            "n_records": len(rows),
+            "n_harmful": sum(1 for label in labels if label == "harmful"),
+            "n_harmless": sum(1 for label in labels if label == "harmless"),
+        }
+
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

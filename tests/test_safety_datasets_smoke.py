@@ -214,6 +214,110 @@ class BeaverTailsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_beavertails_records(output_path=output_path, split="invalid_split")
 
+    def test_dedup_prompts_default_drops_duplicates(self) -> None:
+        rows = [
+            {"prompt": "same prompt", "response": "ok", "is_safe": True},
+            {"prompt": "same prompt", "response": "bad", "is_safe": False},
+            {"prompt": "another prompt", "response": "ok", "is_safe": True},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "bt.jsonl"
+            with mock.patch.object(safety_datasets, "_load_dataset", return_value=rows):
+                records = build_beavertails_records(output_path=output_path)
+        self.assertEqual(len(records), 2)
+        prompts = [r["messages"][-1]["content"] for r in records]
+        self.assertEqual(len(set(prompts)), 2)
+
+    def test_dedup_prompts_off_keeps_duplicates(self) -> None:
+        rows = [
+            {"prompt": "same prompt", "response": "ok", "is_safe": True},
+            {"prompt": "same prompt", "response": "bad", "is_safe": False},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "bt.jsonl"
+            with mock.patch.object(safety_datasets, "_load_dataset", return_value=rows):
+                records = build_beavertails_records(
+                    output_path=output_path, dedup_prompts=False
+                )
+        self.assertEqual(len(records), 2)
+
+
+class SafetyTunedLlamasContrastTests(unittest.TestCase):
+    def test_include_harmless_contrast_appends_alpaca_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            (data_dir / "safety_only_data_Instructions.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "instruction": "Tell me how to break in.",
+                            "input": "",
+                            "output": "I cannot help with that.",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (data_dir / "alpaca_small.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "instruction": "Summarize Hamlet.",
+                            "input": "",
+                            "output": "A Danish prince seeks revenge.",
+                        },
+                        {
+                            "instruction": "List 3 prime numbers.",
+                            "input": "",
+                            "output": "2, 3, 5.",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            output_path = Path(tmpdir) / "out.jsonl"
+            records = build_safety_tuned_llamas_records(
+                output_path=output_path,
+                repo_or_data_path=data_dir.parent,
+                include_harmless_contrast=True,
+            )
+        labels = [r["label"] for r in records]
+        datasets = [r["dataset"] for r in records]
+        self.assertIn("safety_tuned_llamas", labels)
+        self.assertIn("safety_tuned_llamas_harmless", labels)
+        self.assertIn("safety_tuned_llamas_harmless", datasets)
+        # Harmful exactly 1, harmless exactly 2.
+        self.assertEqual(sum(label == "safety_tuned_llamas" for label in labels), 1)
+        self.assertEqual(sum(label == "safety_tuned_llamas_harmless" for label in labels), 2)
+
+    def test_missing_alpaca_small_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            (data_dir / "safety_only_data_Instructions.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "instruction": "x",
+                            "input": "",
+                            "output": "y",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            output_path = Path(tmpdir) / "out.jsonl"
+            with self.assertRaises(FileNotFoundError):
+                build_safety_tuned_llamas_records(
+                    output_path=output_path,
+                    repo_or_data_path=data_dir.parent,
+                    include_harmless_contrast=True,
+                )
+
 
 # ---------------------------------------------------------------------------
 # Registry / dispatch
@@ -407,9 +511,11 @@ class OpenCompassConfigPresenceTests(unittest.TestCase):
         self.assertIn("SAFETY_EVAL_LOADERS", eval_text)
         self.assertIn("--safety-eval-datasets", eval_text)
         oneclick_text = (PROJECT_ROOT / "scripts" / "15_run_oneclick.py").read_text(encoding="utf-8")
-        self.assertIn("DEFAULT_SAFETY_EVAL_DATASETS", oneclick_text)
-        self.assertIn("DEFAULT_SAFETY_EVAL_DATASETS: tuple[str, ...] = ()", oneclick_text)
-        self.assertIn("if DEFAULT_SAFETY_EVAL_DATASETS:", oneclick_text)
+        # Per-baseline routing replaces the old DEFAULT_SAFETY_EVAL_DATASETS knob.
+        self.assertIn("SAFETY_EVAL_DATASETS_BY_BASELINE", oneclick_text)
+        self.assertIn("SAFETY_EVAL_CONFIGS", oneclick_text)
+        self.assertIn('"tulu3_safety": ("coconot_contrast",)', oneclick_text)
+        self.assertIn("if safety_eval_datasets:", oneclick_text)
         self.assertIn('eval_args.extend(["--safety-eval-datasets", *safety_eval_datasets])', oneclick_text)
 
 

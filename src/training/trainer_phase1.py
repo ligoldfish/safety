@@ -486,24 +486,52 @@ def save_checkpoint(
     epoch: int,
     step: int,
     extra: Dict[str, Any],
+    save_mode: str = "trainable",
+    save_optimizer: bool = True,
 ) -> None:
+    """Persist a training checkpoint.
+
+    ``save_mode='trainable'`` (default) writes ``trainable_state_dict`` --
+    the historical LoRA-delta-only payload. ``save_mode='full'`` writes
+    the complete ``model_state_dict`` for full fine-tuning runs. The
+    eval / merge dispatch in ``src/baselines/eval.py`` and
+    ``scripts/16_merge_lora_for_opencompass.py`` discriminates on the
+    manifest's ``mode`` field, not on the payload key, so both layouts
+    interoperate.
+
+    ``save_optimizer=False`` drops the AdamW state, which can otherwise
+    inflate full-fine-tune checkpoints by ~6 GB on a 0.8B model.
+    """
+
     target = Path(checkpoint_path)
     ensure_dir(target.parent)
-    trainable_state = {
-        name: parameter.detach().cpu()
-        for name, parameter in model.named_parameters()
-        if parameter.requires_grad
+    if save_mode == "full":
+        state = {
+            name: parameter.detach().cpu()
+            for name, parameter in model.state_dict().items()
+        }
+        payload_key = "model_state_dict"
+    elif save_mode == "trainable":
+        state = {
+            name: parameter.detach().cpu()
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        payload_key = "trainable_state_dict"
+    else:
+        raise ValueError(
+            f"Unsupported save_mode={save_mode!r}; expected 'trainable' or 'full'."
+        )
+    payload: Dict[str, Any] = {
+        "epoch": epoch,
+        "step": step,
+        payload_key: state,
+        "save_mode": save_mode,
+        "extra": extra,
     }
-    torch.save(
-        {
-            "epoch": epoch,
-            "step": step,
-            "trainable_state_dict": trainable_state,
-            "optimizer_state_dict": optimizer.state_dict(),
-            "extra": extra,
-        },
-        target,
-    )
+    if save_optimizer:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
+    torch.save(payload, target)
 
 
 def load_records(path: str | Path) -> List[Dict[str, Any]]:

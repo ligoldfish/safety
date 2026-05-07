@@ -67,20 +67,46 @@ def load_model_for_evaluation(
         raise FileNotFoundError(f"Adapter checkpoint not found: {checkpoint_path}")
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    inject_lora_modules_by_names(
-        model,
-        module_names=manifest["lora_modules"],
-        rank=int(manifest["lora_rank"]),
-        alpha=float(manifest["lora_alpha"]),
-        dropout=float(manifest["lora_dropout"]),
+    manifest_mode = str(manifest.get("mode", "")).strip().lower()
+    training_mode = str(manifest.get("training_mode", "")).strip().lower()
+    is_full_finetune = (
+        training_mode == "full_finetune"
+        or manifest_mode in {"sft_full_finetune", "distill_full_finetune"}
     )
     checkpoint_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    load_result = model.load_state_dict(checkpoint_payload["trainable_state_dict"], strict=False)
-    if load_result.unexpected_keys:
-        raise ValueError(f"Unexpected adapter checkpoint keys: {load_result.unexpected_keys}")
-    missing_lora = [key for key in load_result.missing_keys if ".lora_" in key]
-    if missing_lora:
-        raise ValueError(f"Missing LoRA weights while loading adapter: {missing_lora}")
+
+    if is_full_finetune:
+        if "model_state_dict" not in checkpoint_payload:
+            raise ValueError(
+                f"Manifest mode={manifest_mode!r} indicates full fine-tune but "
+                f"checkpoint payload is missing 'model_state_dict'. Found keys: "
+                f"{sorted(checkpoint_payload.keys())}"
+            )
+        load_result = model.load_state_dict(checkpoint_payload["model_state_dict"], strict=True)
+        if load_result.unexpected_keys:
+            raise ValueError(
+                f"Unexpected full-finetune checkpoint keys: {load_result.unexpected_keys}"
+            )
+    else:
+        inject_lora_modules_by_names(
+            model,
+            module_names=manifest["lora_modules"],
+            rank=int(manifest["lora_rank"]),
+            alpha=float(manifest["lora_alpha"]),
+            dropout=float(manifest["lora_dropout"]),
+        )
+        if "trainable_state_dict" not in checkpoint_payload:
+            raise ValueError(
+                f"Manifest mode={manifest_mode!r} indicates LoRA but checkpoint "
+                f"payload is missing 'trainable_state_dict'. Found keys: "
+                f"{sorted(checkpoint_payload.keys())}"
+            )
+        load_result = model.load_state_dict(checkpoint_payload["trainable_state_dict"], strict=False)
+        if load_result.unexpected_keys:
+            raise ValueError(f"Unexpected adapter checkpoint keys: {load_result.unexpected_keys}")
+        missing_lora = [key for key in load_result.missing_keys if ".lora_" in key]
+        if missing_lora:
+            raise ValueError(f"Missing LoRA weights while loading adapter: {missing_lora}")
     model.eval()
     return tokenizer, model
 

@@ -1,29 +1,26 @@
 seed: 42
-
 teacher:
   name: Qwen3.5-9B
   path: ../models/Qwen3.5-9B
   chat_template_enable_thinking: false
   device_map: auto
   torch_dtype: auto
-  runtime_backend: ""
-  runtime_device: ""
+  runtime_backend: ''
+  runtime_device: ''
   trust_remote_code: true
   local_files_only: true
-  attn_implementation: ""
-
+  attn_implementation: ''
 student:
   name: Qwen3.5-0.8B
   path: ../models/Qwen3.5-0.8B
   chat_template_enable_thinking: false
   device_map: auto
   torch_dtype: auto
-  runtime_backend: ""
-  runtime_device: ""
+  runtime_backend: ''
+  runtime_device: ''
   trust_remote_code: true
   local_files_only: true
-  attn_implementation: ""
-
+  attn_implementation: ''
 data:
   train_split: ../data/processed/safety/tulu3_safety_train.jsonl
   val_split: ../data/processed/analysis_val_set.jsonl
@@ -33,33 +30,33 @@ data:
     source_name: allenai/tulu-3-sft-mixture
     split: train
     sources:
-      - ai2-adapt-dev/tulu_v3.9_wildguardmix
-      - ai2-adapt-dev/tulu_v3.9_wildjailbreak
-      - ai2-adapt-dev/coconot_converted
+    - ai2-adapt-dev/tulu_v3.9_wildguardmix
+    - ai2-adapt-dev/tulu_v3.9_wildjailbreak
+    - ai2-adapt-dev/coconot_converted
     force_rebuild: false
-
 lora:
   rank: 8
   alpha: 8.0
   dropout: 0.05
   target_modules:
-    - self_attn.v_proj
-    - self_attn.o_proj
-
+  - self_attn.v_proj
+  - self_attn.o_proj
 optim:
   epochs: 1
   batch_size: 128
   micro_batch_size: 1
-  learning_rate: 0.000005
+  learning_rate: 0.0001
   weight_decay: 0.0
   max_length: 2048
   max_new_tokens: 512
   log_every_steps: 20
-
+  gradient_checkpointing: true
+  save_optimizer_state: false
 distill:
   temperature: 2.0
   hard_loss_weight: 0.5
   soft_loss_weight: 0.5
-
 output:
   output_root: ../outputs/baselines/distill_qwen35_9b_to_08b_tulu3_safety
+training:
+  mode: full_finetune

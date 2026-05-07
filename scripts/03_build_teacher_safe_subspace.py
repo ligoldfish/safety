@@ -98,6 +98,26 @@ def main() -> None:
         log_path=str(log_path),
     )
 
+    n_harmful = int(harmful_mask.sum().item())
+    n_harmless = int(harmless_mask.sum().item())
+    if n_harmless > 0:
+        ratio = n_harmful / n_harmless
+        if not (0.77 <= ratio <= 1.3):
+            log_kv(
+                logger,
+                "subspace_label_imbalance_warning",
+                harmful_count=n_harmful,
+                harmless_count=n_harmless,
+                ratio_harmful_over_harmless=ratio,
+                note=(
+                    "Heavy harmful/harmless imbalance biases the safe subspace "
+                    "toward the majority polarity. For BeaverTails this often "
+                    "indicates is_safe labels RESPONSE safety, not PROMPT "
+                    "harmlessness; consider builder dedup_prompts=True or "
+                    "prompt-level filtering."
+                ),
+            )
+
     generated_files: List[str] = []
     for layer_idx in key_layers:
         result = build_teacher_safe_subspace(

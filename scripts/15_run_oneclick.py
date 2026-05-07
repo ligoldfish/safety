@@ -60,6 +60,39 @@ SAFETY_SFT_CONFIGS: dict[tuple[str, str, str], str] = {
 
 # Distillation safety baselines: 9B teacher → 0.8B student, training corpus
 # replaced by Tülu3 safety / Safety-Tuned LLaMAs / BeaverTails.
+# Per-baseline eval configs that point datasets.pan.path at the baseline's
+# own held-out test JSONL (built by scripts/21_build_baseline_eval_jsonls.py).
+# Falls back to the canonical PAN eval YAML when no entry matches.
+SAFETY_EVAL_CONFIGS: dict[tuple[str, str, str], str] = {
+    ("npu", "0.8b", "tulu3_safety"): "configs/baseline_eval_qwen35_08b_tulu3_safety_npu.yaml",
+    ("tpu", "0.8b", "tulu3_safety"): "configs/baseline_eval_qwen35_08b_tulu3_safety_tpu.yaml",
+    ("npu", "0.8b", "safety_tuned_llamas"): "configs/baseline_eval_qwen35_08b_safety_tuned_llamas_npu.yaml",
+    ("tpu", "0.8b", "safety_tuned_llamas"): "configs/baseline_eval_qwen35_08b_safety_tuned_llamas_tpu.yaml",
+    ("npu", "0.8b", "beavertails"): "configs/baseline_eval_qwen35_08b_beavertails_npu.yaml",
+    ("tpu", "0.8b", "beavertails"): "configs/baseline_eval_qwen35_08b_beavertails_tpu.yaml",
+}
+
+# Per-baseline external safety suites passed via --safety-eval-datasets.
+# Tülu3 baseline gets CoCoNot contrast for over-refusal probing because
+# WildGuardTest + WildJailbreak alone do not cover the "looks-harmful but
+# legitimate" axis. The other baselines already carry both polarities in
+# their per-baseline JSONL.
+SAFETY_EVAL_DATASETS_BY_BASELINE: dict[str, tuple[str, ...]] = {
+    "tulu3_safety": ("coconot_contrast",),
+    "safety_tuned_llamas": (),
+    "beavertails": (),
+}
+
+
+def _safety_eval_config(device: str, model_size: str, baseline: str) -> str:
+    """Return baseline-specific eval YAML or fall back to the PAN eval YAML."""
+
+    return SAFETY_EVAL_CONFIGS.get(
+        (device, model_size, baseline),
+        BASELINE_EVAL_CONFIGS[(device, model_size)],
+    )
+
+
 SAFETY_DISTILL_CONFIGS: dict[tuple[str, str], str] = {
     ("npu", "tulu3_safety"): "configs/baseline_distill_qwen35_9b_to_08b_tulu3_safety_npu.yaml",
     ("tpu", "tulu3_safety"): "configs/baseline_distill_qwen35_9b_to_08b_tulu3_safety_tpu.yaml",
@@ -738,11 +771,13 @@ def _run_safety_full(
         device=device,
         device_id=device_id,
     )
+    eval_config_src = _resolve(_safety_eval_config(device, "0.8b", baseline_name))
     eval_config = _make_runtime_override_config(
-        _resolve(BASELINE_EVAL_CONFIGS[(device, "0.8b")]),
+        eval_config_src,
         device=device,
         device_id=device_id,
     )
+    safety_eval_datasets = SAFETY_EVAL_DATASETS_BY_BASELINE.get(baseline_name, ())
     sft_cfg = load_sft_config(sft_safety_config)
     safety_jsonl_path = Path(sft_cfg.data.train_split).resolve()
     env_overrides = _build_env_overrides(device, device_id)
@@ -842,7 +877,8 @@ def _run_safety_full(
         opencompass_datasets=opencompass_datasets,
         skip_opencompass=skip_opencompass,
         enable_opencompass=enable_opencompass,
-        safety_eval_datasets=DEFAULT_SAFETY_EVAL_DATASETS,
+        safety_eval_datasets=safety_eval_datasets,
+        eval_config_path=str(eval_config_src),
     )
 
 
@@ -872,11 +908,13 @@ def _run_safety_distill(
         device=device,
         device_id=device_id,
     )
+    eval_config_src = _resolve(_safety_eval_config(device, "0.8b", baseline_name))
     eval_config = _make_runtime_override_config(
-        _resolve(BASELINE_EVAL_CONFIGS[(device, "0.8b")]),
+        eval_config_src,
         device=device,
         device_id=device_id,
     )
+    safety_eval_datasets = SAFETY_EVAL_DATASETS_BY_BASELINE.get(baseline_name, ())
     cfg = load_distill_config(train_config)
     env_overrides = _build_env_overrides(device, device_id)
 
@@ -910,8 +948,8 @@ def _run_safety_distill(
         "--output-dir",
         str(pan_output_root),
     ]
-    if DEFAULT_SAFETY_EVAL_DATASETS:
-        eval_args.extend(["--safety-eval-datasets", *DEFAULT_SAFETY_EVAL_DATASETS])
+    if safety_eval_datasets:
+        eval_args.extend(["--safety-eval-datasets", *safety_eval_datasets])
     _run_script(
         "12_eval_baseline_suite.py",
         eval_args,
@@ -965,11 +1003,13 @@ def _run_safety_sft(
         device=device,
         device_id=device_id,
     )
+    eval_config_src = _resolve(_safety_eval_config(device, model_size, baseline_name))
     eval_config = _make_runtime_override_config(
-        _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)]),
+        eval_config_src,
         device=device,
         device_id=device_id,
     )
+    safety_eval_datasets = SAFETY_EVAL_DATASETS_BY_BASELINE.get(baseline_name, ())
     cfg = load_sft_config(train_config)
     env_overrides = _build_env_overrides(device, device_id)
 
@@ -1003,8 +1043,8 @@ def _run_safety_sft(
         "--output-dir",
         str(pan_output_root),
     ]
-    if DEFAULT_SAFETY_EVAL_DATASETS:
-        eval_args.extend(["--safety-eval-datasets", *DEFAULT_SAFETY_EVAL_DATASETS])
+    if safety_eval_datasets:
+        eval_args.extend(["--safety-eval-datasets", *safety_eval_datasets])
     _run_script(
         "12_eval_baseline_suite.py",
         eval_args,
@@ -1189,9 +1229,15 @@ def _run_adapter_eval(
     skip_opencompass: bool = True,
     enable_opencompass: bool = False,
     safety_eval_datasets: Sequence[str] = (),
+    eval_config_path: str | None = None,
 ) -> None:
+    eval_config_src = (
+        Path(eval_config_path).resolve()
+        if eval_config_path
+        else _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)])
+    )
     eval_config = _make_runtime_override_config(
-        _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)]),
+        eval_config_src,
         device=device,
         device_id=device_id,
     )

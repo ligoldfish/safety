@@ -137,16 +137,31 @@ def main() -> None:
     )
     student_model.train()
 
-    layer_indices = list(range(int(meta["num_layers"])))
-    injection = inject_lora_modules(
-        student_model,
-        layer_indices=layer_indices,
-        target_suffixes=cfg.lora.target_modules,
-        rank=cfg.lora.rank,
-        alpha=cfg.lora.alpha,
-        dropout=cfg.lora.dropout,
-    )
-    freeze_non_lora_parameters(student_model)
+    training_mode = str(cfg.training.mode).strip().lower()
+    if training_mode == "lora":
+        layer_indices = list(range(int(meta["num_layers"])))
+        injection = inject_lora_modules(
+            student_model,
+            layer_indices=layer_indices,
+            target_suffixes=cfg.lora.target_modules,
+            rank=cfg.lora.rank,
+            alpha=cfg.lora.alpha,
+            dropout=cfg.lora.dropout,
+        )
+        freeze_non_lora_parameters(student_model)
+        lora_modules = list(injection.replaced_module_names)
+    elif training_mode == "full_finetune":
+        injection = None
+        lora_modules = []
+        if bool(cfg.optim.gradient_checkpointing):
+            if hasattr(student_model, "config"):
+                student_model.config.use_cache = False
+            if hasattr(student_model, "gradient_checkpointing_enable"):
+                student_model.gradient_checkpointing_enable()
+    else:
+        raise ValueError(
+            f"Unsupported training.mode={cfg.training.mode!r}; expected 'lora' or 'full_finetune'."
+        )
     trainable_params, total_params = count_trainable_parameters(student_model)
 
     collator = SupervisedCollator(tokenizer, max_length=cfg.optim.max_length)
@@ -204,7 +219,9 @@ def main() -> None:
         soft_loss_weight=cfg.distill.soft_loss_weight,
         trainable_parameters=trainable_params,
         total_parameters=total_params,
-        lora_modules=injection.replaced_module_names,
+        training_mode=training_mode,
+        lora_modules=lora_modules,
+        gradient_checkpointing=bool(cfg.optim.gradient_checkpointing),
         log_path=str(log_path),
     )
 
@@ -329,11 +346,15 @@ def main() -> None:
                 "teacher_model": cfg.teacher.name,
                 "student_model": cfg.student.name,
             },
+            save_mode="full" if training_mode == "full_finetune" else "trainable",
+            save_optimizer=bool(cfg.optim.save_optimizer_state),
         )
 
+    manifest_mode = "distill" if training_mode == "lora" else "distill_full_finetune"
     manifest = {
         "config_path": str(Path(args.config).resolve()),
-        "mode": "distill",
+        "mode": manifest_mode,
+        "training_mode": training_mode,
         "teacher_model_name": cfg.teacher.name,
         "teacher_model_path": cfg.teacher.path,
         "student_model_name": cfg.student.name,
@@ -341,10 +362,6 @@ def main() -> None:
         "train_split": cfg.data.train_split,
         "val_split": cfg.data.val_split,
         "test_split": cfg.data.test_split,
-        "lora_modules": injection.replaced_module_names,
-        "lora_rank": cfg.lora.rank,
-        "lora_alpha": cfg.lora.alpha,
-        "lora_dropout": cfg.lora.dropout,
         "temperature": cfg.distill.temperature,
         "hard_loss_weight": cfg.distill.hard_loss_weight,
         "soft_loss_weight": cfg.distill.soft_loss_weight,
@@ -353,6 +370,8 @@ def main() -> None:
         "micro_batch_size": micro_batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "learning_rate": cfg.optim.learning_rate,
+        "gradient_checkpointing": bool(cfg.optim.gradient_checkpointing),
+        "save_optimizer_state": bool(cfg.optim.save_optimizer_state),
         "train_num_samples": len(train_dataset),
         "val_num_samples": len(val_dataset),
         "trainable_parameters": trainable_params,
@@ -362,6 +381,15 @@ def main() -> None:
         "checkpoints_dir": str(checkpoints_dir),
         "log_path": str(log_path),
     }
+    if training_mode == "lora":
+        manifest.update(
+            {
+                "lora_modules": lora_modules,
+                "lora_rank": cfg.lora.rank,
+                "lora_alpha": cfg.lora.alpha,
+                "lora_dropout": cfg.lora.dropout,
+            }
+        )
     write_json(output_root / "manifest.json", manifest)
     log_kv(logger, "training_complete", output_root=str(output_root), manifest=manifest)
     print(json.dumps(val_metrics, ensure_ascii=False, indent=2))

@@ -63,6 +63,12 @@ class SafetyDatasetSpec:
     file_name: Optional[str] = None
     refusal_template: Optional[str] = None
     system_prompt: Optional[str] = None
+    # Safety-Tuned LLaMAs harmless contrast (alpaca_small.json) toggle.
+    include_harmless_contrast: bool = False
+    harmless_file_name: str = "alpaca_small.json"
+    # BeaverTails de-duplication: 30k_train ships multiple is_safe-tagged
+    # responses per prompt which inflates class imbalance after binary mapping.
+    dedup_prompts: bool = True
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -218,27 +224,21 @@ def _resolve_safety_tuned_llamas_file(
     )
 
 
-def build_safety_tuned_llamas_records(
+def _parse_alpaca_records(
+    json_path: Path,
     *,
-    output_path: str | Path,
-    repo_or_data_path: str | Path,
-    file_name: str = DEFAULT_SAFETY_TUNED_LLAMAS_FILE,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    system_prompt: str,
+    id_prefix: str,
+    label: str,
+    dataset: str,
 ) -> List[Dict[str, Any]]:
-    """Materialize the 2k Safety-Tuned LLaMAs Alpaca-format records.
+    """Parse an Alpaca-format JSON file into the project's record schema."""
 
-    The Alpaca schema is ``{"instruction", "input", "output"}``. The user
-    turn becomes ``instruction`` (with ``input`` appended after a blank
-    line when present) and the assistant turn becomes ``output``.
-    """
-
-    json_path = _resolve_safety_tuned_llamas_file(repo_or_data_path, file_name)
     raw = json.loads(json_path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise ValueError(
             f"Expected a JSON list in {json_path}, got {type(raw).__name__}."
         )
-
     records: List[Dict[str, Any]] = []
     for index, row in enumerate(raw):
         if not isinstance(row, dict):
@@ -257,20 +257,71 @@ def build_safety_tuned_llamas_records(
         ]
         records.append(
             {
-                "id": f"safety_tuned_llamas_{index:06d}",
+                "id": f"{id_prefix}_{index:06d}",
                 "messages": messages,
                 "target_response": output,
-                "label": "safety_tuned_llamas",
+                "label": label,
                 "source": str(json_path),
-                "dataset": "safety_tuned_llamas",
+                "dataset": dataset,
             }
         )
+    return records
+
+
+def build_safety_tuned_llamas_records(
+    *,
+    output_path: str | Path,
+    repo_or_data_path: str | Path,
+    file_name: str = DEFAULT_SAFETY_TUNED_LLAMAS_FILE,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    include_harmless_contrast: bool = False,
+    harmless_file_name: str = "alpaca_small.json",
+) -> List[Dict[str, Any]]:
+    """Materialize the 2k Safety-Tuned LLaMAs Alpaca-format records.
+
+    The Alpaca schema is ``{"instruction", "input", "output"}``. The user
+    turn becomes ``instruction`` (with ``input`` appended after a blank
+    line when present) and the assistant turn becomes ``output``.
+
+    When ``include_harmless_contrast=True``, the upstream repo's
+    ``alpaca_small.json`` (general Alpaca instructions) is also loaded and
+    appended with ``label="safety_tuned_llamas_harmless"``. This gives
+    downstream binary-eval pipelines a harmless contrast signal that the
+    main safety-only file lacks.
+    """
+
+    json_path = _resolve_safety_tuned_llamas_file(repo_or_data_path, file_name)
+    records = _parse_alpaca_records(
+        json_path,
+        system_prompt=system_prompt,
+        id_prefix="safety_tuned_llamas",
+        label="safety_tuned_llamas",
+        dataset="safety_tuned_llamas",
+    )
 
     if not records:
         raise RuntimeError(
             f"No usable records were parsed from {json_path}; "
             "check that the file follows the Alpaca schema."
         )
+
+    if include_harmless_contrast:
+        harmless_path = _resolve_safety_tuned_llamas_file(
+            repo_or_data_path, harmless_file_name
+        )
+        harmless_records = _parse_alpaca_records(
+            harmless_path,
+            system_prompt=system_prompt,
+            id_prefix="safety_tuned_llamas_harmless",
+            label="safety_tuned_llamas_harmless",
+            dataset="safety_tuned_llamas_harmless",
+        )
+        if not harmless_records:
+            raise RuntimeError(
+                f"include_harmless_contrast=True but {harmless_path} parsed "
+                "into zero records; check the alpaca_small.json schema."
+            )
+        records.extend(harmless_records)
 
     write_jsonl(output_path, records)
     return records
@@ -292,12 +343,22 @@ def build_beavertails_records(
     source_name: str = "PKU-Alignment/BeaverTails",
     cache_dir: Optional[str] = None,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    dedup_prompts: bool = True,
 ) -> List[Dict[str, Any]]:
     """Materialize a BeaverTails SFT split.
 
     Unsafe rows (``is_safe == False``) get their assistant turn replaced
     with the project-wide refusal template; safe rows keep the original
     response. Both branches share the same ``messages`` schema.
+
+    BeaverTails 30k_train ships multiple ``is_safe``-tagged responses per
+    prompt. After binary mapping (``is_safe=True → harmless``,
+    ``is_safe=False → harmful``) this inflates the harmful side and biases
+    the SemAlign safe subspace. ``dedup_prompts=True`` (default) keeps
+    only the first record per prompt; this mitigates the imbalance but
+    note that ``is_safe`` reflects RESPONSE safety, not PROMPT
+    harmlessness, so true prompt-level filtering still requires post-hoc
+    category-aware logic.
     """
 
     if split not in SUPPORTED_BEAVERTAILS_TRAIN_SPLITS:
@@ -310,10 +371,15 @@ def build_beavertails_records(
 
     dataset = _load_dataset(source_name, split=split, cache_dir=cache_dir)
     records: List[Dict[str, Any]] = []
+    seen_prompts: set[str] = set()
     for index, row in enumerate(dataset):
         prompt = str(row.get("prompt", "")).strip()
         if not prompt:
             continue
+        if dedup_prompts:
+            if prompt in seen_prompts:
+                continue
+            seen_prompts.add(prompt)
         is_safe = bool(row.get("is_safe", False))
         original_response = str(row.get("response", "")).strip()
         assistant_text = original_response if is_safe else refusal_template
@@ -378,6 +444,8 @@ def _build_safety_tuned_llamas(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
         repo_or_data_path=spec.repo_or_data_path,
         file_name=spec.file_name or DEFAULT_SAFETY_TUNED_LLAMAS_FILE,
         system_prompt=spec.system_prompt or DEFAULT_SYSTEM_PROMPT,
+        include_harmless_contrast=bool(spec.include_harmless_contrast),
+        harmless_file_name=spec.harmless_file_name or "alpaca_small.json",
     )
 
 
@@ -389,6 +457,7 @@ def _build_beavertails(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
         source_name=spec.source_name or "PKU-Alignment/BeaverTails",
         cache_dir=spec.cache_dir,
         system_prompt=spec.system_prompt or DEFAULT_SYSTEM_PROMPT,
+        dedup_prompts=bool(spec.dedup_prompts),
     )
 
 
