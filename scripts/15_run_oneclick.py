@@ -786,12 +786,10 @@ def _run_safety_full(
         / f"safety_full_{baseline_name}_{device}"
         / "phase1"
     ).resolve()
-    safety_phasef_output_root = (
-        PROJECT_ROOT
-        / "outputs"
-        / f"safety_full_{baseline_name}_{device}"
-        / "phaseF"
-    ).resolve()
+    # PhaseF output lives under phase1/training so that 10_sanity_eval and
+    # 11_make_tables — which both default to <phase1.extraction.output_root>/training
+    # — can locate the LoRA checkpoint without --training-dir overrides.
+    safety_phasef_output_root = (safety_phase1_output_root / "training").resolve()
     phase1_override, phasef_override = _make_safety_full_overrides(
         device=device,
         device_id=device_id,
