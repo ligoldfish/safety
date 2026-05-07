@@ -302,3 +302,22 @@ python scripts/19_prepare_safety_data.py --config configs/baseline_sft_qwen35_08
 python scripts/21_build_baseline_eval_jsonls.py --baseline all --force-rebuild
 ```
 
+## Round 3 — base-model evaluation per baseline
+
+`nosft` now accepts `--baseline {pan, tulu3_safety, beavertails, safety_tuned_llamas, all}`. Pass anything other than `pan` to route the eval to the per-baseline test JSONL produced by `scripts/21_build_baseline_eval_jsonls.py`. `all` loops over PAN + the three safety baselines in one invocation.
+
+```powershell
+# Default — back-compat with the pre-Round-3 PAN eval
+python scripts/15_run_oneclick.py nosft --model 0.8b --device npu
+
+# Single safety baseline (Tülu3 also runs the CoCoNot over-refusal probe)
+python scripts/15_run_oneclick.py nosft --model 0.8b --device npu --baseline tulu3_safety
+python scripts/15_run_oneclick.py nosft --model 0.8b --device npu --baseline beavertails
+python scripts/15_run_oneclick.py nosft --model 0.8b --device npu --baseline safety_tuned_llamas
+
+# All four sequentially
+python scripts/15_run_oneclick.py nosft --model 0.8b --device npu --baseline all
+```
+
+`--baseline` other than `pan` requires `--model 0.8b` (per-baseline eval YAMLs only exist for the 0.8B model).
+

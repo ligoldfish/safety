@@ -210,6 +210,18 @@ def parse_args() -> argparse.Namespace:
 
     nosft_parser = subparsers.add_parser("nosft", help="Run no-SFT benchmark evaluation.")
     nosft_parser.add_argument("--model", choices=["0.8b", "9b"], required=True)
+    nosft_parser.add_argument(
+        "--baseline",
+        choices=["pan", *SAFETY_SFT_BASELINES, "all"],
+        default="pan",
+        help=(
+            "Which test set to evaluate the base model on. "
+            "'pan' (default) keeps back-compat with PAN eval. "
+            "'tulu3_safety' / 'beavertails' / 'safety_tuned_llamas' use the "
+            "per-baseline JSONL produced by scripts/21_build_baseline_eval_jsonls.py. "
+            "'all' loops over PAN + the three safety baselines sequentially."
+        ),
+    )
     add_common_flags(nosft_parser)
 
     sft_parser = subparsers.add_parser("sft", help="Run PAN SFT and then benchmark evaluation.")
@@ -616,10 +628,11 @@ def _run_phase1_precompute(
         )
 
 
-def _run_baseline_nosft(
+def _run_baseline_nosft_one(
     device: str,
     model_size: str,
     *,
+    baseline_name: str,
     device_id: int,
     num_devices: int,
     dry_run: bool,
@@ -629,16 +642,42 @@ def _run_baseline_nosft(
     enable_opencompass: bool,
     opencompass_config: str = "",  # reserved; not forwarded yet
 ) -> None:
+    """Run base-model eval on a single baseline test set.
+
+    ``baseline_name="pan"`` keeps the historical behaviour (PAN eval YAML).
+    Any other value routes to the per-baseline eval YAML produced in
+    Round 1 and lifts the ``--safety-eval-datasets`` over-refusal probe
+    from ``SAFETY_EVAL_DATASETS_BY_BASELINE`` (e.g. CoCoNot for Tülu3).
+    """
+
     _validate_device_request(num_devices)
+    if baseline_name == "pan":
+        eval_yaml_src = _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)])
+    else:
+        if model_size != "0.8b":
+            raise ValueError(
+                f"--baseline {baseline_name} only supports --model 0.8b; "
+                "per-baseline eval YAMLs only exist for the 0.8B model."
+            )
+        eval_yaml_src = _resolve(_safety_eval_config(device, model_size, baseline_name))
+
     eval_config = _make_runtime_override_config(
-        _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)]),
+        eval_yaml_src,
         device=device,
         device_id=device_id,
     )
     env_overrides = _build_env_overrides(device, device_id)
+    safety_eval_datasets = (
+        SAFETY_EVAL_DATASETS_BY_BASELINE.get(baseline_name, ())
+        if baseline_name != "pan"
+        else ()
+    )
+    eval_args: list[str] = ["--config", str(eval_config)]
+    if safety_eval_datasets:
+        eval_args.extend(["--safety-eval-datasets", *safety_eval_datasets])
     _run_script(
         "12_eval_baseline_suite.py",
-        ["--config", str(eval_config)],
+        eval_args,
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
@@ -660,6 +699,29 @@ def _run_baseline_nosft(
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
+
+
+def _run_baseline_nosft(
+    device: str,
+    model_size: str,
+    *,
+    baseline_name: str = "pan",
+    **kwargs,
+) -> None:
+    """Outer dispatch: ``--baseline all`` loops over PAN + the three
+    safety baselines; otherwise runs one ``_run_baseline_nosft_one``."""
+
+    if baseline_name == "all":
+        targets: tuple[str, ...] = ("pan", *SAFETY_SFT_BASELINES)
+    else:
+        targets = (baseline_name,)
+    for target in targets:
+        _run_baseline_nosft_one(
+            device,
+            model_size,
+            baseline_name=target,
+            **kwargs,
+        )
 
 
 def _make_safety_full_overrides(
@@ -1433,6 +1495,7 @@ def main() -> None:
         _run_baseline_nosft(
             args.device,
             args.model,
+            baseline_name=args.baseline,
             device_id=args.device_id,
             num_devices=args.num_devices,
             dry_run=args.dry_run,
