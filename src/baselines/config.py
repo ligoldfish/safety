@@ -87,6 +87,7 @@ class SafetyDatasetConfig:
     # STL: pull alpaca_small.json as harmless contrast.
     include_harmless_contrast: bool = False
     harmless_file_name: str = "alpaca_small.json"
+    harmless_max_samples: int = 0  # 0 = match harmful count automatically
     # BeaverTails: drop duplicate prompts (multi-response per prompt).
     dedup_prompts: bool = True
     # Round 2: BeaverTails uses category-dict prompt-level labels by

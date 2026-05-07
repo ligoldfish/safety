@@ -88,6 +88,7 @@ class SafetyDatasetSpec:
     # Safety-Tuned LLaMAs harmless contrast (alpaca_small.json) toggle.
     include_harmless_contrast: bool = False
     harmless_file_name: str = "alpaca_small.json"
+    harmless_max_samples: Optional[int] = None
     # BeaverTails de-duplication: 30k_train ships multiple is_safe-tagged
     # responses per prompt which inflates class imbalance after binary mapping.
     dedup_prompts: bool = True
@@ -98,6 +99,7 @@ class SafetyDatasetSpec:
     # Tülu3 v2: helpful slices to mix in as in-domain harmless contrast.
     helpful_sources: Optional[List[str]] = None
     helpful_max_samples: Optional[int] = None
+    seed: int = 42
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -554,8 +556,18 @@ def _resolve_safety_tuned_llamas_file(
     if base.is_file():
         candidates.append(base)
     else:
-        candidates.append(base / file_name)
-        candidates.append(base / "data" / file_name)
+        # Upstream layout has fluctuated across commits: files live at the
+        # repo root in old snapshots, under ``data/`` in some forks, and
+        # under ``data/training/`` in the current vinid HEAD. Probe all
+        # known locations before giving up.
+        candidates.extend(
+            [
+                base / file_name,
+                base / "data" / file_name,
+                base / "data" / "training" / file_name,
+                base / "training" / file_name,
+            ]
+        )
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -623,6 +635,8 @@ def build_safety_tuned_llamas_records(
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     include_harmless_contrast: bool = False,
     harmless_file_name: str = "alpaca_small.json",
+    harmless_max_samples: Optional[int] = None,
+    seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """Materialize the 2k Safety-Tuned LLaMAs Alpaca-format records.
 
@@ -631,10 +645,11 @@ def build_safety_tuned_llamas_records(
     line when present) and the assistant turn becomes ``output``.
 
     When ``include_harmless_contrast=True``, the upstream repo's
-    ``alpaca_small.json`` (general Alpaca instructions) is also loaded
-    and appended with ``label="harmless"``. This gives downstream
-    binary-eval pipelines (and the SemAlign 20_split contrast builder) a
-    harmless contrast signal that the main safety-only file lacks.
+    ``alpaca_small.json`` (general Alpaca instructions) is also loaded as
+    ``label="harmless"``. By default it is deterministically downsampled
+    to the harmful count so the 20k harmless Alpaca pool does not swamp
+    the ~2.5k safety-only records. Pass ``harmless_max_samples`` to set a
+    different cap.
 
     Round 2: ``label`` is always one of ``{"harmful", "harmless"}`` so
     ``20_split_safety_for_semalign.py`` recognizes both poles in-domain
@@ -673,6 +688,14 @@ def build_safety_tuned_llamas_records(
                 f"include_harmless_contrast=True but {harmless_path} parsed "
                 "into zero records; check the alpaca_small.json schema."
             )
+        harmless_cap = (
+            len(records)
+            if harmless_max_samples is None
+            else max(int(harmless_max_samples), 0)
+        )
+        rng = random.Random(int(seed))
+        rng.shuffle(harmless_records)
+        harmless_records = harmless_records[:harmless_cap]
         records.extend(harmless_records)
 
     write_jsonl(output_path, records)
@@ -836,6 +859,8 @@ def _build_safety_tuned_llamas(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
         system_prompt=spec.system_prompt or DEFAULT_SYSTEM_PROMPT,
         include_harmless_contrast=bool(spec.include_harmless_contrast),
         harmless_file_name=spec.harmless_file_name or "alpaca_small.json",
+        harmless_max_samples=spec.harmless_max_samples,
+        seed=int(spec.seed),
     )
 
 

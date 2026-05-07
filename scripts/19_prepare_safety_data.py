@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_data_block(config_path: Path) -> tuple[SupervisedDataConfig, str]:
+def _load_data_block(config_path: Path) -> tuple[SupervisedDataConfig, str, int]:
     """Try SFT first; fall back to distill. Both share SupervisedDataConfig."""
 
     last_exc: Exception | None = None
@@ -74,7 +74,7 @@ def _load_data_block(config_path: Path) -> tuple[SupervisedDataConfig, str]:
             last_exc = exc
             continue
         if isinstance(cfg, (BaselineSFTConfig, BaselineDistillConfig)):
-            return cfg.data, kind
+            return cfg.data, kind, int(cfg.seed)
     raise ValueError(
         f"Could not load {config_path} as either SFT or distill config. "
         f"Last loader error: {last_exc!r}"
@@ -82,7 +82,7 @@ def _load_data_block(config_path: Path) -> tuple[SupervisedDataConfig, str]:
 
 
 def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSpec, str]:
-    data, kind = _load_data_block(config_path)
+    data, kind, seed = _load_data_block(config_path)
     safety_cfg = data.safety_dataset
     if not safety_cfg.name:
         raise ValueError(
@@ -103,6 +103,11 @@ def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSp
         system_prompt=safety_cfg.system_prompt or None,
         include_harmless_contrast=bool(safety_cfg.include_harmless_contrast),
         harmless_file_name=safety_cfg.harmless_file_name or "alpaca_small.json",
+        harmless_max_samples=(
+            int(safety_cfg.harmless_max_samples)
+            if safety_cfg.harmless_max_samples
+            else None
+        ),
         dedup_prompts=bool(safety_cfg.dedup_prompts),
         label_strategy=safety_cfg.label_strategy or "category_any",
         helpful_sources=list(safety_cfg.helpful_sources) or None,
@@ -111,6 +116,7 @@ def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSp
             if safety_cfg.helpful_max_samples
             else None
         ),
+        seed=seed,
     )
     return spec, kind
 

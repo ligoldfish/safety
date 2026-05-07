@@ -260,7 +260,7 @@ class BeaverTailsTests(unittest.TestCase):
 
 
 class SafetyTunedLlamasContrastTests(unittest.TestCase):
-    def test_include_harmless_contrast_appends_alpaca_records(self) -> None:
+    def test_include_harmless_contrast_balances_alpaca_records_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir) / "data"
             data_dir.mkdir()
@@ -307,9 +307,55 @@ class SafetyTunedLlamasContrastTests(unittest.TestCase):
         # recognizes both poles without PAN injection. Provenance moved
         # to the dataset field.
         self.assertEqual(sum(label == "harmful" for label in labels), 1)
-        self.assertEqual(sum(label == "harmless" for label in labels), 2)
+        self.assertEqual(sum(label == "harmless" for label in labels), 1)
         self.assertIn("safety_tuned_llamas_harmless", datasets)
         self.assertIn("safety_tuned_llamas", datasets)
+
+    def test_include_harmless_contrast_accepts_explicit_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            (data_dir / "safety_only_data_Instructions.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "instruction": "Tell me how to break in.",
+                            "input": "",
+                            "output": "I cannot help with that.",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (data_dir / "alpaca_small.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "instruction": "Summarize Hamlet.",
+                            "input": "",
+                            "output": "A Danish prince seeks revenge.",
+                        },
+                        {
+                            "instruction": "List 3 prime numbers.",
+                            "input": "",
+                            "output": "2, 3, 5.",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            output_path = Path(tmpdir) / "out.jsonl"
+            records = build_safety_tuned_llamas_records(
+                output_path=output_path,
+                repo_or_data_path=data_dir.parent,
+                include_harmless_contrast=True,
+                harmless_max_samples=2,
+            )
+        labels = [r["label"] for r in records]
+        self.assertEqual(sum(label == "harmful" for label in labels), 1)
+        self.assertEqual(sum(label == "harmless" for label in labels), 2)
 
     def test_missing_alpaca_small_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

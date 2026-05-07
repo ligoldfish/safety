@@ -23,6 +23,7 @@ data:
     # the in-domain residual subspace with PAN style).
     include_harmless_contrast: true
     harmless_file_name: alpaca_small.json
+    harmless_max_samples: 0  # 0 = auto-balance to harmful count
     force_rebuild: false
 lora:
   rank: 8
