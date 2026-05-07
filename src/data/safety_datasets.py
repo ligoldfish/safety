@@ -245,6 +245,156 @@ def _classify_wildguardmix_label(value: str) -> Optional[str]:
     return None
 
 
+def _build_v2_record(
+    *,
+    record_id: str,
+    prompt: str,
+    target: str,
+    label: str,
+    raw_label: str,
+    source: str,
+    system_prompt: str,
+) -> Dict[str, Any]:
+    return {
+        "id": record_id,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "target_response": target,
+        "label": label,
+        "raw_label": raw_label,
+        "source": source,
+        "dataset": "tulu3_safety_v2",
+    }
+
+
+def _iter_dataset_rows(loaded: Any) -> Iterable[Dict[str, Any]]:
+    """Iterate either a HF Dataset or a DatasetDict's first split."""
+
+    if hasattr(loaded, "keys") and not hasattr(loaded, "__iter__"):
+        loaded = loaded[next(iter(loaded.keys()))]
+    return loaded
+
+
+def _collect_wildguardmix_train_rows(
+    *,
+    source_name: str,
+    config_name: str,
+    cache_dir: Optional[str],
+    system_prompt: str,
+    refusal_template: str,
+) -> List[Dict[str, Any]]:
+    """Pull harmful/harmless rows directly from upstream WildGuardMix train.
+
+    The Tülu3 SFT mixture strips ``prompt_harm_label`` so we cannot rely
+    on it; the upstream dataset still carries the field.
+    """
+
+    try:
+        loaded = _load_dataset(source_name, config_name, cache_dir=cache_dir)
+    except Exception as exc:  # network / gated access failure
+        raise RuntimeError(
+            f"Failed to load {source_name}:{config_name} for tulu3_safety_v2 "
+            f"harmful side. Underlying error: {exc!r}. Ensure the dataset is "
+            "accessible and the HF token has access."
+        ) from exc
+    rows = _iter_dataset_rows(loaded)
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        prompt = str(row.get("prompt", "") or "").strip()
+        if not prompt or prompt in seen:
+            continue
+        seen.add(prompt)
+        raw_label = str(row.get("prompt_harm_label", "")).strip()
+        mapped = _classify_wildguardmix_label(raw_label)
+        if mapped is None:
+            continue
+        if mapped == "harmless":
+            response = str(row.get("response", "") or "").strip()
+            response_harm = str(row.get("response_harm_label", "")).strip().lower()
+            # Skip rows whose response itself is harmful even though the
+            # prompt is benign — keeping them would teach unsafe completion
+            # on a harmless prompt.
+            if not response or response_harm == "harmful":
+                continue
+            target = response
+        else:
+            target = refusal_template
+        out.append(
+            _build_v2_record(
+                record_id=str(row.get("id") or f"tulu3v2_wgm_{index:08d}"),
+                prompt=prompt,
+                target=target,
+                label=mapped,
+                raw_label=raw_label,
+                source=f"{source_name}:{config_name}",
+                system_prompt=system_prompt,
+            )
+        )
+    return out
+
+
+def _collect_wildjailbreak_train_rows(
+    *,
+    source_name: str,
+    config_name: str,
+    cache_dir: Optional[str],
+    system_prompt: str,
+    refusal_template: str,
+) -> List[Dict[str, Any]]:
+    try:
+        loaded = _load_dataset(
+            source_name,
+            config_name,
+            delimiter="\t",
+            keep_default_na=False,
+            cache_dir=cache_dir,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load {source_name}:{config_name} for tulu3_safety_v2 "
+            f"harmful side. Underlying error: {exc!r}. WildJailbreak is gated; "
+            "accept the license on huggingface.co and retry with HF_TOKEN set."
+        ) from exc
+    rows = _iter_dataset_rows(loaded)
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        # Adversarial prompts dominate the train split; fall back to the
+        # vanilla rendition when adversarial is empty.
+        prompt = (
+            str(row.get("adversarial", "") or "").strip()
+            or str(row.get("vanilla", "") or "").strip()
+        )
+        if not prompt or prompt in seen:
+            continue
+        seen.add(prompt)
+        raw_label = str(row.get("data_type", "") or row.get("type", "")).strip()
+        mapped = _classify_wildjailbreak_data_type(raw_label)
+        if mapped is None:
+            continue
+        if mapped == "harmless":
+            target = str(row.get("completion", "") or "").strip()
+            if not target:
+                continue
+        else:
+            target = refusal_template
+        out.append(
+            _build_v2_record(
+                record_id=str(row.get("id") or f"tulu3v2_wjb_{index:08d}"),
+                prompt=prompt,
+                target=target,
+                label=mapped,
+                raw_label=raw_label,
+                source=f"{source_name}:{config_name}",
+                system_prompt=system_prompt,
+            )
+        )
+    return out
+
+
 def build_tulu3_safety_v2_records(
     *,
     output_path: str | Path,
@@ -255,46 +405,82 @@ def build_tulu3_safety_v2_records(
     helpful_sources: Sequence[str] = DEFAULT_TULU3_HELPFUL_SOURCES,
     helpful_max_samples: Optional[int] = None,
     seed: int = 42,
+    refusal_template: str = DEFAULT_SAFETY_REFUSAL_TEMPLATE,
+    wildguardmix_source: str = "allenai/wildguardmix",
+    wildguardmix_config: str = "wildguardtrain",
+    wildjailbreak_source: str = "allenai/wildjailbreak",
+    wildjailbreak_config: str = "train",
 ) -> List[Dict[str, Any]]:
     """Build the Tülu3 safety v2 corpus (Round 2 contrast).
 
     Differs from :func:`build_tulu3_safety_records` in two ways:
 
-    1. WildGuardMix and WildJailbreak rows keep their **raw** harmful /
-       harmless labels (``prompt_harm_label`` / ``data_type``) rather than
-       being collapsed to a single ``tulu3_safety`` tag.
-    2. Helpful in-domain harmless contrast is mixed in from the same
-       ``allenai/tulu-3-sft-mixture`` train split via ``helpful_sources``
-       (default: personahub_math + open_math_2_gsm8k). This replaces the
-       previous PAN-harmless cross-corpus injection that 20_split fell back
-       to when every Tülu3 row was tagged ``harmful``.
+    1. The harmful / harmless safety rows come from the **upstream**
+       ``allenai/wildguardmix`` (config ``wildguardtrain``) and
+       ``allenai/wildjailbreak`` (config ``train``) datasets directly,
+       not from the Tülu3 SFT mixture. The mixture re-packages them as
+       ``{id, messages, source}`` and drops ``prompt_harm_label`` /
+       ``data_type``, which we need for binary supervision.
+    2. Helpful in-domain harmless contrast is mixed in from
+       ``allenai/tulu-3-sft-mixture`` via ``helpful_sources`` (default:
+       personahub_math + open_math_2_gsm8k). This replaces the previous
+       PAN-harmless cross-corpus injection that 20_split fell back to
+       when every Tülu3 row was tagged ``harmful``.
 
     CoCoNot-converted rows are intentionally excluded from this builder;
     they are kept in :func:`load_coconot_contrast` as a separate
     over-refusal eval signal.
 
     ``helpful_max_samples`` caps the personahub side. ``None`` (default)
-    means: take min(n_personahub_seen, n_harmful) so the harmless and
-    harmful halves stay balanced.
+    means: top up only enough so harmless ≈ harmful after counting the
+    in-domain harmless rows already pulled from WildGuardMix /
+    WildJailbreak.
     """
 
-    accepted_safety = {
-        "ai2-adapt-dev/tulu_v3.9_wildguardmix",
-        "ai2-adapt-dev/tulu_v3.9_wildjailbreak",
-    }
     accepted_helpful = {str(value) for value in helpful_sources}
     if not accepted_helpful:
         raise ValueError("`helpful_sources` must list at least one helpful slice")
 
-    dataset = _load_dataset(source_name, split=split, cache_dir=cache_dir)
     safety_records: List[Dict[str, Any]] = []
+    safety_records.extend(
+        _collect_wildguardmix_train_rows(
+            source_name=wildguardmix_source,
+            config_name=wildguardmix_config,
+            cache_dir=cache_dir,
+            system_prompt=system_prompt,
+            refusal_template=refusal_template,
+        )
+    )
+    safety_records.extend(
+        _collect_wildjailbreak_train_rows(
+            source_name=wildjailbreak_source,
+            config_name=wildjailbreak_config,
+            cache_dir=cache_dir,
+            system_prompt=system_prompt,
+            refusal_template=refusal_template,
+        )
+    )
+
+    if not safety_records:
+        raise RuntimeError(
+            "tulu3_safety_v2 harmful side produced zero records. Verify that "
+            f"{wildguardmix_source}:{wildguardmix_config} and "
+            f"{wildjailbreak_source}:{wildjailbreak_config} are both reachable."
+        )
+
     helpful_pool: List[Dict[str, Any]] = []
+    try:
+        mixture = _load_dataset(source_name, split=split, cache_dir=cache_dir)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load {source_name}:{split} for personahub helpful "
+            f"slice. Underlying error: {exc!r}."
+        ) from exc
 
-    for index, row in enumerate(dataset):
+    for index, row in enumerate(mixture):
         row_source = str(row.get("source", "")).strip()
-        if row_source not in accepted_safety and row_source not in accepted_helpful:
+        if row_source not in accepted_helpful:
             continue
-
         messages = _coerce_messages(row.get("messages") or [])
         if not messages:
             continue
@@ -302,55 +488,23 @@ def build_tulu3_safety_v2_records(
         prompt_messages, target_response = _split_prompt_messages_and_target(messages)
         if not target_response:
             continue
-
-        if row_source == "ai2-adapt-dev/tulu_v3.9_wildguardmix":
-            raw_label = str(row.get("prompt_harm_label", "")).strip()
-            mapped = _classify_wildguardmix_label(raw_label)
-            if mapped is None:
-                continue
-            record = {
-                "id": str(row.get("id") or f"tulu3v2_wgm_{index:08d}"),
-                "messages": prompt_messages,
-                "target_response": target_response,
-                "label": mapped,
-                "raw_label": raw_label,
-                "source": row_source,
-                "dataset": "tulu3_safety_v2",
-            }
-            safety_records.append(record)
-        elif row_source == "ai2-adapt-dev/tulu_v3.9_wildjailbreak":
-            raw_label = str(row.get("data_type", "")).strip()
-            mapped = _classify_wildjailbreak_data_type(raw_label)
-            if mapped is None:
-                continue
-            record = {
-                "id": str(row.get("id") or f"tulu3v2_wjb_{index:08d}"),
-                "messages": prompt_messages,
-                "target_response": target_response,
-                "label": mapped,
-                "raw_label": raw_label,
-                "source": row_source,
-                "dataset": "tulu3_safety_v2",
-            }
-            safety_records.append(record)
-        elif row_source in accepted_helpful:
-            helpful_pool.append(
-                {
-                    "id": str(row.get("id") or f"tulu3v2_helpful_{index:08d}"),
-                    "messages": prompt_messages,
-                    "target_response": target_response,
-                    "label": "harmless",
-                    "raw_label": "personahub_helpful",
-                    "source": row_source,
-                    "dataset": "tulu3_safety_v2",
-                }
+        user_text = ""
+        for message in prompt_messages:
+            if str(message.get("role", "")).lower() == "user":
+                user_text = str(message.get("content", ""))
+                break
+        if not user_text:
+            continue
+        helpful_pool.append(
+            _build_v2_record(
+                record_id=str(row.get("id") or f"tulu3v2_helpful_{index:08d}"),
+                prompt=user_text,
+                target=target_response,
+                label="harmless",
+                raw_label="personahub_helpful",
+                source=row_source,
+                system_prompt=system_prompt,
             )
-
-    if not safety_records:
-        raise RuntimeError(
-            "tulu3_safety_v2 produced zero WildGuardMix / WildJailbreak records — "
-            "check that prompt_harm_label / data_type fields are present in the "
-            f"mixture rows of {source_name}."
         )
 
     n_harmful = sum(1 for record in safety_records if record["label"] == "harmful")

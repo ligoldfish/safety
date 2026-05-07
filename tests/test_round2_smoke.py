@@ -182,118 +182,159 @@ class BeaverTailsLabelStrategyTests(unittest.TestCase):
 
 
 class Tulu3SafetyV2Tests(unittest.TestCase):
-    def setUp(self) -> None:
-        # One harmful + one harmless WildGuardMix row, one harmful + one
-        # harmless WildJailbreak row, two personahub helpful rows.
-        def msgs(text: str) -> list[dict]:
-            return [
-                {"role": "user", "content": text},
-                {"role": "assistant", "content": "ok response"},
-            ]
+    """v2 builder pulls harmful side from upstream WildGuardMix /
+    WildJailbreak directly (the Tülu3 SFT mixture strips
+    prompt_harm_label / data_type) and uses the mixture only for
+    personahub helpful contrast."""
 
-        self.rows = [
+    def setUp(self) -> None:
+        self.wgm_rows = [
             {
                 "id": "wgm-harmful",
-                "source": "ai2-adapt-dev/tulu_v3.9_wildguardmix",
-                "messages": msgs("how to do bad thing"),
+                "prompt": "how to do bad thing",
+                "response": "I cannot help with that.",
                 "prompt_harm_label": "harmful",
+                "response_harm_label": "unharmful",
             },
             {
                 "id": "wgm-benign",
-                "source": "ai2-adapt-dev/tulu_v3.9_wildguardmix",
-                "messages": msgs("how to bake bread"),
+                "prompt": "how to bake bread",
+                "response": "Mix flour, water, yeast.",
                 "prompt_harm_label": "unharmful",
+                "response_harm_label": "unharmful",
             },
             {
+                "id": "wgm-benign-noisy-response",
+                "prompt": "tell me about chemistry",
+                "response": "Detailed step-by-step harm.",
+                "prompt_harm_label": "unharmful",
+                # Response itself flagged harmful -> drop to avoid teaching
+                # unsafe completion on harmless prompts.
+                "response_harm_label": "harmful",
+            },
+            {
+                "id": "wgm-bad-label",
+                "prompt": "missing label",
+                "response": "x",
+                "prompt_harm_label": "",
+            },
+        ]
+        self.wjb_rows = [
+            {
                 "id": "wjb-adv-harmful",
-                "source": "ai2-adapt-dev/tulu_v3.9_wildjailbreak",
-                "messages": msgs("disguised attack"),
+                "adversarial": "disguised attack",
+                "vanilla": "",
+                "completion": "I will not assist.",
                 "data_type": "adversarial_harmful",
             },
             {
                 "id": "wjb-adv-benign",
-                "source": "ai2-adapt-dev/tulu_v3.9_wildjailbreak",
-                "messages": msgs("dressed-up benign"),
+                "adversarial": "dressed-up benign",
+                "vanilla": "plain benign",
+                "completion": "Sure, here is a benign answer.",
                 "data_type": "adversarial_benign",
             },
             {
+                "id": "wjb-skip-bad-type",
+                "adversarial": "weird",
+                "vanilla": "",
+                "completion": "y",
+                "data_type": "unknown_type",
+            },
+        ]
+        self.mixture_rows = [
+            {
                 "id": "personahub-1",
                 "source": "ai2-adapt-dev/personahub_math_v5_regen_149960",
-                "messages": msgs("solve x^2 = 4"),
+                "messages": [
+                    {"role": "user", "content": "solve x^2 = 4"},
+                    {"role": "assistant", "content": "x = ±2"},
+                ],
             },
             {
                 "id": "personahub-2",
                 "source": "ai2-adapt-dev/personahub_math_v5_regen_149960",
-                "messages": msgs("compute 17 * 23"),
-            },
-            # Excluded rows
-            {
-                "id": "coconot-skip",
-                "source": "ai2-adapt-dev/coconot_converted",
-                "messages": msgs("over-refusal probe"),
+                "messages": [
+                    {"role": "user", "content": "compute 17 * 23"},
+                    {"role": "assistant", "content": "391"},
+                ],
             },
             {
-                "id": "wgm-bad-label",
+                "id": "skip-other-source",
                 "source": "ai2-adapt-dev/tulu_v3.9_wildguardmix",
-                "messages": msgs("missing label"),
-                "prompt_harm_label": "",
+                "messages": [
+                    {"role": "user", "content": "ignored — comes from upstream now"},
+                    {"role": "assistant", "content": "x"},
+                ],
             },
         ]
+
+    def _patch_loader(self):
+        # _load_dataset called in order: WGM train, WJB train, mixture.
+        return mock.patch.object(
+            safety_datasets,
+            "_load_dataset",
+            side_effect=[self.wgm_rows, self.wjb_rows, self.mixture_rows],
+        )
 
     def test_v2_builder_label_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "tulu3v2.jsonl"
-            with mock.patch.object(
-                safety_datasets, "_load_dataset", return_value=self.rows
-            ):
+            with self._patch_loader():
                 records = build_tulu3_safety_v2_records(
                     output_path=output_path,
                     helpful_max_samples=2,
                 )
         by_id = {r["id"]: r for r in records}
-        # CoCoNot and the empty-label row dropped.
-        self.assertNotIn("coconot-skip", by_id)
+        # WGM noisy response + bad label dropped.
+        self.assertNotIn("wgm-benign-noisy-response", by_id)
         self.assertNotIn("wgm-bad-label", by_id)
+        # WJB unknown data_type dropped.
+        self.assertNotIn("wjb-skip-bad-type", by_id)
+        # Mixture entries other than personahub dropped.
+        self.assertNotIn("skip-other-source", by_id)
         self.assertEqual(by_id["wgm-harmful"]["label"], "harmful")
+        self.assertEqual(
+            by_id["wgm-harmful"]["target_response"],
+            safety_datasets.DEFAULT_SAFETY_REFUSAL_TEMPLATE,
+        )
         self.assertEqual(by_id["wgm-benign"]["label"], "harmless")
+        self.assertEqual(by_id["wgm-benign"]["target_response"], "Mix flour, water, yeast.")
         self.assertEqual(by_id["wjb-adv-harmful"]["label"], "harmful")
+        self.assertEqual(
+            by_id["wjb-adv-harmful"]["target_response"],
+            safety_datasets.DEFAULT_SAFETY_REFUSAL_TEMPLATE,
+        )
         self.assertEqual(by_id["wjb-adv-benign"]["label"], "harmless")
+        self.assertEqual(by_id["wjb-adv-benign"]["target_response"], "Sure, here is a benign answer.")
         self.assertEqual(by_id["personahub-1"]["label"], "harmless")
         self.assertEqual(by_id["personahub-1"]["raw_label"], "personahub_helpful")
         for record in records:
             self.assertEqual(record["dataset"], "tulu3_safety_v2")
 
     def test_v2_builder_balances_helpful_to_harmful(self) -> None:
-        # 2 harmful rows -> default helpful_max_samples should keep at most 2
-        # personahub records (we provided 2; both kept).
+        # WGM: 1 harmful + 1 harmless. WJB: 1 harmful + 1 harmless.
+        # n_harmful = 2, n_harmless_safety = 2 -> default helpful_cap = 0.
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "tulu3v2.jsonl"
-            with mock.patch.object(
-                safety_datasets, "_load_dataset", return_value=self.rows
-            ):
+            with self._patch_loader():
                 records = build_tulu3_safety_v2_records(output_path=output_path)
         helpful_n = sum(
             1 for r in records if r.get("raw_label") == "personahub_helpful"
         )
         harmful_n = sum(1 for r in records if r["label"] == "harmful")
+        harmless_n = sum(1 for r in records if r["label"] == "harmless")
         self.assertGreaterEqual(harmful_n, 1)
         self.assertLessEqual(helpful_n, harmful_n)
+        self.assertLessEqual(harmless_n, harmful_n + 1)
 
     def test_v2_builder_empty_safety_raises(self) -> None:
-        rows = [
-            {
-                "id": "only-helpful",
-                "source": "ai2-adapt-dev/personahub_math_v5_regen_149960",
-                "messages": [
-                    {"role": "user", "content": "x"},
-                    {"role": "assistant", "content": "y"},
-                ],
-            },
-        ]
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "tulu3v2.jsonl"
             with mock.patch.object(
-                safety_datasets, "_load_dataset", return_value=rows
+                safety_datasets,
+                "_load_dataset",
+                side_effect=[[], [], self.mixture_rows],
             ):
                 with self.assertRaises(RuntimeError):
                     build_tulu3_safety_v2_records(output_path=output_path)
