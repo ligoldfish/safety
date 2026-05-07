@@ -339,6 +339,27 @@ class Tulu3SafetyV2Tests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     build_tulu3_safety_v2_records(output_path=output_path)
 
+    def test_v2_builder_unwraps_datasetdict_shape(self) -> None:
+        # HF returns a DatasetDict (a dict subclass) when ``split=`` is
+        # not passed. Iterating a dict yields keys (strs), not rows, so
+        # the builder must unwrap to the first split before iterating.
+        wgm_dict = {"train": self.wgm_rows}
+        wjb_dict = {"train": self.wjb_rows}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "tulu3v2.jsonl"
+            with mock.patch.object(
+                safety_datasets,
+                "_load_dataset",
+                side_effect=[wgm_dict, wjb_dict, self.mixture_rows],
+            ):
+                records = build_tulu3_safety_v2_records(
+                    output_path=output_path,
+                    helpful_max_samples=2,
+                )
+        ids = {r["id"] for r in records}
+        self.assertIn("wgm-harmful", ids)
+        self.assertIn("wjb-adv-harmful", ids)
+
 
 class SafetyDatasetRegistryTests(unittest.TestCase):
     def test_v2_in_registry(self) -> None:

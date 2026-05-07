@@ -270,10 +270,19 @@ def _build_v2_record(
 
 
 def _iter_dataset_rows(loaded: Any) -> Iterable[Dict[str, Any]]:
-    """Iterate either a HF Dataset or a DatasetDict's first split."""
+    """Iterate either a HF Dataset or a DatasetDict's first split.
 
-    if hasattr(loaded, "keys") and not hasattr(loaded, "__iter__"):
-        loaded = loaded[next(iter(loaded.keys()))]
+    HF ``load_dataset`` returns a ``DatasetDict`` (a dict subclass keyed
+    by split name) when ``split=`` is omitted. ``DatasetDict`` is itself
+    iterable, but iteration yields split names (strs), not rows. A plain
+    HF ``Dataset`` is not a dict subclass, so ``isinstance(..., dict)``
+    cleanly separates the two cases.
+    """
+
+    if isinstance(loaded, dict):
+        keys = list(loaded.keys())
+        if keys:
+            return loaded[keys[0]]
     return loaded
 
 
