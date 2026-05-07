@@ -104,8 +104,35 @@ def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSp
         include_harmless_contrast=bool(safety_cfg.include_harmless_contrast),
         harmless_file_name=safety_cfg.harmless_file_name or "alpaca_small.json",
         dedup_prompts=bool(safety_cfg.dedup_prompts),
+        label_strategy=safety_cfg.label_strategy or "category_any",
+        helpful_sources=list(safety_cfg.helpful_sources) or None,
+        helpful_max_samples=(
+            int(safety_cfg.helpful_max_samples)
+            if safety_cfg.helpful_max_samples
+            else None
+        ),
     )
     return spec, kind
+
+
+def _summarize_labels(jsonl_path: Path) -> dict:
+    counts: dict[str, int] = {}
+    total = 0
+    if not jsonl_path.exists():
+        return {"total": 0, "by_label": counts}
+    with jsonl_path.open(encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            label = str(row.get("label", "")).lower()
+            counts[label] = counts.get(label, 0) + 1
+            total += 1
+    return {"total": total, "by_label": counts}
 
 
 def main() -> None:
@@ -119,6 +146,7 @@ def main() -> None:
         "dataset_name": spec.name,
         "output_path": str(output_path),
         "force_rebuild": spec.force_rebuild,
+        "labels": _summarize_labels(output_path),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

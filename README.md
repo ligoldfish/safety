@@ -261,3 +261,44 @@ D:\Anaconda3\envs\pytorch-cpu\python.exe D:\safety\scripts\12_eval_baseline_suit
   --adapter-checkpoint D:\safety\outputs\baselines\distill_qwen35_9b_to_08b\checkpoints\epoch_001.pt `
   --output-dir D:\safety\outputs\baselines\distill_qwen35_9b_to_08b\eval_suite
 ```
+
+## Round 2 caveats — in-domain contrast & data independence
+
+Round 1 outputs (`outputs_v1/`) showed cross-corpus contamination on every
+non-PAN safety baseline. The contrast subspace was being trained on
+"baseline-style harmful vs PAN-style harmless" rather than on a true
+in-domain harmful/harmless distinction. Round 2 fixes:
+
+- **PhaseF LoRA capacity**: rank 8 → 16, alpha 32, target_modules now also
+  include `mlp.gate_proj`, epochs 3 → 2. See `configs/qwen35_08b_phaseF_*.yaml`.
+- **No PAN harmless injection in safety-full**: `scripts/20_split_safety_for_semalign.py`
+  now defaults to `--harmless-source auto`, which **requires** the safety
+  JSONL to already carry harmless rows. The legacy PAN injection lives
+  behind `--harmless-source pan`.
+- **BeaverTails**: prompt-level labels via the `category` dict (any True →
+  harmful) instead of the response-level `is_safe` flag. Set
+  `data.safety_dataset.label_strategy: category_any` (now the default in
+  shipped configs).
+- **Tülu 3 (`tulu3_safety_v2`)**: harmful side keeps the raw
+  `prompt_harm_label` / `data_type` mapping; harmless side mixes in the
+  personahub helpful slices (`personahub_math_v5_regen_149960`,
+  `tulu_v3.9_open_math_2_gsm8k_50k`) sampled from the same
+  `allenai/tulu-3-sft-mixture` train split. CoCoNot contrast is **not**
+  fused into the train set; it stays as a separate over-refusal eval
+  signal.
+- **Safety-Tuned LLaMAs**: training and eval both pull `alpaca_small.json`
+  as the harmless half via `include_harmless_contrast: true`. PAN harmless
+  is never injected into STL experiments.
+- **Phase 1 alignment**: with `--harmless-source auto`, the PhaseE residual
+  subspace is extracted on the same in-domain harmful/harmless contrast
+  that downstream evaluation sees.
+
+Regenerate caches after pulling Round 2 changes:
+
+```powershell
+python scripts/19_prepare_safety_data.py --config configs/baseline_sft_qwen35_08b_tulu3_safety_npu.yaml --force-rebuild
+python scripts/19_prepare_safety_data.py --config configs/baseline_sft_qwen35_08b_beavertails_npu.yaml --force-rebuild
+python scripts/19_prepare_safety_data.py --config configs/baseline_sft_qwen35_08b_safety_tuned_llamas_npu.yaml --force-rebuild
+python scripts/21_build_baseline_eval_jsonls.py --baseline all --force-rebuild
+```
+

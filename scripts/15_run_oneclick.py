@@ -809,6 +809,8 @@ def _run_safety_full(
             str(safety_processed_dir),
             "--pan-processed-dir",
             str(pan_processed_dir),
+            "--harmless-source",
+            "auto",
         ],
         dry_run=dry_run,
         env_overrides=env_overrides,

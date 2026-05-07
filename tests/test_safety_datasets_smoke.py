@@ -163,6 +163,8 @@ class SafetyTunedLlamasTests(unittest.TestCase):
             self.assertEqual(len(records[1]["messages"]), 2)
             self.assertEqual(records[1]["target_response"], "A fairy tale begins.")
             self.assertEqual(records[0]["dataset"], "safety_tuned_llamas")
+            # Round 2: STL safety records are tagged ``harmful`` directly.
+            self.assertEqual(records[0]["label"], "harmful")
 
 
 # ---------------------------------------------------------------------------
@@ -196,17 +198,26 @@ class BeaverTailsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "bt.jsonl"
             with mock.patch.object(safety_datasets, "_load_dataset", return_value=self.rows):
+                # Round 2 default: category_any -> binary harmful/harmless.
                 records = build_beavertails_records(output_path=output_path)
             self.assertEqual(len(records), 2)
             safe_record, unsafe_record = records
             self.assertTrue(safe_record["is_safe"])
             self.assertEqual(safe_record["target_response"], "Boil water, add salt and pasta...")
             self.assertEqual(safe_record["messages"][-1]["role"], "user")
+            self.assertEqual(safe_record["label"], "harmless")
             self.assertFalse(unsafe_record["is_safe"])
             self.assertEqual(unsafe_record["target_response"], DEFAULT_SAFETY_REFUSAL_TEMPLATE)
             self.assertEqual(unsafe_record["messages"][-1]["role"], "user")
             self.assertEqual(unsafe_record["original_response"], "Sure, here's how...")
-            self.assertEqual(unsafe_record["label"], "beavertails_unsafe")
+            self.assertEqual(unsafe_record["label"], "harmful")
+            # Legacy strategy still accessible for back-compat eval.
+            with mock.patch.object(safety_datasets, "_load_dataset", return_value=self.rows):
+                legacy_records = build_beavertails_records(
+                    output_path=output_path,
+                    label_strategy="is_safe",
+                )
+            self.assertEqual([r["label"] for r in legacy_records], ["harmless", "harmful"])
 
     def test_split_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -215,6 +226,8 @@ class BeaverTailsTests(unittest.TestCase):
                 build_beavertails_records(output_path=output_path, split="invalid_split")
 
     def test_dedup_prompts_default_drops_duplicates(self) -> None:
+        # dedup is orthogonal to label semantics; use is_safe strategy so
+        # the test fixture stays minimal (no need for category dicts).
         rows = [
             {"prompt": "same prompt", "response": "ok", "is_safe": True},
             {"prompt": "same prompt", "response": "bad", "is_safe": False},
@@ -223,7 +236,9 @@ class BeaverTailsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "bt.jsonl"
             with mock.patch.object(safety_datasets, "_load_dataset", return_value=rows):
-                records = build_beavertails_records(output_path=output_path)
+                records = build_beavertails_records(
+                    output_path=output_path, label_strategy="is_safe"
+                )
         self.assertEqual(len(records), 2)
         prompts = [r["messages"][-1]["content"] for r in records]
         self.assertEqual(len(set(prompts)), 2)
@@ -237,7 +252,9 @@ class BeaverTailsTests(unittest.TestCase):
             output_path = Path(tmpdir) / "bt.jsonl"
             with mock.patch.object(safety_datasets, "_load_dataset", return_value=rows):
                 records = build_beavertails_records(
-                    output_path=output_path, dedup_prompts=False
+                    output_path=output_path,
+                    dedup_prompts=False,
+                    label_strategy="is_safe",
                 )
         self.assertEqual(len(records), 2)
 
@@ -286,12 +303,13 @@ class SafetyTunedLlamasContrastTests(unittest.TestCase):
             )
         labels = [r["label"] for r in records]
         datasets = [r["dataset"] for r in records]
-        self.assertIn("safety_tuned_llamas", labels)
-        self.assertIn("safety_tuned_llamas_harmless", labels)
+        # Round 2: STL emits binary harmful/harmless labels so 20_split
+        # recognizes both poles without PAN injection. Provenance moved
+        # to the dataset field.
+        self.assertEqual(sum(label == "harmful" for label in labels), 1)
+        self.assertEqual(sum(label == "harmless" for label in labels), 2)
         self.assertIn("safety_tuned_llamas_harmless", datasets)
-        # Harmful exactly 1, harmless exactly 2.
-        self.assertEqual(sum(label == "safety_tuned_llamas" for label in labels), 1)
-        self.assertEqual(sum(label == "safety_tuned_llamas_harmless" for label in labels), 2)
+        self.assertIn("safety_tuned_llamas", datasets)
 
     def test_missing_alpaca_small_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -432,8 +450,9 @@ class ConfigWiringSmokeTests(unittest.TestCase):
     def test_factory_constructs_three_specs(self) -> None:
         from src.baselines import load_sft_config
 
+        # Round 2: tulu3 SFT YAML now points at the v2 builder.
         configs = {
-            "tulu3_safety": "configs/baseline_sft_qwen35_08b_tulu3_safety.yaml",
+            "tulu3_safety_v2": "configs/baseline_sft_qwen35_08b_tulu3_safety.yaml",
             "safety_tuned_llamas": "configs/baseline_sft_qwen35_08b_safety_tuned_llamas.yaml",
             "beavertails": "configs/baseline_sft_qwen35_08b_beavertails.yaml",
         }

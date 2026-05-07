@@ -89,6 +89,20 @@ def parse_args() -> argparse.Namespace:
         default="You are a helpful assistant.",
         help="System prompt expected by Phase 1 record schema.",
     )
+    parser.add_argument(
+        "--harmless-source",
+        choices=("auto", "in_domain", "pan", "none"),
+        default="auto",
+        help=(
+            "Where the harmless half of the SemAlign contrast set comes from. "
+            "auto (default): require the safety JSONL to already carry harmless "
+            "rows (Round 2 strict in-domain mode). "
+            "in_domain: same as auto but never injects PAN. "
+            "pan: legacy fallback that injects PAN alignment_set harmless when "
+            "the JSONL is single-pole. "
+            "none: trust the caller (skip injection even when no harmless rows)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -137,9 +151,17 @@ def _normalize_record(
 
 
 def _label_safety_record(record: Dict[str, Any]) -> str:
-    """BeaverTails carries an explicit ``is_safe`` flag; everything else
-    is treated as harmful (jailbreak / safety SFT prompts)."""
+    """Resolve a record's binary harmful/harmless label.
 
+    Round 2: builders that already emit ``label`` in {harmful, harmless}
+    pass through unchanged. BeaverTails legacy rows still rely on the
+    response-level ``is_safe`` flag. Everything else falls back to
+    ``harmful`` (jailbreak / safety SFT prompts without metadata).
+    """
+
+    raw = str(record.get("label", "")).strip().lower()
+    if raw in {"harmful", "harmless"}:
+        return raw
     if "is_safe" in record:
         return "harmless" if bool(record["is_safe"]) else "harmful"
     return "harmful"
@@ -219,12 +241,27 @@ def main() -> None:
             "a SemAlign contrast set."
         )
 
-    if not has_harmless:
-        injected = _load_pan_harmless_records(
-            pan_processed_dir,
-            system_prompt=args.system_prompt,
-        )
-        safety_records.extend(injected)
+    harmless_source = args.harmless_source
+    if harmless_source in {"auto", "in_domain"}:
+        if not has_harmless:
+            raise RuntimeError(
+                "Safety JSONL has no harmless records and --harmless-source="
+                f"{harmless_source}. Provide in-domain harmless via the builder "
+                "(e.g. tulu3_safety_v2 helpful slice, BeaverTails category_any "
+                "labeling, STL include_harmless_contrast=True), or pass "
+                "--harmless-source=pan for legacy PAN injection."
+            )
+    elif harmless_source == "pan":
+        if not has_harmless:
+            injected = _load_pan_harmless_records(
+                pan_processed_dir,
+                system_prompt=args.system_prompt,
+            )
+            safety_records.extend(injected)
+    elif harmless_source == "none":
+        pass
+    else:  # pragma: no cover -- argparse choices guard this
+        raise ValueError(f"Unknown --harmless-source: {harmless_source!r}")
 
     rng = random.Random(int(args.seed))
     rng.shuffle(safety_records)

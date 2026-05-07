@@ -18,6 +18,11 @@ data:
     name: safety_tuned_llamas
     repo_or_data_path: ../external/safety-tuned-llamas
     file_name: safety_only_data_Instructions.json
+    # Round 2: STL training mixes alpaca_small.json as harmless contrast
+    # so 20_split never falls back to PAN injection (which contaminates
+    # the in-domain residual subspace with PAN style).
+    include_harmless_contrast: true
+    harmless_file_name: alpaca_small.json
     force_rebuild: false
 lora:
   rank: 8

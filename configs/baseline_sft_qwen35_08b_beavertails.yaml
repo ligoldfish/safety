@@ -21,6 +21,10 @@ data:
     refusal_template: I can't help with requests that could cause harm or enable unsafe
       behavior. If your goal is legitimate or safety-related, I can help with a safer
       alternative, prevention guidance, or high-level information.
+    # Round 2: prompt-level labels via BT category dict (any True -> harmful)
+    # so 20_split sees both poles in-domain and never injects PAN harmless.
+    label_strategy: category_any
+    dedup_prompts: true
     force_rebuild: false
 lora:
   rank: 8

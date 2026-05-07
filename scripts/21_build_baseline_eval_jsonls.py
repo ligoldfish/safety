@@ -145,6 +145,7 @@ def _build_beavertails_test(
             split="30k_train",
             cache_dir=cache_dir,
             dedup_prompts=True,
+            label_strategy="category_any",
         )
 
     held_out = [r for r in all_records if r["id"] not in train_ids]
@@ -159,14 +160,20 @@ def _build_beavertails_test(
 
     eval_records: List[Dict[str, Any]] = []
     for r in sliced:
-        is_safe = bool(r.get("is_safe", False))
+        label = str(r.get("label", "")).lower()
+        if label not in {"harmful", "harmless"}:
+            # Builder under category_any always emits harmful/harmless;
+            # fall back to is_safe flip just in case the strategy was
+            # toggled via env override.
+            label = "harmless" if bool(r.get("is_safe", False)) else "harmful"
         eval_records.append(
             {
                 "id": f"bt_test_{r['id']}",
-                "label": "harmless" if is_safe else "harmful",
+                "label": label,
                 "messages": list(r["messages"]),
                 "source": r.get("source"),
-                "is_safe": is_safe,
+                "is_safe": bool(r.get("is_safe", False)),
+                "category": r.get("category"),
             }
         )
     write_jsonl(out, eval_records)
@@ -338,12 +345,22 @@ def main() -> None:
 
         rows = read_jsonl(written)
         labels = [str(row.get("label", "")) for row in rows]
-        summary["outputs"][baseline] = {
+        out_entry: Dict[str, Any] = {
             "path": str(written.resolve()),
             "n_records": len(rows),
             "n_harmful": sum(1 for label in labels if label == "harmful"),
             "n_harmless": sum(1 for label in labels if label == "harmless"),
         }
+        if baseline == "tulu3_safety":
+            buckets: Dict[str, Dict[str, int]] = {}
+            for row in rows:
+                bucket = str(row.get("source", "")) or "unknown"
+                label = str(row.get("label", ""))
+                buckets.setdefault(bucket, {"harmful": 0, "harmless": 0})
+                if label in buckets[bucket]:
+                    buckets[bucket][label] += 1
+            out_entry["n_by_source"] = buckets
+        summary["outputs"][baseline] = out_entry
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

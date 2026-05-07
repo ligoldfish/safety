@@ -20,6 +20,7 @@ Supported training corpora (see plan):
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -39,6 +40,27 @@ DEFAULT_TULU3_SAFETY_SOURCES: Tuple[str, ...] = (
     "ai2-adapt-dev/tulu_v3.9_wildjailbreak",
     "ai2-adapt-dev/coconot_converted",
 )
+
+# Round 2: helpful slices used as in-domain harmless contrast for the
+# tulu3_safety_v2 corpus. Both come from the same ``allenai/tulu-3-sft-mixture``
+# train split, identified via the ``source`` field.
+DEFAULT_TULU3_HELPFUL_SOURCES: Tuple[str, ...] = (
+    "ai2-adapt-dev/personahub_math_v5_regen_149960",
+    "ai2-adapt-dev/tulu_v3.9_open_math_2_gsm8k_50k",
+)
+
+# WildJailbreak ``data_type`` -> binary harmful/harmless mapping for the v2
+# Tülu3 builder. ``adversarial_*`` framings are styling, not content; the
+# benign content stays harmless.
+WILDJAILBREAK_HARMFUL_DATA_TYPES: frozenset[str] = frozenset(
+    {"vanilla_harmful", "adversarial_harmful"}
+)
+WILDJAILBREAK_HARMLESS_DATA_TYPES: frozenset[str] = frozenset(
+    {"vanilla_benign", "adversarial_benign"}
+)
+# WildGuardMix ``prompt_harm_label`` mapping.
+WILDGUARDMIX_HARMFUL_LABELS: frozenset[str] = frozenset({"harmful"})
+WILDGUARDMIX_HARMLESS_LABELS: frozenset[str] = frozenset({"unharmful"})
 
 DEFAULT_SAFETY_TUNED_LLAMAS_FILE = "safety_only_data_Instructions.json"
 SAFETY_TUNED_LLAMAS_REPO_URL = "https://github.com/vinid/safety-tuned-llamas"
@@ -69,6 +91,13 @@ class SafetyDatasetSpec:
     # BeaverTails de-duplication: 30k_train ships multiple is_safe-tagged
     # responses per prompt which inflates class imbalance after binary mapping.
     dedup_prompts: bool = True
+    # BeaverTails label assignment. Round 2: prompt-level via the
+    # ``category`` dict (any True -> harmful) is the new default; ``is_safe``
+    # is response-level and biases toward the majority refusal style.
+    label_strategy: str = "category_any"
+    # Tülu3 v2: helpful slices to mix in as in-domain harmless contrast.
+    helpful_sources: Optional[List[str]] = None
+    helpful_max_samples: Optional[int] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -194,6 +223,161 @@ def build_tulu3_safety_records(
 
 
 # ---------------------------------------------------------------------------
+# Tülu 3 safety v2 (Round 2): raw harmful/harmless labels + personahub helpful
+# ---------------------------------------------------------------------------
+
+
+def _classify_wildjailbreak_data_type(value: str) -> Optional[str]:
+    text = (value or "").strip().lower()
+    if text in WILDJAILBREAK_HARMFUL_DATA_TYPES:
+        return "harmful"
+    if text in WILDJAILBREAK_HARMLESS_DATA_TYPES:
+        return "harmless"
+    return None
+
+
+def _classify_wildguardmix_label(value: str) -> Optional[str]:
+    text = (value or "").strip().lower()
+    if text in WILDGUARDMIX_HARMFUL_LABELS:
+        return "harmful"
+    if text in WILDGUARDMIX_HARMLESS_LABELS:
+        return "harmless"
+    return None
+
+
+def build_tulu3_safety_v2_records(
+    *,
+    output_path: str | Path,
+    source_name: str = "allenai/tulu-3-sft-mixture",
+    split: str = "train",
+    cache_dir: Optional[str] = None,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    helpful_sources: Sequence[str] = DEFAULT_TULU3_HELPFUL_SOURCES,
+    helpful_max_samples: Optional[int] = None,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """Build the Tülu3 safety v2 corpus (Round 2 contrast).
+
+    Differs from :func:`build_tulu3_safety_records` in two ways:
+
+    1. WildGuardMix and WildJailbreak rows keep their **raw** harmful /
+       harmless labels (``prompt_harm_label`` / ``data_type``) rather than
+       being collapsed to a single ``tulu3_safety`` tag.
+    2. Helpful in-domain harmless contrast is mixed in from the same
+       ``allenai/tulu-3-sft-mixture`` train split via ``helpful_sources``
+       (default: personahub_math + open_math_2_gsm8k). This replaces the
+       previous PAN-harmless cross-corpus injection that 20_split fell back
+       to when every Tülu3 row was tagged ``harmful``.
+
+    CoCoNot-converted rows are intentionally excluded from this builder;
+    they are kept in :func:`load_coconot_contrast` as a separate
+    over-refusal eval signal.
+
+    ``helpful_max_samples`` caps the personahub side. ``None`` (default)
+    means: take min(n_personahub_seen, n_harmful) so the harmless and
+    harmful halves stay balanced.
+    """
+
+    accepted_safety = {
+        "ai2-adapt-dev/tulu_v3.9_wildguardmix",
+        "ai2-adapt-dev/tulu_v3.9_wildjailbreak",
+    }
+    accepted_helpful = {str(value) for value in helpful_sources}
+    if not accepted_helpful:
+        raise ValueError("`helpful_sources` must list at least one helpful slice")
+
+    dataset = _load_dataset(source_name, split=split, cache_dir=cache_dir)
+    safety_records: List[Dict[str, Any]] = []
+    helpful_pool: List[Dict[str, Any]] = []
+
+    for index, row in enumerate(dataset):
+        row_source = str(row.get("source", "")).strip()
+        if row_source not in accepted_safety and row_source not in accepted_helpful:
+            continue
+
+        messages = _coerce_messages(row.get("messages") or [])
+        if not messages:
+            continue
+        messages = _ensure_system_prompt(messages, system_prompt=system_prompt)
+        prompt_messages, target_response = _split_prompt_messages_and_target(messages)
+        if not target_response:
+            continue
+
+        if row_source == "ai2-adapt-dev/tulu_v3.9_wildguardmix":
+            raw_label = str(row.get("prompt_harm_label", "")).strip()
+            mapped = _classify_wildguardmix_label(raw_label)
+            if mapped is None:
+                continue
+            record = {
+                "id": str(row.get("id") or f"tulu3v2_wgm_{index:08d}"),
+                "messages": prompt_messages,
+                "target_response": target_response,
+                "label": mapped,
+                "raw_label": raw_label,
+                "source": row_source,
+                "dataset": "tulu3_safety_v2",
+            }
+            safety_records.append(record)
+        elif row_source == "ai2-adapt-dev/tulu_v3.9_wildjailbreak":
+            raw_label = str(row.get("data_type", "")).strip()
+            mapped = _classify_wildjailbreak_data_type(raw_label)
+            if mapped is None:
+                continue
+            record = {
+                "id": str(row.get("id") or f"tulu3v2_wjb_{index:08d}"),
+                "messages": prompt_messages,
+                "target_response": target_response,
+                "label": mapped,
+                "raw_label": raw_label,
+                "source": row_source,
+                "dataset": "tulu3_safety_v2",
+            }
+            safety_records.append(record)
+        elif row_source in accepted_helpful:
+            helpful_pool.append(
+                {
+                    "id": str(row.get("id") or f"tulu3v2_helpful_{index:08d}"),
+                    "messages": prompt_messages,
+                    "target_response": target_response,
+                    "label": "harmless",
+                    "raw_label": "personahub_helpful",
+                    "source": row_source,
+                    "dataset": "tulu3_safety_v2",
+                }
+            )
+
+    if not safety_records:
+        raise RuntimeError(
+            "tulu3_safety_v2 produced zero WildGuardMix / WildJailbreak records — "
+            "check that prompt_harm_label / data_type fields are present in the "
+            f"mixture rows of {source_name}."
+        )
+
+    n_harmful = sum(1 for record in safety_records if record["label"] == "harmful")
+    n_harmless_safety = sum(
+        1 for record in safety_records if record["label"] == "harmless"
+    )
+    if helpful_max_samples is None:
+        # Default: top up helpful slice only as much as needed so the
+        # harmless half (WildGuardMix unharmful + WildJailbreak benign +
+        # personahub) does not overshoot the harmful half.
+        helpful_cap = max(n_harmful - n_harmless_safety, 0)
+    else:
+        helpful_cap = max(int(helpful_max_samples), 0)
+
+    if helpful_pool and helpful_cap > 0:
+        rng = random.Random(int(seed))
+        rng.shuffle(helpful_pool)
+        helpful_records = helpful_pool[:helpful_cap]
+    else:
+        helpful_records = []
+
+    records = safety_records + helpful_records
+    write_jsonl(output_path, records)
+    return records
+
+
+# ---------------------------------------------------------------------------
 # Safety-Tuned LLaMAs
 # ---------------------------------------------------------------------------
 
@@ -284,10 +468,15 @@ def build_safety_tuned_llamas_records(
     line when present) and the assistant turn becomes ``output``.
 
     When ``include_harmless_contrast=True``, the upstream repo's
-    ``alpaca_small.json`` (general Alpaca instructions) is also loaded and
-    appended with ``label="safety_tuned_llamas_harmless"``. This gives
-    downstream binary-eval pipelines a harmless contrast signal that the
-    main safety-only file lacks.
+    ``alpaca_small.json`` (general Alpaca instructions) is also loaded
+    and appended with ``label="harmless"``. This gives downstream
+    binary-eval pipelines (and the SemAlign 20_split contrast builder) a
+    harmless contrast signal that the main safety-only file lacks.
+
+    Round 2: ``label`` is always one of ``{"harmful", "harmless"}`` so
+    ``20_split_safety_for_semalign.py`` recognizes both poles in-domain
+    without falling back to PAN harmless injection. Provenance lives on
+    the ``dataset`` field instead.
     """
 
     json_path = _resolve_safety_tuned_llamas_file(repo_or_data_path, file_name)
@@ -295,7 +484,7 @@ def build_safety_tuned_llamas_records(
         json_path,
         system_prompt=system_prompt,
         id_prefix="safety_tuned_llamas",
-        label="safety_tuned_llamas",
+        label="harmful",
         dataset="safety_tuned_llamas",
     )
 
@@ -313,7 +502,7 @@ def build_safety_tuned_llamas_records(
             harmless_path,
             system_prompt=system_prompt,
             id_prefix="safety_tuned_llamas_harmless",
-            label="safety_tuned_llamas_harmless",
+            label="harmless",
             dataset="safety_tuned_llamas_harmless",
         )
         if not harmless_records:
@@ -335,6 +524,16 @@ def build_safety_tuned_llamas_records(
 SUPPORTED_BEAVERTAILS_TRAIN_SPLITS = frozenset({"30k_train", "330k_train"})
 
 
+def _bt_label_from_category(category: Any) -> str:
+    """Round 2: prompt-level harmful when any category flag is True."""
+
+    if isinstance(category, dict) and category:
+        return "harmful" if any(bool(value) for value in category.values()) else "harmless"
+    # Missing / non-dict category -> conservative harmful (BT prompts without
+    # categories almost never appear in the 30k_train split).
+    return "harmful"
+
+
 def build_beavertails_records(
     *,
     output_path: str | Path,
@@ -344,6 +543,7 @@ def build_beavertails_records(
     cache_dir: Optional[str] = None,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     dedup_prompts: bool = True,
+    label_strategy: str = "category_any",
 ) -> List[Dict[str, Any]]:
     """Materialize a BeaverTails SFT split.
 
@@ -352,13 +552,24 @@ def build_beavertails_records(
     response. Both branches share the same ``messages`` schema.
 
     BeaverTails 30k_train ships multiple ``is_safe``-tagged responses per
-    prompt. After binary mapping (``is_safe=True → harmless``,
-    ``is_safe=False → harmful``) this inflates the harmful side and biases
-    the SemAlign safe subspace. ``dedup_prompts=True`` (default) keeps
-    only the first record per prompt; this mitigates the imbalance but
-    note that ``is_safe`` reflects RESPONSE safety, not PROMPT
-    harmlessness, so true prompt-level filtering still requires post-hoc
-    category-aware logic.
+    prompt. ``dedup_prompts=True`` (default) keeps only the first record
+    per prompt to flatten that response-level inflation.
+
+    ``label_strategy`` selects the binary label semantics:
+
+    * ``"category_any"`` (default, Round 2): prompt-level — ``harmful``
+      when any flag in the BT ``category`` dict is True, ``harmless``
+      otherwise. To prevent target/label mismatch (e.g. a benign-category
+      prompt paired with an ``is_safe=False`` unsafe response would teach
+      the model to refuse benign prompts), this strategy **drops** rows
+      where the prompt-level label disagrees with response-level
+      ``is_safe``. The kept rows have aligned signal:
+      ``(harmful, is_safe=False)`` → refusal target, and
+      ``(harmless, is_safe=True)`` → keep the original safe response.
+    * ``"is_safe"`` (legacy, Round 1): response-level — flips the upstream
+      ``is_safe`` boolean (``True → harmless``, ``False → harmful``).
+      Retained for reproducibility of older runs but biased toward refusal
+      style rather than prompt content.
     """
 
     if split not in SUPPORTED_BEAVERTAILS_TRAIN_SPLITS:
@@ -368,6 +579,11 @@ def build_beavertails_records(
         )
     if not refusal_template.strip():
         raise ValueError("`refusal_template` must be a non-empty string")
+    if label_strategy not in {"category_any", "is_safe"}:
+        raise ValueError(
+            f"Unknown label_strategy {label_strategy!r}; expected 'category_any' "
+            "or 'is_safe'."
+        )
 
     dataset = _load_dataset(source_name, split=split, cache_dir=cache_dir)
     records: List[Dict[str, Any]] = []
@@ -382,10 +598,20 @@ def build_beavertails_records(
             seen_prompts.add(prompt)
         is_safe = bool(row.get("is_safe", False))
         original_response = str(row.get("response", "")).strip()
-        assistant_text = original_response if is_safe else refusal_template
+        category = row.get("category")
+        if label_strategy == "category_any":
+            label = _bt_label_from_category(category)
+            response_label = "harmless" if is_safe else "harmful"
+            if label != response_label:
+                # BT noise: drop prompts where category-level harmfulness
+                # disagrees with response-level is_safe. Keeping these
+                # would teach the model the wrong association.
+                continue
+        else:
+            label = "harmless" if is_safe else "harmful"
+        assistant_text = original_response if label == "harmless" else refusal_template
         if not assistant_text:
             continue
-        category = row.get("category")
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
@@ -397,7 +623,8 @@ def build_beavertails_records(
             "original_response": original_response,
             "is_safe": is_safe,
             "category": category,
-            "label": "beavertails_safe" if is_safe else "beavertails_unsafe",
+            "label": label,
+            "label_strategy": label_strategy,
             "source": source_name,
             "split": split,
             "dataset": "beavertails",
@@ -458,11 +685,25 @@ def _build_beavertails(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
         cache_dir=spec.cache_dir,
         system_prompt=spec.system_prompt or DEFAULT_SYSTEM_PROMPT,
         dedup_prompts=bool(spec.dedup_prompts),
+        label_strategy=spec.label_strategy or "category_any",
+    )
+
+
+def _build_tulu3_safety_v2(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
+    return build_tulu3_safety_v2_records(
+        output_path=spec.output_path,
+        source_name=spec.source_name or "allenai/tulu-3-sft-mixture",
+        split=spec.split or "train",
+        cache_dir=spec.cache_dir,
+        system_prompt=spec.system_prompt or DEFAULT_SYSTEM_PROMPT,
+        helpful_sources=tuple(spec.helpful_sources or DEFAULT_TULU3_HELPFUL_SOURCES),
+        helpful_max_samples=spec.helpful_max_samples,
     )
 
 
 SAFETY_TRAIN_DATASETS: Dict[str, SafetyDatasetBuilder] = {
     "tulu3_safety": _build_tulu3_safety,
+    "tulu3_safety_v2": _build_tulu3_safety_v2,
     "safety_tuned_llamas": _build_safety_tuned_llamas,
     "beavertails": _build_beavertails,
 }
@@ -497,13 +738,20 @@ def materialize_safety_train_dataset(
 __all__ = [
     "DEFAULT_SAFETY_REFUSAL_TEMPLATE",
     "DEFAULT_SAFETY_TUNED_LLAMAS_FILE",
+    "DEFAULT_TULU3_HELPFUL_SOURCES",
     "DEFAULT_TULU3_SAFETY_SOURCES",
     "SAFETY_TUNED_LLAMAS_REPO_URL",
     "SAFETY_TRAIN_DATASETS",
     "SafetyDatasetSpec",
     "SUPPORTED_BEAVERTAILS_TRAIN_SPLITS",
+    "WILDGUARDMIX_HARMFUL_LABELS",
+    "WILDGUARDMIX_HARMLESS_LABELS",
+    "WILDJAILBREAK_HARMFUL_DATA_TYPES",
+    "WILDJAILBREAK_HARMLESS_DATA_TYPES",
+    "_bt_label_from_category",
     "build_beavertails_records",
     "build_safety_tuned_llamas_records",
     "build_tulu3_safety_records",
+    "build_tulu3_safety_v2_records",
     "materialize_safety_train_dataset",
 ]

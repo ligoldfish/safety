@@ -89,6 +89,12 @@ class SafetyDatasetConfig:
     harmless_file_name: str = "alpaca_small.json"
     # BeaverTails: drop duplicate prompts (multi-response per prompt).
     dedup_prompts: bool = True
+    # Round 2: BeaverTails uses category-dict prompt-level labels by
+    # default; legacy ``"is_safe"`` retained for reproducing older runs.
+    label_strategy: str = "category_any"
+    # Round 2: Tülu3 v2 helpful slices (in-domain harmless contrast).
+    helpful_sources: list[str] = field(default_factory=list)
+    helpful_max_samples: int = 0  # 0 = match harmful count automatically
 
 
 @dataclass
@@ -262,6 +268,8 @@ def _to_safety_dataset_config(raw: Dict[str, Any], base_dir: Path) -> SafetyData
         data["cache_dir"] = _resolve_path(str(data["cache_dir"]), base_dir)
     if "sources" in data and data["sources"] is not None:
         data["sources"] = [str(item) for item in data["sources"]]
+    if "helpful_sources" in data and data["helpful_sources"] is not None:
+        data["helpful_sources"] = [str(item) for item in data["helpful_sources"]]
     return SafetyDatasetConfig(**data)
 
 

@@ -26,13 +26,12 @@ data:
   val_split: ../data/processed/analysis_val_set.jsonl
   test_split: ../data/processed/pan_test_set.jsonl
   safety_dataset:
-    name: tulu3_safety
+    name: tulu3_safety_v2
     source_name: allenai/tulu-3-sft-mixture
     split: train
-    sources:
-    - ai2-adapt-dev/tulu_v3.9_wildguardmix
-    - ai2-adapt-dev/tulu_v3.9_wildjailbreak
-    - ai2-adapt-dev/coconot_converted
+    helpful_sources:
+    - ai2-adapt-dev/personahub_math_v5_regen_149960
+    - ai2-adapt-dev/tulu_v3.9_open_math_2_gsm8k_50k
     force_rebuild: false
 lora:
   rank: 8
