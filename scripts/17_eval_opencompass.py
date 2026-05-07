@@ -260,6 +260,15 @@ def main() -> None:
         str(args.batch_size),
         "--hf-num-gpus",
         str(num_gpus),
+        # Force OC LocalRunner to serialize tasks on a single accelerator. Even
+        # though OC's CLI defaults to max-num-workers=1 today, pinning these
+        # explicitly stops a future config bump or stray --extra-args from
+        # spawning multiple tasks that would each reload the model onto the
+        # same NPU/GPU and crash with OOM.
+        "--max-num-workers",
+        "1",
+        "--max-workers-per-gpu",
+        "1",
         "--work-dir",
         str(work_dir),
         "--datasets",
