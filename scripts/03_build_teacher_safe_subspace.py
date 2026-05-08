@@ -54,6 +54,24 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Subspace rank k. The proposal fixes this to 8 for stage C.",
     )
+    parser.add_argument(
+        "--balance-polarities",
+        dest="balance_polarities",
+        action="store_true",
+        default=True,
+        help=(
+            "(default ON) Downsample the larger polarity to match the smaller "
+            "before the SVD that builds the safe subspace. Prevents corpus "
+            "imbalance (e.g. BeaverTails ~1.36:1) from biasing the subspace "
+            "toward the refusal direction."
+        ),
+    )
+    parser.add_argument(
+        "--no-balance-polarities",
+        dest="balance_polarities",
+        action="store_false",
+        help="Disable pre-SVD polarity balancing (keeps the historical imbalance).",
+    )
     return parser.parse_args()
 
 
@@ -63,6 +81,44 @@ def _load_key_layers(path: Path) -> List[int]:
     if not key_layers:
         raise ValueError(f"No key layers found in: {path}")
     return key_layers
+
+
+def _balance_polarities(
+    harmful_mask: torch.Tensor,
+    harmless_mask: torch.Tensor,
+    *,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Downsample the larger polarity to match the smaller. Pure on input masks.
+
+    Uses a dedicated ``torch.Generator`` so the global RNG is unaffected.
+    Returns (new_harmful_mask, new_harmless_mask, info_dict).
+    """
+
+    n_harmful = int(harmful_mask.sum().item())
+    n_harmless = int(harmless_mask.sum().item())
+    if n_harmful == 0 or n_harmless == 0:
+        return harmful_mask, harmless_mask, {"applied": False, "reason": "empty_polarity"}
+    keep = min(n_harmful, n_harmless)
+    generator = torch.Generator().manual_seed(int(seed))
+    new_harmful = harmful_mask
+    new_harmless = harmless_mask
+    if n_harmful > keep:
+        idx = torch.nonzero(harmful_mask, as_tuple=False).flatten()
+        perm = torch.randperm(idx.numel(), generator=generator)[: idx.numel() - keep]
+        new_harmful = harmful_mask.clone()
+        new_harmful[idx[perm]] = False
+    if n_harmless > keep:
+        idx = torch.nonzero(harmless_mask, as_tuple=False).flatten()
+        perm = torch.randperm(idx.numel(), generator=generator)[: idx.numel() - keep]
+        new_harmless = harmless_mask.clone()
+        new_harmless[idx[perm]] = False
+    return new_harmful, new_harmless, {
+        "applied": True,
+        "kept_per_polarity": keep,
+        "harmful_dropped": n_harmful - keep,
+        "harmless_dropped": n_harmless - keep,
+    }
 
 
 def main() -> None:
@@ -95,8 +151,15 @@ def main() -> None:
         train_label_counts=train_split.label_counts(),
         key_layers=key_layers,
         requested_rank=int(args.rank),
+        balance_polarities=bool(args.balance_polarities),
         log_path=str(log_path),
     )
+
+    if args.balance_polarities:
+        harmful_mask, harmless_mask, balance_info = _balance_polarities(
+            harmful_mask, harmless_mask, seed=cfg.seed,
+        )
+        log_kv(logger, "subspace_balance_applied", **balance_info)
 
     n_harmful = int(harmful_mask.sum().item())
     n_harmless = int(harmless_mask.sum().item())

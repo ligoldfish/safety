@@ -158,6 +158,7 @@ class PhaseFOptimConfig:
     micro_batch_size: int = 0
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
+    sft_loss_weight: float = 1.0
     layer_loss_weight: float = 0.5
     max_length: int = 1024
     max_new_tokens: int = 256

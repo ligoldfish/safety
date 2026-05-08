@@ -70,6 +70,12 @@ SAFETY_EVAL_CONFIGS: dict[tuple[str, str, str], str] = {
     ("tpu", "0.8b", "safety_tuned_llamas"): "configs/baseline_eval_qwen35_08b_safety_tuned_llamas_tpu.yaml",
     ("npu", "0.8b", "beavertails"): "configs/baseline_eval_qwen35_08b_beavertails_npu.yaml",
     ("tpu", "0.8b", "beavertails"): "configs/baseline_eval_qwen35_08b_beavertails_tpu.yaml",
+    ("npu", "9b", "tulu3_safety"): "configs/baseline_eval_qwen35_9b_tulu3_safety_npu.yaml",
+    ("tpu", "9b", "tulu3_safety"): "configs/baseline_eval_qwen35_9b_tulu3_safety_tpu.yaml",
+    ("npu", "9b", "safety_tuned_llamas"): "configs/baseline_eval_qwen35_9b_safety_tuned_llamas_npu.yaml",
+    ("tpu", "9b", "safety_tuned_llamas"): "configs/baseline_eval_qwen35_9b_safety_tuned_llamas_tpu.yaml",
+    ("npu", "9b", "beavertails"): "configs/baseline_eval_qwen35_9b_beavertails_npu.yaml",
+    ("tpu", "9b", "beavertails"): "configs/baseline_eval_qwen35_9b_beavertails_tpu.yaml",
 }
 
 # Per-baseline external safety suites passed via --safety-eval-datasets.
@@ -213,13 +219,13 @@ def parse_args() -> argparse.Namespace:
     nosft_parser.add_argument(
         "--baseline",
         choices=["pan", *SAFETY_SFT_BASELINES, "all"],
-        default="pan",
+        default="all",
         help=(
             "Which test set to evaluate the base model on. "
-            "'pan' (default) keeps back-compat with PAN eval. "
+            "'all' (default) loops over PAN + the three safety baselines sequentially. "
+            "'pan' reproduces the pre-Round-3 single-baseline run. "
             "'tulu3_safety' / 'beavertails' / 'safety_tuned_llamas' use the "
-            "per-baseline JSONL produced by scripts/21_build_baseline_eval_jsonls.py. "
-            "'all' loops over PAN + the three safety baselines sequentially."
+            "per-baseline JSONL produced by scripts/21_build_baseline_eval_jsonls.py."
         ),
     )
     add_common_flags(nosft_parser)
@@ -383,6 +389,14 @@ def _should_run_opencompass(
     if skip_opencompass:
         print("[INFO] OpenCompass step skipped (--skip-opencompass).")
         return False
+    if not enable_opencompass and opencompass_dir and Path(opencompass_dir).expanduser().exists():
+        # Auto-enable: an existing opencompass_dir is a strong signal that the
+        # user wants the general-capability eval. Pass --skip-opencompass to opt out.
+        print(
+            f"[INFO] OpenCompass auto-enabled (opencompass-dir present: {opencompass_dir}). "
+            "Pass --skip-opencompass to opt out."
+        )
+        enable_opencompass = True
     if not enable_opencompass and not opencompass_dir:
         # Default path: OpenCompass disabled. General datasets should show up in
         # the final summary as ``disabled`` rather than as placeholders.
@@ -654,11 +668,6 @@ def _run_baseline_nosft_one(
     if baseline_name == "pan":
         eval_yaml_src = _resolve(BASELINE_EVAL_CONFIGS[(device, model_size)])
     else:
-        if model_size != "0.8b":
-            raise ValueError(
-                f"--baseline {baseline_name} only supports --model 0.8b; "
-                "per-baseline eval YAMLs only exist for the 0.8B model."
-            )
         eval_yaml_src = _resolve(_safety_eval_config(device, model_size, baseline_name))
 
     eval_config = _make_runtime_override_config(

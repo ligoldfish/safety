@@ -33,9 +33,10 @@ optim:
   epochs: 1
   batch_size: 8
   micro_batch_size: 2
-  learning_rate: 0.00005
+  learning_rate: 1.0e-06
   weight_decay: 0.0
-  layer_loss_weight: 0.5
+  sft_loss_weight: 0.8
+  layer_loss_weight: 0.2
   max_length: 1024
   max_new_tokens: 32
   log_every_steps: 1

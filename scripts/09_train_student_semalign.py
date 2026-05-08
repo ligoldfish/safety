@@ -213,6 +213,7 @@ def main() -> None:
                 device=device,
                 layer_ids=layer_ids,
                 layer_loss_weight=cfg.optim.layer_loss_weight,
+                sft_loss_weight=cfg.optim.sft_loss_weight,
             )
             microbatch_size = int(batch.input_ids.size(0))
             (loss_total / gradient_accumulation_steps).backward()
@@ -349,6 +350,7 @@ def main() -> None:
             "micro_batch_size": micro_batch_size,
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "learning_rate": cfg.optim.learning_rate,
+            "sft_loss_weight": cfg.optim.sft_loss_weight,
             "layer_loss_weight": cfg.optim.layer_loss_weight,
             "train_num_samples": len(train_dataset),
             "val_num_samples": len(val_dataset),

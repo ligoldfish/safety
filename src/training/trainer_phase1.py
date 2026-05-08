@@ -239,6 +239,7 @@ def forward_semalign_batch(
     device: torch.device,
     layer_ids: Sequence[int],
     layer_loss_weight: float,
+    sft_loss_weight: float = 1.0,
 ) -> tuple[torch.Tensor, Dict[str, float]]:
     inputs = {
         "input_ids": batch.input_ids.to(device),
@@ -266,7 +267,7 @@ def forward_semalign_batch(
     }
     loss_layer, cosine_by_layer = cosine_layer_alignment_loss(predicted_by_layer, target_by_layer)
     loss_out = outputs.loss
-    loss_total = loss_out + (layer_loss_weight * loss_layer)
+    loss_total = (sft_loss_weight * loss_out) + (layer_loss_weight * loss_layer)
     metrics = {
         "loss_total": float(loss_total.detach().cpu().item()),
         "loss_out": float(loss_out.detach().cpu().item()),

@@ -23,6 +23,7 @@ data:
       alternative, prevention guidance, or high-level information.
     label_strategy: category_any
     dedup_prompts: true
+    harmful_max_samples: 3850
     force_rebuild: false
 lora:
   rank: 8
@@ -32,7 +33,7 @@ lora:
   - self_attn.v_proj
   - self_attn.o_proj
 optim:
-  epochs: 1
+  epochs: 3
   batch_size: 32
   micro_batch_size: 1
   learning_rate: 0.0001

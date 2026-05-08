@@ -93,6 +93,9 @@ class SafetyDatasetConfig:
     # Round 2: BeaverTails uses category-dict prompt-level labels by
     # default; legacy ``"is_safe"`` retained for reproducing older runs.
     label_strategy: str = "category_any"
+    # Round 4: BT harmful cap. 0 = no cap. Used by 03_build_teacher_safe_subspace
+    # to keep the SVD from biasing toward refusal direction.
+    harmful_max_samples: int = 0
     # Round 2: Tülu3 v2 helpful slices (in-domain harmless contrast).
     helpful_sources: list[str] = field(default_factory=list)
     helpful_max_samples: int = 0  # 0 = match harmful count automatically
