@@ -58,15 +58,12 @@ def _evaluate_val_loss(
     device: torch.device,
 ) -> float:
     model.eval()
-    runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
-    xla_model = getattr(model, "_codex_xla_model", None)
     total_loss = 0.0
     total_examples = 0
     with torch.no_grad():
         for batch in dataloader:
             loss, _ = forward_supervised_batch(model, batch, device=device)
-            if runtime_backend == "tpu" and xla_model is not None:
-                xla_model.mark_step()
+            # PPU eager mode: no graph step barrier needed.
             batch_size = int(batch.input_ids.size(0))
             total_loss += float(loss.detach().cpu().item()) * batch_size
             total_examples += batch_size
@@ -153,11 +150,18 @@ def main() -> None:
         weight_decay=cfg.optim.weight_decay,
         betas=(0.9, 0.95),
     )
-    micro_batches_per_epoch = max(1, len(train_dataset) // max(int(cfg.optim.micro_batch_size or cfg.optim.batch_size), 1))
-    gradient_accumulation_steps_estimate = max(
-        1, math.ceil(int(cfg.optim.batch_size) / max(int(cfg.optim.micro_batch_size or cfg.optim.batch_size), 1))
+    micro_batches_per_epoch = max(
+        1,
+        len(train_dataset) // max(int(cfg.optim.micro_batch_size or cfg.optim.batch_size), 1),
     )
-    num_training_steps = max(1, (micro_batches_per_epoch * int(cfg.optim.epochs)) // gradient_accumulation_steps_estimate)
+    grad_accum_estimate = max(
+        1,
+        math.ceil(int(cfg.optim.batch_size) / max(int(cfg.optim.micro_batch_size or cfg.optim.batch_size), 1)),
+    )
+    num_training_steps = max(
+        1,
+        (micro_batches_per_epoch * int(cfg.optim.epochs)) // grad_accum_estimate,
+    )
     warmup_ratio = float(getattr(cfg.optim, "warmup_ratio", 0.0) or 0.0)
     num_warmup_steps = max(0, int(warmup_ratio * num_training_steps))
     scheduler_kind = str(getattr(cfg.optim, "lr_scheduler", "constant") or "constant").strip().lower()
@@ -192,7 +196,6 @@ def main() -> None:
 
     device = _resolve_device(model)
     runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
-    xla_model = getattr(model, "_codex_xla_model", None)
 
     log_kv(
         logger,
@@ -244,13 +247,8 @@ def main() -> None:
                         [p for p in model.parameters() if p.requires_grad],
                         max_grad_norm,
                     )
-                if runtime_backend == "tpu":
-                    if xla_model is None:
-                        raise RuntimeError("TPU backend requested but torch_xla runtime is unavailable on the model.")
-                    xla_model.optimizer_step(optimizer, barrier=True)
-                    xla_model.mark_step()
-                else:
-                    optimizer.step()
+                # PPU and NPU both run eager mode -> standard optimizer.step().
+                optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -262,7 +260,6 @@ def main() -> None:
                 accumulation_loss = 0.0
 
                 if global_step % cfg.optim.log_every_steps == 0:
-                    current_lr = float(optimizer.param_groups[0]["lr"])
                     write_train_metric(
                         train_metrics_path,
                         {
@@ -270,7 +267,7 @@ def main() -> None:
                             "epoch": epoch,
                             "batch": batch_idx,
                             "loss_total": averaged_loss,
-                            "learning_rate": current_lr,
+                            "learning_rate": cfg.optim.learning_rate,
                             "effective_batch_size": cfg.optim.batch_size,
                             "micro_batch_size": micro_batch_size,
                             "gradient_accumulation_steps": gradient_accumulation_steps,

@@ -188,7 +188,7 @@ class OneClickConfigSmokeTests(unittest.TestCase):
     def test_08b_eval_uses_dedicated_08b_entrypoints(self):
         expected = {
             ("npu", "0.8b"): PROJECT_ROOT / "configs" / "baseline_eval_qwen35_08b_npu.yaml",
-            ("tpu", "0.8b"): PROJECT_ROOT / "configs" / "baseline_eval_qwen35_08b_tpu.yaml",
+            ("ppu", "0.8b"): PROJECT_ROOT / "configs" / "baseline_eval_qwen35_08b_ppu.yaml",
         }
         for key, path in expected.items():
             self.assertIn(key, self.module.BASELINE_EVAL_CONFIGS)
@@ -198,9 +198,9 @@ class OneClickConfigSmokeTests(unittest.TestCase):
             set(self.module.BASELINE_EVAL_CONFIGS),
             {
                 ("npu", "0.8b"),
-                ("tpu", "0.8b"),
+                ("ppu", "0.8b"),
                 ("npu", "9b"),
-                ("tpu", "9b"),
+                ("ppu", "9b"),
             },
         )
 

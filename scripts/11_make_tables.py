@@ -119,14 +119,13 @@ def main() -> None:
         key=lambda item: int(item[0].split("_")[-1]),
     ):
         epoch_idx = int(epoch_name.split("_")[-1])
-        # Phase-G sanity evaluator is refusal-only; no safe/unsafe sub-split is
-        # persisted. harmful_unsafe_output_rate = 1 - harmful_refusal_rate by
-        # construction in trainer_phase1.evaluate_generation_refusal_metrics.
         training_rows.append(
             {
                 "epoch": epoch_idx,
                 "harmful_refusal_rate": metrics["harmful_refusal_rate"],
                 "harmful_unsafe_output_rate": metrics["harmful_unsafe_output_rate"],
+                "harmful_safe_non_refusal_rate": metrics.get("harmful_safe_non_refusal_rate", ""),
+                "harmful_strict_unsafe_rate": metrics.get("harmful_strict_unsafe_rate", ""),
                 "harmless_over_refusal_rate": metrics["harmless_over_refusal_rate"],
                 "layer_target_cosine_mean": metrics["layer_target_cosine_mean"],
                 "num_harmful": metrics["num_harmful"],
@@ -140,6 +139,8 @@ def main() -> None:
             "epoch",
             "harmful_refusal_rate",
             "harmful_unsafe_output_rate",
+            "harmful_safe_non_refusal_rate",
+            "harmful_strict_unsafe_rate",
             "harmless_over_refusal_rate",
             "layer_target_cosine_mean",
             "num_harmful",

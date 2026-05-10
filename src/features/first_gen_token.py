@@ -87,10 +87,7 @@ def gather_first_generated_token_representations(
         output_hidden_states=True,
         return_dict=True,
     )
-    runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
-    xla_model = getattr(model, "_codex_xla_model", None)
-    if runtime_backend == "tpu" and xla_model is not None:
-        xla_model.mark_step()
+    # PPU/NPU eager mode: no XLA graph step required.
     layer_hiddens = extract_last_position_hidden(
         hidden_states=outputs.hidden_states,
         attention_mask=encoded["attention_mask"],

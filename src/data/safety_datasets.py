@@ -96,10 +96,6 @@ class SafetyDatasetSpec:
     # ``category`` dict (any True -> harmful) is the new default; ``is_safe``
     # is response-level and biases toward the majority refusal style.
     label_strategy: str = "category_any"
-    # BeaverTails harmful cap. Round 4: caps the harmful pole post-dedup so
-    # the SVD that builds the safe subspace is not biased toward refusal by
-    # the corpus's natural ~1.36:1 harmful:harmless ratio.
-    harmful_max_samples: Optional[int] = None
     # Tülu3 v2: helpful slices to mix in as in-domain harmless contrast.
     helpful_sources: Optional[List[str]] = None
     helpful_max_samples: Optional[int] = None
@@ -734,8 +730,6 @@ def build_beavertails_records(
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     dedup_prompts: bool = True,
     label_strategy: str = "category_any",
-    harmful_max_samples: Optional[int] = None,
-    seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """Materialize a BeaverTails SFT split.
 
@@ -828,21 +822,6 @@ def build_beavertails_records(
             f"BeaverTails {split} produced zero usable records from {source_name}."
         )
 
-    if harmful_max_samples is not None and harmful_max_samples > 0:
-        harmful_records = [rec for rec in records if rec["label"] == "harmful"]
-        harmless_records = [rec for rec in records if rec["label"] == "harmless"]
-        if len(harmful_records) > harmful_max_samples:
-            cap_rng = random.Random(seed)
-            cap_rng.shuffle(harmful_records)
-            dropped = len(harmful_records) - harmful_max_samples
-            harmful_records = harmful_records[:harmful_max_samples]
-            print(
-                f"[bt] harmful_max_samples cap dropped {dropped} harmful rows "
-                f"(kept {harmful_max_samples}, harmless={len(harmless_records)})"
-            )
-        records = harmless_records + harmful_records
-        records.sort(key=lambda rec: rec["id"])
-
     write_jsonl(output_path, records)
     return records
 
@@ -895,8 +874,6 @@ def _build_beavertails(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
         system_prompt=spec.system_prompt or DEFAULT_SYSTEM_PROMPT,
         dedup_prompts=bool(spec.dedup_prompts),
         label_strategy=spec.label_strategy or "category_any",
-        harmful_max_samples=spec.harmful_max_samples,
-        seed=int(spec.seed),
     )
 
 

@@ -64,8 +64,6 @@ def _evaluate_val_distill_loss(
 ) -> dict[str, float]:
     student_model.eval()
     teacher_model.eval()
-    runtime_backend = str(getattr(student_model, "_codex_runtime_backend", "")).lower()
-    xla_model = getattr(student_model, "_codex_xla_model", None)
     total_examples = 0
     total_loss = 0.0
     total_hard = 0.0
@@ -82,8 +80,6 @@ def _evaluate_val_distill_loss(
                 hard_loss_weight=hard_loss_weight,
                 soft_loss_weight=soft_loss_weight,
             )
-            if runtime_backend == "tpu" and xla_model is not None:
-                xla_model.mark_step()
             batch_size = int(batch.input_ids.size(0))
             total_examples += batch_size
             total_loss += float(loss_total.detach().cpu().item()) * batch_size
@@ -187,7 +183,10 @@ def main() -> None:
         weight_decay=cfg.optim.weight_decay,
         betas=(0.9, 0.95),
     )
-    num_training_steps = max(1, (len(train_loader) * int(cfg.optim.epochs)) // gradient_accumulation_steps)
+    num_training_steps = max(
+        1,
+        (len(train_loader) * int(cfg.optim.epochs)) // gradient_accumulation_steps,
+    )
     warmup_ratio = float(getattr(cfg.optim, "warmup_ratio", 0.0) or 0.0)
     num_warmup_steps = max(0, int(warmup_ratio * num_training_steps))
     scheduler_kind = str(getattr(cfg.optim, "lr_scheduler", "constant") or "constant").strip().lower()
@@ -295,13 +294,8 @@ def main() -> None:
                         [p for p in student_model.parameters() if p.requires_grad],
                         max_grad_norm,
                     )
-                if student_runtime_backend == "tpu":
-                    if student_xla_model is None:
-                        raise RuntimeError("TPU backend requested but torch_xla runtime is unavailable on the student model.")
-                    student_xla_model.optimizer_step(optimizer, barrier=True)
-                    student_xla_model.mark_step()
-                else:
-                    optimizer.step()
+                # PPU and NPU both run eager mode -> standard optimizer.step().
+                optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -317,7 +311,6 @@ def main() -> None:
                 accumulation_soft = 0.0
 
                 if global_step % cfg.optim.log_every_steps == 0:
-                    current_lr = float(optimizer.param_groups[0]["lr"])
                     write_train_metric(
                         train_metrics_path,
                         {
@@ -327,7 +320,7 @@ def main() -> None:
                             "loss_total": averaged_total,
                             "loss_hard": averaged_hard,
                             "loss_soft": averaged_soft,
-                            "learning_rate": current_lr,
+                            "learning_rate": cfg.optim.learning_rate,
                             "effective_batch_size": cfg.optim.batch_size,
                             "micro_batch_size": micro_batch_size,
                             "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -386,7 +379,11 @@ def main() -> None:
             save_optimizer=bool(cfg.optim.save_optimizer_state),
         )
 
-        epoch_val_loss = float(val_loss_metrics.get("val_loss", val_loss_metrics.get("loss_total", float("inf"))))
+        epoch_val_loss = float(
+            val_loss_metrics.get("val_loss")
+            or val_loss_metrics.get("loss_total")
+            or float("inf")
+        )
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
             best_epoch = epoch

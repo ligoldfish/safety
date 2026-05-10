@@ -24,7 +24,7 @@ fi
 usage() {
   cat <<'EOF'
 Usage:
-  bash /root/run_experiments.sh --device <npu|tpu> --visible-devices <ids> \
+  bash /root/run_experiments.sh --device <npu|ppu> --visible-devices <ids> \
     [--opencompass-dir <path>] [--opencompass-datasets "<ds1 ds2 ...>"] [--skip-opencompass] \
     <exp1> [exp2] ...
 
@@ -103,8 +103,8 @@ parse_args() {
     exit 1
   fi
 
-  if [[ "${DEVICE}" != "npu" && "${DEVICE}" != "tpu" ]]; then
-    echo "[ERROR] --device must be npu or tpu"
+  if [[ "${DEVICE}" != "npu" && "${DEVICE}" != "ppu" ]]; then
+    echo "[ERROR] --device must be npu or ppu"
     exit 2
   fi
 }

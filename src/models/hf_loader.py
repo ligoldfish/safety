@@ -31,19 +31,19 @@ def _resolve_runtime(runtime_backend: str = "", runtime_device: str = "") -> Dic
         device = torch.device(device_name or "npu:0")
         torch.npu.set_device(device)
         return {"backend": "npu", "device": device, "xla_model": None}
-    if backend == "tpu":
-        import torch_xla.core.xla_model as xm
+    if backend == "ppu":
+        # PPU backend follows the torch_npu calling convention (eager mode +
+        # torch.<backend>.set_device). Vendor SDKs that ship as an
+        # out-of-tree extension via PyTorch's PrivateUse1 mechanism (e.g.
+        # Cambricon CATCH, Ascend torch_npu) expose torch_ppu and
+        # torch.ppu.set_device. If your PPU SDK uses a different module name
+        # or device API, adjust the two calls below.
+        import torch_ppu  # type: ignore[import-not-found]  # noqa: F401
 
-        if not device_name or device_name == "xla":
-            device = xm.xla_device()
-        elif device_name.startswith("xla:"):
-            ordinal = int(device_name.split(":", 1)[1])
-            device = xm.xla_device(ordinal)
-        else:
-            raise ValueError(
-                f"Unsupported TPU runtime device: {runtime_device}. Expected 'xla' or 'xla:<ordinal>'."
-            )
-        return {"backend": "tpu", "device": device, "xla_model": xm}
+        device = torch.device(device_name or "ppu:0")
+        if hasattr(torch, "ppu") and hasattr(torch.ppu, "set_device"):
+            torch.ppu.set_device(device)
+        return {"backend": "ppu", "device": device, "xla_model": None}
     raise ValueError(f"Unsupported runtime backend: {runtime_backend}")
 
 
@@ -85,18 +85,18 @@ def load_hf_model(
         use_fast=False,
     )
     tokenizer.padding_side = "left"
-    # Qwen3.5 chat mode terminates each turn with <|im_end|>. The base tokenizer
-    # may default eos_token_id to <|endoftext|> (151643) which never appears in
-    # rendered chat conversations -> generate() runs to max_new_tokens, training
-    # labels never contain a learnable EOS, and 12_eval_baseline_suite reports
-    # used_max_new_tokens for every sample. Force the chat-mode EOS when the
-    # tokenizer exposes <|im_end|>.
-    im_end_id = None
+    # Qwen3 chat template terminates each turn with <|im_end|>. Base tokenizer
+    # may default eos_token_id to <|endoftext|> which never appears in chat
+    # generations -> model.generate() runs to max_new_tokens, training labels
+    # contain no learnable EOS, OpenCompass HuggingFacewithChatTemplate cannot
+    # stop. Force the chat-mode EOS when the vocab exposes <|im_end|>.
+    # Reference: Qwen3 official ms-swift recipe.
+    im_end_id: int | None = None
     try:
         candidate = tokenizer.convert_tokens_to_ids("<|im_end|>")
         unk_id = getattr(tokenizer, "unk_token_id", None)
         if isinstance(candidate, int) and candidate >= 0 and candidate != unk_id:
-            im_end_id = candidate
+            im_end_id = int(candidate)
     except Exception:
         im_end_id = None
     if im_end_id is not None:
@@ -125,10 +125,10 @@ def load_hf_model(
     model = AutoModelForCausalLM.from_pretrained(model_ref, **model_kwargs)
     if runtime["device"] is not None:
         model.to(runtime["device"])
-    # Mirror the Qwen3.5 chat EOS into model.generation_config so model.generate()
-    # and downstream save_pretrained inherit a stop-token list that includes
-    # <|im_end|>. We append rather than overwrite so existing eos_token_id (e.g.
-    # <|endoftext|>) still terminates legacy generations.
+    # Mirror chat-mode EOS into model.generation_config so model.generate()
+    # and downstream save_pretrained checkpoints carry stop tokens that match
+    # the rendered chat conversations. Append rather than overwrite so the
+    # original eos_token_id (e.g. <|endoftext|>) still terminates legacy outputs.
     if im_end_id is not None and hasattr(model, "generation_config") and model.generation_config is not None:
         existing = model.generation_config.eos_token_id
         if existing is None:

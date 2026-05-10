@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import torch
+from transformers import AutoTokenizer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -56,11 +57,46 @@ def parse_args() -> argparse.Namespace:
         default=4096,
         help="Vocabulary chunk size for streaming top-k search.",
     )
+    parser.add_argument(
+        "--selection-mode",
+        type=str,
+        default="abs",
+        choices=["abs", "positive", "negative"],
+        help="Coefficient priority: absolute value, positive-only, or negative-only.",
+    )
+    parser.add_argument(
+        "--disable-token-filter",
+        action="store_true",
+        help="Keep special/format-only tokens in the semantic top-k search.",
+    )
     return parser.parse_args()
 
 
 def _load_basis(path: Path) -> Dict[str, object]:
     return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def _build_valid_token_mask(cfg, vocab_size: int) -> torch.Tensor:
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.teacher.path,
+        trust_remote_code=cfg.teacher.trust_remote_code,
+        local_files_only=cfg.teacher.local_files_only,
+    )
+    special_ids = {int(token_id) for token_id in getattr(tokenizer, "all_special_ids", [])}
+    mask = torch.ones(vocab_size, dtype=torch.bool)
+    for token_id in range(vocab_size):
+        if token_id in special_ids:
+            mask[token_id] = False
+            continue
+        try:
+            text = tokenizer.decode([token_id], skip_special_tokens=False)
+        except Exception:
+            mask[token_id] = False
+            continue
+        stripped = text.strip()
+        if not stripped or not any(ch.isalnum() for ch in stripped):
+            mask[token_id] = False
+    return mask
 
 
 def main() -> None:
@@ -75,6 +111,7 @@ def main() -> None:
     basis_path = Path(cfg.extraction.output_root) / "semantic_bases" / "teacher_semantic_basis.pt"
     basis_payload = _load_basis(basis_path)
     basis = basis_payload["basis"]
+    valid_token_mask = None if args.disable_token_filter else _build_valid_token_mask(cfg, int(basis.size(0)))
 
     part_paths = sorted(input_dir.glob("part_*.pt"))
     if not part_paths:
@@ -89,6 +126,9 @@ def main() -> None:
         teacher_basis_path=str(basis_path),
         top_k=int(args.top_k),
         vocab_chunk_size=int(args.vocab_chunk_size),
+        selection_mode=args.selection_mode,
+        token_filter_enabled=not args.disable_token_filter,
+        valid_token_count=None if valid_token_mask is None else int(valid_token_mask.sum().item()),
         num_parts=len(part_paths),
         log_path=str(log_path),
     )
@@ -108,6 +148,8 @@ def main() -> None:
                 basis,
                 top_k=args.top_k,
                 vocab_chunk_size=args.vocab_chunk_size,
+                selection_mode=args.selection_mode,
+                valid_token_mask=valid_token_mask,
             )
             semantic_coeffs_by_layer[str(layer_idx)] = {
                 "top_indices": top_indices,
@@ -141,15 +183,20 @@ def main() -> None:
             "teacher_basis_path": str(basis_path),
             "top_k": args.top_k,
             "vocab_chunk_size": args.vocab_chunk_size,
+            "selection_mode": args.selection_mode,
+            "token_filter_enabled": not args.disable_token_filter,
+            "valid_token_count": None if valid_token_mask is None else int(valid_token_mask.sum().item()),
             "key_layers": [] if key_layers is None else key_layers,
             "decomposition_semantics": (
                 "For each sample and each teacher key layer l, we compute "
                 "a = S_T @ h_safe / ||h_safe||_2 (V-dim semantic coefficient "
-                "vector), then keep the top-{k} entries by |a_i|. h_safe is "
+                "vector), then keep the top-{k} entries by the configured "
+                "selection priority. h_safe is "
                 "the safe component from step 06 (UU^T h), so we decompose "
                 "*only the safety subspace projection*, not the full hidden "
                 "state. Stored values are raw coefficients; indices are vocab "
-                "token ids."
+                "token ids. By default, special and format-only tokens are "
+                "excluded before top-k selection."
             ).format(k=args.top_k),
             "files": manifest_files,
         },
@@ -162,6 +209,8 @@ def main() -> None:
                 "split": args.split,
                 "output_dir": str(output_dir),
                 "top_k": args.top_k,
+                "selection_mode": args.selection_mode,
+                "token_filter_enabled": not args.disable_token_filter,
             },
             ensure_ascii=False,
             indent=2,

@@ -55,22 +55,14 @@ def parse_args() -> argparse.Namespace:
         help="Subspace rank k. The proposal fixes this to 8 for stage C.",
     )
     parser.add_argument(
-        "--balance-polarities",
-        dest="balance_polarities",
+        "--no-balance-labels",
         action="store_true",
-        default=True,
-        help=(
-            "(default ON) Downsample the larger polarity to match the smaller "
-            "before the SVD that builds the safe subspace. Prevents corpus "
-            "imbalance (e.g. BeaverTails ~1.36:1) from biasing the subspace "
-            "toward the refusal direction."
-        ),
+        help="Disable deterministic downsampling to equal harmful/harmless counts before SVD.",
     )
     parser.add_argument(
-        "--no-balance-polarities",
-        dest="balance_polarities",
-        action="store_false",
-        help="Disable pre-SVD polarity balancing (keeps the historical imbalance).",
+        "--no-normalize-hidden",
+        action="store_true",
+        help="Disable per-sample L2 normalization before estimating the safe subspace.",
     )
     return parser.parse_args()
 
@@ -83,42 +75,26 @@ def _load_key_layers(path: Path) -> List[int]:
     return key_layers
 
 
-def _balance_polarities(
+def _balanced_masks(
     harmful_mask: torch.Tensor,
     harmless_mask: torch.Tensor,
     *,
     seed: int,
-) -> tuple[torch.Tensor, torch.Tensor, dict]:
-    """Downsample the larger polarity to match the smaller. Pure on input masks.
-
-    Uses a dedicated ``torch.Generator`` so the global RNG is unaffected.
-    Returns (new_harmful_mask, new_harmless_mask, info_dict).
-    """
-
-    n_harmful = int(harmful_mask.sum().item())
-    n_harmless = int(harmless_mask.sum().item())
-    if n_harmful == 0 or n_harmless == 0:
-        return harmful_mask, harmless_mask, {"applied": False, "reason": "empty_polarity"}
-    keep = min(n_harmful, n_harmless)
-    generator = torch.Generator().manual_seed(int(seed))
-    new_harmful = harmful_mask
-    new_harmless = harmless_mask
-    if n_harmful > keep:
-        idx = torch.nonzero(harmful_mask, as_tuple=False).flatten()
-        perm = torch.randperm(idx.numel(), generator=generator)[: idx.numel() - keep]
-        new_harmful = harmful_mask.clone()
-        new_harmful[idx[perm]] = False
-    if n_harmless > keep:
-        idx = torch.nonzero(harmless_mask, as_tuple=False).flatten()
-        perm = torch.randperm(idx.numel(), generator=generator)[: idx.numel() - keep]
-        new_harmless = harmless_mask.clone()
-        new_harmless[idx[perm]] = False
-    return new_harmful, new_harmless, {
-        "applied": True,
-        "kept_per_polarity": keep,
-        "harmful_dropped": n_harmful - keep,
-        "harmless_dropped": n_harmless - keep,
-    }
+) -> tuple[torch.Tensor, torch.Tensor]:
+    harmful_indices = torch.where(harmful_mask)[0]
+    harmless_indices = torch.where(harmless_mask)[0]
+    keep_count = min(int(harmful_indices.numel()), int(harmless_indices.numel()))
+    if keep_count <= 0:
+        return harmful_mask, harmless_mask
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    harmful_keep = harmful_indices[torch.randperm(int(harmful_indices.numel()), generator=generator)[:keep_count]]
+    harmless_keep = harmless_indices[torch.randperm(int(harmless_indices.numel()), generator=generator)[:keep_count]]
+    balanced_harmful = torch.zeros_like(harmful_mask)
+    balanced_harmless = torch.zeros_like(harmless_mask)
+    balanced_harmful[harmful_keep] = True
+    balanced_harmless[harmless_keep] = True
+    return balanced_harmful, balanced_harmless
 
 
 def main() -> None:
@@ -143,6 +119,10 @@ def main() -> None:
     )
     harmful_mask = torch.tensor([label == "harmful" for label in train_split.labels], dtype=torch.bool)
     harmless_mask = torch.tensor([label == "harmless" for label in train_split.labels], dtype=torch.bool)
+    raw_harmful_count = int(harmful_mask.sum().item())
+    raw_harmless_count = int(harmless_mask.sum().item())
+    if not args.no_balance_labels:
+        harmful_mask, harmless_mask = _balanced_masks(harmful_mask, harmless_mask, seed=int(cfg.seed))
     log_kv(
         logger,
         "safe_subspace_setup",
@@ -151,15 +131,12 @@ def main() -> None:
         train_label_counts=train_split.label_counts(),
         key_layers=key_layers,
         requested_rank=int(args.rank),
-        balance_polarities=bool(args.balance_polarities),
+        balance_labels=not args.no_balance_labels,
+        normalize_hidden=not args.no_normalize_hidden,
+        raw_harmful_count=raw_harmful_count,
+        raw_harmless_count=raw_harmless_count,
         log_path=str(log_path),
     )
-
-    if args.balance_polarities:
-        harmful_mask, harmless_mask, balance_info = _balance_polarities(
-            harmful_mask, harmless_mask, seed=cfg.seed,
-        )
-        log_kv(logger, "subspace_balance_applied", **balance_info)
 
     n_harmful = int(harmful_mask.sum().item())
     n_harmless = int(harmless_mask.sum().item())
@@ -188,6 +165,7 @@ def main() -> None:
             harmful_hidden=train_split.layer_tensors[layer_idx][harmful_mask],
             harmless_hidden=train_split.layer_tensors[layer_idx][harmless_mask],
             k=args.rank,
+            normalize_hidden=not args.no_normalize_hidden,
         )
         layer_path = output_root / f"teacher_safe_subspace_layer_{layer_idx:02d}.pt"
         torch.save(
@@ -210,6 +188,10 @@ def main() -> None:
                 "explained_ratio_top8": result.explained_ratio_topk,
                 "harmful_count": result.harmful_count,
                 "harmless_count": result.harmless_count,
+                "normalize_hidden": not args.no_normalize_hidden,
+                "balance_labels": not args.no_balance_labels,
+                "raw_harmful_count": raw_harmful_count,
+                "raw_harmless_count": raw_harmless_count,
                 "subspace_definition": (
                     "basis = top-{k} right singular vectors of "
                     "Delta_l where Delta_l[i] = h_harmful[i] - mean(h_harmless)"
@@ -239,6 +221,10 @@ def main() -> None:
             "key_layers_path": str(key_layers_path),
             "key_layers": key_layers,
             "rank": args.rank,
+            "balance_labels": not args.no_balance_labels,
+            "normalize_hidden": not args.no_normalize_hidden,
+            "raw_harmful_count": raw_harmful_count,
+            "raw_harmless_count": raw_harmless_count,
             "files": generated_files,
         },
     )

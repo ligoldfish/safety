@@ -93,9 +93,6 @@ class SafetyDatasetConfig:
     # Round 2: BeaverTails uses category-dict prompt-level labels by
     # default; legacy ``"is_safe"`` retained for reproducing older runs.
     label_strategy: str = "category_any"
-    # Round 4: BT harmful cap. 0 = no cap. Used by 03_build_teacher_safe_subspace
-    # to keep the SVD from biasing toward refusal direction.
-    harmful_max_samples: int = 0
     # Round 2: Tülu3 v2 helpful slices (in-domain harmless contrast).
     helpful_sources: list[str] = field(default_factory=list)
     helpful_max_samples: int = 0  # 0 = match harmful count automatically
@@ -129,6 +126,9 @@ class BaselineOptimConfig:
     micro_batch_size: int = 1
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
+    # Qwen3 official full-FT recipe (Qwen3.5-4B reference): warmup_ratio=0.03,
+    # cosine LR, AdamW betas=(0.9, 0.95), max_grad_norm=1.0. Defaults preserve
+    # legacy behavior (no scheduler); YAML overrides activate stable training.
     warmup_ratio: float = 0.0
     max_grad_norm: float = 0.0
     lr_scheduler: str = "constant"

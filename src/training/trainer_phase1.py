@@ -14,6 +14,7 @@ from src.data.template_qwen import (
     render_qwen_supervised_text,
     strip_qwen_thinking_content,
 )
+from src.phase_b.hidden_states import load_hidden_state_split
 from src.training.eval_utils import (
     judge_harmful_response_safety,
     looks_like_refusal,
@@ -40,6 +41,21 @@ def load_student_target_map(target_dir: str | Path) -> tuple[Dict[str, Dict[int,
             for row_idx, sample_id in enumerate(sample_ids):
                 target_map.setdefault(sample_id, {})[layer_idx] = tensor[row_idx].to(dtype=torch.float32)
     return target_map, sorted(layer_ids)
+
+
+def load_student_anchor_map(
+    hidden_dir: str | Path,
+    *,
+    layer_ids: Sequence[int],
+) -> Dict[str, Dict[int, torch.Tensor]]:
+    hidden_split = load_hidden_state_split(hidden_dir, selected_layers=[int(layer_idx) for layer_idx in layer_ids])
+    anchor_map: Dict[str, Dict[int, torch.Tensor]] = {}
+    for row_idx, sample_id in enumerate(hidden_split.sample_ids):
+        sample_layers: Dict[int, torch.Tensor] = {}
+        for layer_idx in layer_ids:
+            sample_layers[int(layer_idx)] = hidden_split.layer_tensors[int(layer_idx)][row_idx].to(dtype=torch.float32)
+        anchor_map[str(sample_id)] = sample_layers
+    return anchor_map
 
 
 def summarize_target_map(target_map: Dict[str, Dict[int, torch.Tensor]]) -> Dict[str, Any]:
@@ -92,11 +108,44 @@ def build_random_target_map(
 
 
 class SemAlignDataset(Dataset):
-    def __init__(self, records: Sequence[Dict[str, Any]], target_map: Dict[str, Dict[int, torch.Tensor]]) -> None:
-        self.records = [record for record in records if str(record["id"]) in target_map]
+    def __init__(
+        self,
+        records: Sequence[Dict[str, Any]],
+        target_map: Dict[str, Dict[int, torch.Tensor]],
+        *,
+        anchor_map: Dict[str, Dict[int, torch.Tensor]] | None = None,
+        filter_harmful_targets: bool = False,
+    ) -> None:
+        self.anchor_map = anchor_map or {}
+        self.filtered_harmful_target_count = 0
+        self.missing_harmless_anchor_count = 0
+        kept_records: List[Dict[str, Any]] = []
+        for record in records:
+            sample_id = str(record["id"])
+            if sample_id not in target_map:
+                continue
+            if anchor_map is not None and str(record.get("label", "")) == "harmless" and sample_id not in anchor_map:
+                self.missing_harmless_anchor_count += 1
+                continue
+            if filter_harmful_targets and str(record.get("label", "")) == "harmful":
+                target_text = str(record.get("target_response") or record.get("rejected_response") or "")
+                if not target_text.strip():
+                    self.filtered_harmful_target_count += 1
+                    continue
+                judgment = judge_harmful_response_safety(target_text)
+                if not looks_like_refusal(target_text) and not judgment.is_safe:
+                    self.filtered_harmful_target_count += 1
+                    continue
+            kept_records.append(record)
+        self.records = kept_records
         self.target_map = target_map
         if not self.records:
             raise ValueError("No records remain after joining against student targets.")
+        if anchor_map is not None and self.missing_harmless_anchor_count > 0:
+            raise ValueError(
+                "Missing harmless base anchors for "
+                f"{self.missing_harmless_anchor_count} records after joining targets."
+            )
 
     def __len__(self) -> int:
         return len(self.records)
@@ -107,6 +156,7 @@ class SemAlignDataset(Dataset):
         return {
             "record": record,
             "targets": self.target_map[sample_id],
+            "anchors": self.anchor_map.get(sample_id),
         }
 
 
@@ -117,6 +167,7 @@ class BatchPayload:
     labels: torch.Tensor
     prompt_last_positions: torch.Tensor
     layer_targets: Dict[int, torch.Tensor]
+    layer_anchors: Dict[int, torch.Tensor] | None
     sample_ids: List[str]
     labels_text: List[str]
     messages: List[Sequence[Dict[str, str]]]
@@ -141,6 +192,7 @@ class SemAlignCollator:
     def __call__(self, batch: Sequence[Dict[str, Any]]) -> BatchPayload:
         records = [item["record"] for item in batch]
         target_dicts = [item["targets"] for item in batch]
+        anchor_dicts = [item.get("anchors") for item in batch]
         prompt_texts = [
             render_qwen_generation_prompt(self.tokenizer, record["messages"])
             for record in records
@@ -183,12 +235,28 @@ class SemAlignCollator:
             layer_idx: torch.stack([target_dict[layer_idx] for target_dict in target_dicts], dim=0)
             for layer_idx in self.layer_ids
         }
+        layer_anchors = None
+        if any(anchor_dict is not None for anchor_dict in anchor_dicts):
+            layer_anchors = {}
+            for layer_idx in self.layer_ids:
+                layer_anchors[layer_idx] = torch.stack(
+                    [
+                        (
+                            anchor_dict[layer_idx]
+                            if anchor_dict is not None and layer_idx in anchor_dict
+                            else target_dicts[row_idx][layer_idx]
+                        )
+                        for row_idx, anchor_dict in enumerate(anchor_dicts)
+                    ],
+                    dim=0,
+                )
         return BatchPayload(
             input_ids=encoded_full["input_ids"],
             attention_mask=encoded_full["attention_mask"],
             labels=labels,
             prompt_last_positions=prompt_last_positions,
             layer_targets=layer_targets,
+            layer_anchors=layer_anchors,
             sample_ids=[str(record["id"]) for record in records],
             labels_text=[str(record["label"]) for record in records],
             messages=[record["messages"] for record in records],
@@ -232,6 +300,44 @@ def _capture_layer_outputs(
     return hooks
 
 
+def _build_layer_targets_for_policy(
+    batch: BatchPayload,
+    *,
+    device: torch.device,
+    layer_ids: Sequence[int],
+    layer_loss_policy: str,
+) -> Dict[int, torch.Tensor]:
+    policy = str(layer_loss_policy).strip().lower()
+    target_by_layer = {
+        int(layer_idx): tensor.to(device)
+        for layer_idx, tensor in batch.layer_targets.items()
+    }
+    if policy != "harmless_anchor":
+        return target_by_layer
+
+    if batch.layer_anchors is None:
+        raise ValueError("layer_loss_policy='harmless_anchor' requires layer_anchors in the batch.")
+    harmless_mask = torch.tensor(
+        [str(label) == "harmless" for label in batch.labels_text],
+        device=device,
+        dtype=torch.bool,
+    )
+    if not bool(harmless_mask.any().detach().cpu().item()):
+        return target_by_layer
+
+    mixed_targets: Dict[int, torch.Tensor] = {}
+    for layer_idx in layer_ids:
+        layer_idx = int(layer_idx)
+        if layer_idx not in batch.layer_anchors:
+            raise KeyError(f"Missing harmless anchor tensor for layer {layer_idx}.")
+        semantic_target = target_by_layer[layer_idx]
+        anchor_target = batch.layer_anchors[layer_idx].to(device=device, dtype=semantic_target.dtype)
+        mixed = semantic_target.clone()
+        mixed[harmless_mask] = anchor_target[harmless_mask]
+        mixed_targets[layer_idx] = mixed
+    return mixed_targets
+
+
 def forward_semalign_batch(
     model: nn.Module,
     batch: BatchPayload,
@@ -240,6 +346,9 @@ def forward_semalign_batch(
     layer_ids: Sequence[int],
     layer_loss_weight: float,
     sft_loss_weight: float = 1.0,
+    layer_loss_policy: str = "all",
+    harmful_layer_weight: float = 1.0,
+    harmless_layer_weight: float = 1.0,
 ) -> tuple[torch.Tensor, Dict[str, float]]:
     inputs = {
         "input_ids": batch.input_ids.to(device),
@@ -261,20 +370,66 @@ def forward_semalign_batch(
             hook.remove()
 
     predicted_by_layer = {int(layer_idx): cache[int(layer_idx)] for layer_idx in layer_ids}
-    target_by_layer = {
-        int(layer_idx): tensor.to(device)
-        for layer_idx, tensor in batch.layer_targets.items()
-    }
-    loss_layer, cosine_by_layer = cosine_layer_alignment_loss(predicted_by_layer, target_by_layer)
+    target_by_layer = _build_layer_targets_for_policy(
+        batch,
+        device=device,
+        layer_ids=layer_ids,
+        layer_loss_policy=layer_loss_policy,
+    )
+    sample_weights = _layer_sample_weights(
+        batch.labels_text,
+        device=device,
+        layer_loss_policy=layer_loss_policy,
+        harmful_layer_weight=harmful_layer_weight,
+        harmless_layer_weight=harmless_layer_weight,
+    )
+    loss_layer, cosine_by_layer = cosine_layer_alignment_loss(
+        predicted_by_layer,
+        target_by_layer,
+        sample_weights=sample_weights,
+    )
     loss_out = outputs.loss
     loss_total = (sft_loss_weight * loss_out) + (layer_loss_weight * loss_layer)
+    active_layer_weight_sum = (
+        float(batch.input_ids.size(0))
+        if sample_weights is None
+        else float(sample_weights.detach().sum().cpu().item())
+    )
     metrics = {
         "loss_total": float(loss_total.detach().cpu().item()),
         "loss_out": float(loss_out.detach().cpu().item()),
         "loss_layer": float(loss_layer.detach().cpu().item()),
         "layer_target_cosine_mean": mean(cosine_by_layer.values()),
+        "active_layer_weight_sum": active_layer_weight_sum,
     }
     return loss_total, metrics
+
+
+def _layer_sample_weights(
+    labels_text: Sequence[str],
+    *,
+    device: torch.device,
+    layer_loss_policy: str,
+    harmful_layer_weight: float,
+    harmless_layer_weight: float,
+) -> torch.Tensor | None:
+    policy = str(layer_loss_policy).strip().lower()
+    if policy == "all":
+        return None
+    if policy not in {"harmful_only", "label_weighted", "harmless_anchor"}:
+        raise ValueError(
+            f"Unsupported layer_loss_policy: {layer_loss_policy}. "
+            "Expected 'all', 'harmful_only', 'label_weighted', or 'harmless_anchor'."
+        )
+    weights = []
+    for label in labels_text:
+        if str(label) == "harmful":
+            weights.append(float(harmful_layer_weight))
+        elif str(label) == "harmless":
+            weights.append(0.0 if policy == "harmful_only" else float(harmless_layer_weight))
+        else:
+            weights.append(0.0)
+    return torch.tensor(weights, device=device, dtype=torch.float32)
 
 
 @torch.no_grad()
@@ -284,6 +439,9 @@ def evaluate_layer_alignment(
     *,
     device: torch.device,
     layer_ids: Sequence[int],
+    layer_loss_policy: str = "all",
+    harmful_layer_weight: float = 1.0,
+    harmless_layer_weight: float = 1.0,
 ) -> float:
     cosine_scores: List[float] = []
     model.eval()
@@ -306,10 +464,29 @@ def evaluate_layer_alignment(
             for hook in hooks:
                 hook.remove()
 
+        target_by_layer = _build_layer_targets_for_policy(
+            batch,
+            device=device,
+            layer_ids=layer_ids,
+            layer_loss_policy=layer_loss_policy,
+        )
+        sample_weights = _layer_sample_weights(
+            batch.labels_text,
+            device=device,
+            layer_loss_policy=layer_loss_policy,
+            harmful_layer_weight=harmful_layer_weight,
+            harmless_layer_weight=harmless_layer_weight,
+        )
         for layer_idx in layer_ids:
             predicted = cache[int(layer_idx)]
-            target = batch.layer_targets[int(layer_idx)].to(device)
+            target = target_by_layer[int(layer_idx)]
             cosine = torch.nn.functional.cosine_similarity(predicted, target, dim=-1)
+            if sample_weights is not None:
+                keep_mask = sample_weights > 0
+                if bool(keep_mask.any().detach().cpu().item()):
+                    cosine = cosine[keep_mask]
+                else:
+                    continue
             cosine_scores.extend(cosine.detach().cpu().tolist())
     return mean(cosine_scores)
 
@@ -363,8 +540,6 @@ def evaluate_generation_refusal_metrics(
     previous_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     model.eval()
-    runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
-    xla_model = getattr(model, "_codex_xla_model", None)
 
     full_max_new_tokens = int(max_new_tokens)
     requested_initial = int(initial_max_new_tokens)
@@ -398,14 +573,17 @@ def evaluate_generation_refusal_metrics(
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
             )
-        if runtime_backend == "tpu" and xla_model is not None:
-            xla_model.mark_step()
+        # PPU/NPU eager mode: no XLA graph step required.
         prompt_width = int(encoded["input_ids"].size(1))
         generated_only = generated[:, prompt_width:]
         decoded = [
             tokenizer.decode(generated_only[row_idx], skip_special_tokens=True)
             for row_idx in range(generated_only.size(0))
         ]
+        # Real per-sample stop count: index of first EOS token (or full window
+        # if model never emitted EOS within gen_max_new_tokens). The previous
+        # implementation always reported gen_max_new_tokens for every row,
+        # which masked legitimate EOS-emission diagnostics.
         used: list[int] = []
         for row_idx in range(generated_only.size(0)):
             row = generated_only[row_idx].tolist()

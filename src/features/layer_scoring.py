@@ -17,6 +17,7 @@ class LayerScoreResult:
     harmless_mean: torch.Tensor
     mean_diff: torch.Tensor
     mean_diff_norm: float
+    mean_diff_effect_size: float
     linear_probe_acc: float
     final_score: float
 
@@ -81,7 +82,13 @@ def fit_linear_probe_accuracy(
     with torch.no_grad():
         logits = probe(val_x).squeeze(-1)
         predictions = (logits >= 0).to(dtype=torch.float32)
-        accuracy = torch.mean((predictions == val_targets).to(dtype=torch.float32))
+        positive_mask = val_targets == 1
+        negative_mask = val_targets == 0
+        class_accs = []
+        for mask in (positive_mask, negative_mask):
+            if bool(mask.any().item()):
+                class_accs.append(torch.mean((predictions[mask] == val_targets[mask]).to(dtype=torch.float32)))
+        accuracy = torch.stack(class_accs).mean() if class_accs else torch.tensor(0.0)
     return float(accuracy.item())
 
 
@@ -108,6 +115,10 @@ def score_teacher_layer(
     harmless_mean = harmless_hidden.mean(dim=0)
     mean_diff = harmful_mean - harmless_mean
     mean_diff_norm = float(torch.linalg.norm(mean_diff).item())
+    harmful_centered = harmful_hidden - harmful_mean
+    harmless_centered = harmless_hidden - harmless_mean
+    within_rms = torch.cat([harmful_centered, harmless_centered], dim=0).norm(dim=1).mean().clamp_min(1e-6)
+    mean_diff_effect_size = float((torch.linalg.norm(mean_diff) / within_rms).item())
     linear_probe_acc = fit_linear_probe_accuracy(
         train_hidden=train_hidden,
         train_labels=train_labels,
@@ -117,7 +128,7 @@ def score_teacher_layer(
         max_iter=probe_max_iter,
         weight_decay=probe_weight_decay,
     )
-    final_score = mean_diff_norm + linear_probe_acc
+    final_score = mean_diff_effect_size + linear_probe_acc
 
     return LayerScoreResult(
         layer_idx=layer_idx,
@@ -127,6 +138,7 @@ def score_teacher_layer(
         harmless_mean=harmless_mean,
         mean_diff=mean_diff,
         mean_diff_norm=mean_diff_norm,
+        mean_diff_effect_size=mean_diff_effect_size,
         linear_probe_acc=linear_probe_acc,
         final_score=final_score,
     )

@@ -23,6 +23,7 @@ from src.training import (
     evaluate_layer_alignment,
     forward_semalign_batch,
     load_records,
+    load_student_anchor_map,
     load_student_target_map,
     save_checkpoint,
     summarize_target_map,
@@ -60,6 +61,12 @@ def main() -> None:
         raise ValueError(
             f"Unsupported target mode: {cfg.target.mode}. Expected 'semantic' or 'random_same_norm'."
         )
+    layer_loss_policy = str(cfg.target.layer_loss_policy).strip().lower()
+    if layer_loss_policy not in {"all", "harmful_only", "label_weighted", "harmless_anchor"}:
+        raise ValueError(
+            f"Unsupported target.layer_loss_policy: {cfg.target.layer_loss_policy}. "
+            "Expected 'all', 'harmful_only', 'label_weighted', or 'harmless_anchor'."
+        )
 
     semantic_train_target_map, train_layer_ids = load_student_target_map(cfg.inputs.train_targets_dir)
     semantic_val_target_map, val_layer_ids = load_student_target_map(cfg.inputs.val_targets_dir)
@@ -72,6 +79,16 @@ def main() -> None:
         raise ValueError(
             f"Student target layers {layer_ids} do not match pairing file layers {paired_student_layers}."
         )
+    train_anchor_map = None
+    val_anchor_map = None
+    if layer_loss_policy == "harmless_anchor":
+        if not cfg.inputs.train_anchor_dir or not cfg.inputs.val_anchor_dir:
+            raise ValueError(
+                "target.layer_loss_policy='harmless_anchor' requires inputs.train_anchor_dir "
+                "and inputs.val_anchor_dir."
+            )
+        train_anchor_map = load_student_anchor_map(cfg.inputs.train_anchor_dir, layer_ids=layer_ids)
+        val_anchor_map = load_student_anchor_map(cfg.inputs.val_anchor_dir, layer_ids=layer_ids)
 
     if target_mode == "semantic":
         train_target_map = semantic_train_target_map
@@ -90,12 +107,21 @@ def main() -> None:
 
     train_records = load_records(cfg.inputs.train_split)
     val_records = load_records(cfg.inputs.val_split)
-    train_dataset = SemAlignDataset(train_records, train_target_map)
-    val_dataset = SemAlignDataset(val_records, val_target_map)
+    train_dataset = SemAlignDataset(
+        train_records,
+        train_target_map,
+        anchor_map=train_anchor_map,
+        filter_harmful_targets=bool(cfg.target.filter_harmful_targets),
+    )
+    val_dataset = SemAlignDataset(
+        val_records,
+        val_target_map,
+        anchor_map=val_anchor_map,
+    )
     semantic_reference_val_dataset = (
         None
         if target_mode == "semantic"
-        else SemAlignDataset(val_records, semantic_val_target_map)
+        else SemAlignDataset(val_records, semantic_val_target_map, anchor_map=val_anchor_map)
     )
 
     tokenizer, model, _ = load_hf_model(
@@ -151,7 +177,33 @@ def main() -> None:
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=cfg.optim.learning_rate,
         weight_decay=cfg.optim.weight_decay,
+        betas=(0.9, 0.95),
     )
+    micro_batches_total = max(1, len(train_loader) * int(cfg.optim.epochs))
+    num_training_steps = max(1, micro_batches_total // gradient_accumulation_steps)
+    warmup_ratio = float(getattr(cfg.optim, "warmup_ratio", 0.0) or 0.0)
+    num_warmup_steps = max(0, int(warmup_ratio * num_training_steps))
+    scheduler_kind = str(getattr(cfg.optim, "lr_scheduler", "constant") or "constant").strip().lower()
+    if scheduler_kind == "cosine":
+        from transformers import get_cosine_schedule_with_warmup
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps,
+        )
+    elif scheduler_kind == "linear":
+        from transformers import get_linear_schedule_with_warmup
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps,
+        )
+    elif scheduler_kind == "constant":
+        if num_warmup_steps > 0:
+            from transformers import get_constant_schedule_with_warmup
+            scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps)
+        else:
+            scheduler = None
+    else:
+        raise ValueError(f"Unknown lr_scheduler={scheduler_kind!r}; expected cosine|linear|constant.")
+    max_grad_norm = float(getattr(cfg.optim, "max_grad_norm", 0.0) or 0.0)
+    early_stopping_patience = int(getattr(cfg.optim, "early_stopping_patience", 0) or 0)
 
     checkpoints_dir = ensure_dir(output_root / "checkpoints")
     logs_dir = ensure_dir(output_root / "logs")
@@ -166,7 +218,6 @@ def main() -> None:
     except StopIteration:
         device = torch.device("cpu")
     runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
-    xla_model = getattr(model, "_codex_xla_model", None)
 
     log_kv(
         logger,
@@ -175,6 +226,13 @@ def main() -> None:
         target_mode=target_mode,
         random_seed=int(cfg.target.random_seed),
         match_l2_norm=bool(cfg.target.match_l2_norm),
+        layer_loss_policy=layer_loss_policy,
+        harmful_layer_weight=float(cfg.target.harmful_layer_weight),
+        harmless_layer_weight=float(cfg.target.harmless_layer_weight),
+        filter_harmful_targets=bool(cfg.target.filter_harmful_targets),
+        train_filtered_harmful_targets=int(train_dataset.filtered_harmful_target_count),
+        train_anchor_summary=None if train_anchor_map is None else summarize_target_map(train_anchor_map),
+        val_anchor_summary=None if val_anchor_map is None else summarize_target_map(val_anchor_map),
         layer_ids=layer_ids,
         paired_student_layers=paired_student_layers,
         train_num_samples=len(train_dataset),
@@ -194,6 +252,9 @@ def main() -> None:
 
     val_metrics = {}
     global_step = 0
+    best_val_loss = float("inf")
+    best_epoch = 0
+    epochs_since_improve = 0
     for epoch in range(1, cfg.optim.epochs + 1):
         log_kv(logger, "epoch_start", epoch=epoch, total_epochs=int(cfg.optim.epochs))
         model.train()
@@ -205,6 +266,7 @@ def main() -> None:
             "loss_out": 0.0,
             "loss_layer": 0.0,
             "layer_target_cosine_mean": 0.0,
+            "active_layer_weight_sum": 0.0,
         }
         for batch_idx, batch in enumerate(train_loader, start=1):
             loss_total, metrics = forward_semalign_batch(
@@ -214,6 +276,9 @@ def main() -> None:
                 layer_ids=layer_ids,
                 layer_loss_weight=cfg.optim.layer_loss_weight,
                 sft_loss_weight=cfg.optim.sft_loss_weight,
+                layer_loss_policy=layer_loss_policy,
+                harmful_layer_weight=float(cfg.target.harmful_layer_weight),
+                harmless_layer_weight=float(cfg.target.harmless_layer_weight),
             )
             microbatch_size = int(batch.input_ids.size(0))
             (loss_total / gradient_accumulation_steps).backward()
@@ -227,13 +292,15 @@ def main() -> None:
                 or batch_idx == len(train_loader)
             )
             if should_step:
-                if runtime_backend == "tpu":
-                    if xla_model is None:
-                        raise RuntimeError("TPU backend requested but torch_xla runtime is unavailable on the model.")
-                    xla_model.optimizer_step(optimizer, barrier=True)
-                    xla_model.mark_step()
-                else:
-                    optimizer.step()
+                if max_grad_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad],
+                        max_grad_norm,
+                    )
+                # PPU and NPU both run eager mode -> standard optimizer.step().
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
                 global_step += 1
@@ -260,6 +327,7 @@ def main() -> None:
                             "loss_out": averaged_metrics["loss_out"],
                             "loss_layer": averaged_metrics["loss_layer"],
                             "layer_target_cosine_mean": averaged_metrics["layer_target_cosine_mean"],
+                            "active_layer_weight_sum": averaged_metrics["active_layer_weight_sum"],
                             "lr": cfg.optim.learning_rate,
                         },
                     )
@@ -269,6 +337,9 @@ def main() -> None:
             val_loader,
             device=device,
             layer_ids=layer_ids,
+            layer_loss_policy=layer_loss_policy,
+            harmful_layer_weight=float(cfg.target.harmful_layer_weight),
+            harmless_layer_weight=float(cfg.target.harmless_layer_weight),
         )
         semantic_target_cosine_mean = layer_target_cosine_mean
         if semantic_reference_val_loader is not None:
@@ -277,6 +348,9 @@ def main() -> None:
                 semantic_reference_val_loader,
                 device=device,
                 layer_ids=layer_ids,
+                layer_loss_policy=layer_loss_policy,
+                harmful_layer_weight=float(cfg.target.harmful_layer_weight),
+                harmless_layer_weight=float(cfg.target.harmless_layer_weight),
             )
         generation_metrics = evaluate_generation_refusal_metrics(
             model,
@@ -310,6 +384,7 @@ def main() -> None:
             epoch=epoch,
             harmful_refusal_rate=epoch_metrics["harmful_refusal_rate"],
             harmful_unsafe_output_rate=epoch_metrics["harmful_unsafe_output_rate"],
+            harmful_strict_unsafe_rate=epoch_metrics["harmful_strict_unsafe_rate"],
             harmless_over_refusal_rate=epoch_metrics["harmless_over_refusal_rate"],
             active_target_cosine_mean=epoch_metrics["active_target_cosine_mean"],
             semantic_target_cosine_mean=epoch_metrics["semantic_target_cosine_mean"],
@@ -330,6 +405,31 @@ def main() -> None:
             },
         )
 
+        # Early stopping driven by layer alignment cosine (PhaseF has no scalar
+        # val_loss exposed here; use semantic target cosine which is the natural
+        # PAN-paper-aligned signal). Higher cosine = better; track best by epoch.
+        epoch_alignment = float(
+            epoch_metrics.get("semantic_target_cosine_mean")
+            or epoch_metrics.get("active_target_cosine_mean")
+            or 0.0
+        )
+        if epoch_alignment > -best_val_loss:
+            best_val_loss = -epoch_alignment
+            best_epoch = epoch
+            epochs_since_improve = 0
+        else:
+            epochs_since_improve += 1
+        if early_stopping_patience > 0 and epochs_since_improve >= early_stopping_patience:
+            log_kv(
+                logger,
+                "early_stop",
+                stopped_at_epoch=epoch,
+                best_epoch=best_epoch,
+                best_alignment=-best_val_loss,
+                patience=early_stopping_patience,
+            )
+            break
+
     write_json(
         output_root / "manifest.json",
         {
@@ -339,6 +439,8 @@ def main() -> None:
             "val_split": cfg.inputs.val_split,
             "train_targets_dir": cfg.inputs.train_targets_dir,
             "val_targets_dir": cfg.inputs.val_targets_dir,
+            "train_anchor_dir": cfg.inputs.train_anchor_dir,
+            "val_anchor_dir": cfg.inputs.val_anchor_dir,
             "pairing_path": cfg.inputs.pairing_path,
             "paired_student_layers": paired_student_layers,
             "lora_modules": injection.replaced_module_names,
@@ -352,6 +454,12 @@ def main() -> None:
             "learning_rate": cfg.optim.learning_rate,
             "sft_loss_weight": cfg.optim.sft_loss_weight,
             "layer_loss_weight": cfg.optim.layer_loss_weight,
+            "warmup_ratio": float(getattr(cfg.optim, "warmup_ratio", 0.0) or 0.0),
+            "max_grad_norm": float(getattr(cfg.optim, "max_grad_norm", 0.0) or 0.0),
+            "lr_scheduler": str(getattr(cfg.optim, "lr_scheduler", "constant") or "constant"),
+            "early_stopping_patience": int(getattr(cfg.optim, "early_stopping_patience", 0) or 0),
+            "best_epoch": best_epoch,
+            "epochs_completed": epoch,
             "train_num_samples": len(train_dataset),
             "val_num_samples": len(val_dataset),
             "trainable_parameters": trainable_params,
@@ -359,8 +467,15 @@ def main() -> None:
             "target_mode": target_mode,
             "target_random_seed": int(cfg.target.random_seed),
             "target_match_l2_norm": bool(cfg.target.match_l2_norm),
+            "target_layer_loss_policy": layer_loss_policy,
+            "target_harmful_layer_weight": float(cfg.target.harmful_layer_weight),
+            "target_harmless_layer_weight": float(cfg.target.harmless_layer_weight),
+            "target_filter_harmful_targets": bool(cfg.target.filter_harmful_targets),
+            "train_filtered_harmful_targets": int(train_dataset.filtered_harmful_target_count),
             "train_target_summary": summarize_target_map(train_target_map),
             "val_target_summary": summarize_target_map(val_target_map),
+            "train_anchor_summary": None if train_anchor_map is None else summarize_target_map(train_anchor_map),
+            "val_anchor_summary": None if val_anchor_map is None else summarize_target_map(val_anchor_map),
             "train_metrics_path": str(train_metrics_path),
             "val_metrics_path": str(val_metrics_path),
             "checkpoints_dir": str(checkpoints_dir),

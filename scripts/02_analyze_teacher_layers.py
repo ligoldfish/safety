@@ -97,6 +97,7 @@ def _serialize_layer_result(result: LayerScoreResult) -> Dict[str, object]:
         "harmful_count": result.harmful_count,
         "harmless_count": result.harmless_count,
         "mean_diff_norm": result.mean_diff_norm,
+        "mean_diff_effect_size": result.mean_diff_effect_size,
         "linear_probe_acc": result.linear_probe_acc,
         "final_score": result.final_score,
     }
@@ -154,6 +155,7 @@ def main() -> None:
                 "harmless_mean": result.harmless_mean,
                 "mean_diff": result.mean_diff,
                 "mean_diff_norm": result.mean_diff_norm,
+                "mean_diff_effect_size": result.mean_diff_effect_size,
             },
             mean_diff_root / f"teacher_mean_diff_layer_{layer_idx:02d}.pt",
         )
@@ -173,6 +175,7 @@ def main() -> None:
             "train_split_dir": train_split.split_dir,
             "val_split_dir": val_split.split_dir,
             "top_k": args.top_k,
+            "selection_metric": "mean_diff_effect_size + linear_probe_balanced_accuracy",
             "key_layers": key_layers,
             "layer_rows": csv_rows,
         },
@@ -188,6 +191,7 @@ def main() -> None:
             "val_split_dir": val_split.split_dir,
             "val_label_counts": val_split.label_counts(),
             "top_k": args.top_k,
+            "selection_metric": "mean_diff_effect_size + linear_probe_balanced_accuracy",
             "selected_key_layers": key_layers,
             "teacher_layer_scores_csv": str(output_root / "teacher_layer_scores.csv"),
             "teacher_key_layers_json": str(output_root / "teacher_key_layers.json"),

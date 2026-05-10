@@ -129,8 +129,6 @@ def _generate_text_batch_with_info(
 ) -> tuple[List[str], List[int]]:
     if not prompt_texts:
         return [], []
-    runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
-    xla_model = getattr(model, "_codex_xla_model", None)
     previous_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     encoded = tokenizer(
@@ -154,8 +152,7 @@ def _generate_text_batch_with_info(
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
         )
-    if runtime_backend == "tpu" and xla_model is not None:
-        xla_model.mark_step()
+    # PPU/NPU eager mode: no XLA graph step required.
     prompt_width = int(encoded["input_ids"].size(1))
     texts = [
         tokenizer.decode(generated[row_idx, prompt_width:], skip_special_tokens=True)
@@ -354,8 +351,6 @@ def _continuation_nll(
     device: torch.device,
     max_length: int,
 ) -> float:
-    runtime_backend = str(getattr(model, "_codex_runtime_backend", "")).lower()
-    xla_model = getattr(model, "_codex_xla_model", None)
     encoded_prompt = tokenizer(
         prompt_text,
         return_tensors="pt",
@@ -379,8 +374,7 @@ def _continuation_nll(
             use_cache=False,
             return_dict=True,
         )
-    if runtime_backend == "tpu" and xla_model is not None:
-        xla_model.mark_step()
+    # PPU/NPU eager mode: no XLA graph step required.
 
     logits = outputs.logits[:, :-1, :]
     labels = input_ids[:, 1:]

@@ -17,6 +17,8 @@ inputs:
   train_targets_dir: ../outputs/qwen35_08b_phase1_smoke_npu/student_targets/student_safe_targets_alignment
   val_targets_dir: ../outputs/qwen35_08b_phase1_smoke_npu/student_targets/student_safe_targets_val
   pairing_path: ../outputs/qwen35_08b_phase1_smoke_npu/layer_pairing/teacher_student_layer_pairs.json
+  train_anchor_dir: ../outputs/qwen35_08b_phase1_smoke_npu/hidden_states/student_alignment
+  val_anchor_dir: ../outputs/qwen35_08b_phase1_smoke_npu/hidden_states/student_analysis_val
 
 lora:
   rank: 16
@@ -33,10 +35,14 @@ optim:
   epochs: 1
   batch_size: 8
   micro_batch_size: 2
-  learning_rate: 1.0e-06
+  learning_rate: 0.00005
   weight_decay: 0.0
-  sft_loss_weight: 0.8
-  layer_loss_weight: 0.2
+  sft_loss_weight: 1.0
+  layer_loss_weight: 0.5
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  early_stopping_patience: 0
   max_length: 1024
   max_new_tokens: 32
   log_every_steps: 1
@@ -45,6 +51,10 @@ target:
   mode: semantic
   random_seed: 2042
   match_l2_norm: true
+  layer_loss_policy: harmless_anchor
+  harmful_layer_weight: 1.0
+  harmless_layer_weight: 0.5
+  filter_harmful_targets: true
 
 output:
   output_root: ../outputs/qwen35_08b_phase1_smoke_npu/training

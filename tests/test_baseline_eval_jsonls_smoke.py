@@ -69,11 +69,11 @@ class LauncherSafetyEvalRoutingTests(unittest.TestCase):
         module = _load_module("oneclick_launcher", self.LAUNCHER)
         expected = {
             ("npu", "0.8b", "tulu3_safety"),
-            ("tpu", "0.8b", "tulu3_safety"),
+            ("ppu", "0.8b", "tulu3_safety"),
             ("npu", "0.8b", "beavertails"),
-            ("tpu", "0.8b", "beavertails"),
+            ("ppu", "0.8b", "beavertails"),
             ("npu", "0.8b", "safety_tuned_llamas"),
-            ("tpu", "0.8b", "safety_tuned_llamas"),
+            ("ppu", "0.8b", "safety_tuned_llamas"),
         }
         self.assertTrue(expected.issubset(set(module.SAFETY_EVAL_CONFIGS.keys())))
 
@@ -104,7 +104,7 @@ class PerBaselineEvalYamlPointsAtCorrectJsonl(unittest.TestCase):
         from src.baselines import load_eval_config
 
         for baseline in ("tulu3_safety", "beavertails", "safety_tuned_llamas"):
-            for device in ("npu", "tpu"):
+            for device in ("npu", "ppu"):
                 yaml_path = (
                     PROJECT_ROOT / "configs" / f"baseline_eval_qwen35_08b_{baseline}_{device}.yaml"
                 )

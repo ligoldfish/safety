@@ -33,12 +33,12 @@ lora:
   - self_attn.v_proj
   - self_attn.o_proj
 optim:
-  epochs: 3
+  epochs: 1
   batch_size: 8
   micro_batch_size: 1
-  learning_rate: 2.0e-05
-  weight_decay: 0.01
-  warmup_ratio: 0.1
+  learning_rate: 1.0e-05
+  weight_decay: 0.1
+  warmup_ratio: 0.03
   max_grad_norm: 1.0
   lr_scheduler: cosine
   early_stopping_patience: 0

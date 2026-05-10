@@ -161,6 +161,11 @@ class NosftBaselineRoutingTests(unittest.TestCase):
             any("safety_tuned_llamas_npu.yaml" in j for j in joined_per_call)
         )
 
+    def test_9b_with_baseline_other_than_pan_raises(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            self._run(model_size="9b", baseline_name="beavertails")
+        self.assertIn("0.8b", str(ctx.exception).lower())
+
     def test_9b_pan_still_works(self) -> None:
         # Backwards-compat: nosft --model 9b --baseline pan
         calls = self._run(model_size="9b", baseline_name="pan")
@@ -168,94 +173,6 @@ class NosftBaselineRoutingTests(unittest.TestCase):
         _, args = calls[0]
         joined = " ".join(args)
         self.assertIn("baseline_eval_qwen35_9b_npu.yaml", joined)
-
-    def test_9b_beavertails_routes_to_9b_baseline_yaml(self) -> None:
-        calls = self._run(model_size="9b", baseline_name="beavertails")
-        self.assertEqual(len(calls), 1)
-        _, args = calls[0]
-        joined = " ".join(args)
-        self.assertIn("baseline_eval_qwen35_9b_beavertails_npu.yaml", joined)
-        self.assertNotIn("--safety-eval-datasets", args)
-
-    def test_9b_safety_tuned_llamas_routes_to_9b_baseline_yaml(self) -> None:
-        calls = self._run(model_size="9b", baseline_name="safety_tuned_llamas")
-        self.assertEqual(len(calls), 1)
-        _, args = calls[0]
-        joined = " ".join(args)
-        self.assertIn("baseline_eval_qwen35_9b_safety_tuned_llamas_npu.yaml", joined)
-
-    def test_9b_tulu3_routes_to_9b_baseline_yaml_with_coconot(self) -> None:
-        calls = self._run(model_size="9b", baseline_name="tulu3_safety")
-        self.assertEqual(len(calls), 1)
-        _, args = calls[0]
-        joined = " ".join(args)
-        self.assertIn("baseline_eval_qwen35_9b_tulu3_safety_npu.yaml", joined)
-        self.assertIn("--safety-eval-datasets", args)
-        idx = args.index("--safety-eval-datasets")
-        self.assertEqual(args[idx + 1], "coconot_contrast")
-
-    def test_9b_all_iterates_four_baselines(self) -> None:
-        calls = self._run(model_size="9b", baseline_name="all")
-        self.assertEqual(len(calls), 4)
-        joined_per_call = [" ".join(args) for _, args in calls]
-        self.assertTrue(any("baseline_eval_qwen35_9b_npu.yaml" in j for j in joined_per_call))
-        self.assertTrue(any("9b_tulu3_safety_npu.yaml" in j for j in joined_per_call))
-        self.assertTrue(any("9b_beavertails_npu.yaml" in j for j in joined_per_call))
-        self.assertTrue(any("9b_safety_tuned_llamas_npu.yaml" in j for j in joined_per_call))
-
-
-class NosftArgparseDefaultTests(unittest.TestCase):
-    """argparse default --baseline=all (Round 4)."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.launcher = _load_launcher()
-
-    def test_baseline_default_is_all(self) -> None:
-        argv = ["15_run_oneclick.py", "nosft", "--device", "npu", "--model", "0.8b"]
-        with mock.patch.object(sys, "argv", argv):
-            args = self.launcher.parse_args()
-        self.assertEqual(args.baseline, "all")
-
-
-class OpenCompassAutoEnableTests(unittest.TestCase):
-    """Round 4: ``_should_run_opencompass`` auto-enables when opencompass-dir
-    points at an existing path, even without explicit ``--enable-opencompass``."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.launcher = _load_launcher()
-
-    def test_auto_enable_when_dir_exists(self) -> None:
-        with mock.patch.object(self.launcher.Path, "exists", return_value=True):
-            self.assertTrue(
-                self.launcher._should_run_opencompass(
-                    "/some/oc/dir", skip_opencompass=False, enable_opencompass=False,
-                )
-            )
-
-    def test_skip_overrides_auto_enable(self) -> None:
-        with mock.patch.object(self.launcher.Path, "exists", return_value=True):
-            self.assertFalse(
-                self.launcher._should_run_opencompass(
-                    "/some/oc/dir", skip_opencompass=True, enable_opencompass=False,
-                )
-            )
-
-    def test_empty_dir_keeps_disabled(self) -> None:
-        self.assertFalse(
-            self.launcher._should_run_opencompass(
-                "", skip_opencompass=False, enable_opencompass=False,
-            )
-        )
-
-    def test_explicit_enable_with_missing_dir_warns(self) -> None:
-        with mock.patch.object(self.launcher.Path, "exists", return_value=False):
-            self.assertFalse(
-                self.launcher._should_run_opencompass(
-                    "/missing/oc/dir", skip_opencompass=False, enable_opencompass=True,
-                )
-            )
 
 
 if __name__ == "__main__":

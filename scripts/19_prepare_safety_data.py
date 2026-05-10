@@ -110,11 +110,6 @@ def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSp
         ),
         dedup_prompts=bool(safety_cfg.dedup_prompts),
         label_strategy=safety_cfg.label_strategy or "category_any",
-        harmful_max_samples=(
-            int(safety_cfg.harmful_max_samples)
-            if safety_cfg.harmful_max_samples
-            else None
-        ),
         helpful_sources=list(safety_cfg.helpful_sources) or None,
         helpful_max_samples=(
             int(safety_cfg.helpful_max_samples)

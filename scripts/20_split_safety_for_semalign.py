@@ -32,6 +32,7 @@ import json
 import random
 import shutil
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -200,17 +201,26 @@ def _split(
     val_fraction: float,
     sanity_fraction: float,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    n = len(records)
-    val_size = max(1, int(round(n * val_fraction))) if n > 0 else 0
-    sanity_size = max(1, int(round(n * sanity_fraction))) if n > 0 else 0
-    if val_size + sanity_size >= n:
-        raise ValueError(
-            f"Combined val+sanity sizes ({val_size}+{sanity_size}) exceed "
-            f"total record count {n}; lower --val-fraction / --sanity-fraction."
-        )
-    val_split = records[:val_size]
-    sanity_split = records[val_size : val_size + sanity_size]
-    train_split = records[val_size + sanity_size :]
+    by_label: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        by_label[str(record.get("label", ""))].append(record)
+
+    train_split: List[Dict[str, Any]] = []
+    val_split: List[Dict[str, Any]] = []
+    sanity_split: List[Dict[str, Any]] = []
+    for label, group in sorted(by_label.items()):
+        n = len(group)
+        val_size = max(1, int(round(n * val_fraction))) if n > 0 else 0
+        sanity_size = max(1, int(round(n * sanity_fraction))) if n > 0 else 0
+        if val_size + sanity_size >= n:
+            raise ValueError(
+                f"Combined val+sanity sizes for label={label!r} "
+                f"({val_size}+{sanity_size}) exceed label count {n}; lower "
+                "--val-fraction / --sanity-fraction."
+            )
+        val_split.extend(group[:val_size])
+        sanity_split.extend(group[val_size : val_size + sanity_size])
+        train_split.extend(group[val_size + sanity_size :])
     return train_split, val_split, sanity_split
 
 

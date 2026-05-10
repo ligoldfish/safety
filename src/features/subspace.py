@@ -25,6 +25,8 @@ def build_teacher_safe_subspace(
     harmful_hidden: torch.Tensor,
     harmless_hidden: torch.Tensor,
     k: int = 8,
+    normalize_hidden: bool = False,
+    eps: float = 1e-12,
 ) -> SafeSubspaceResult:
     """Build the teacher safe subspace for a single key layer.
 
@@ -53,6 +55,9 @@ def build_teacher_safe_subspace(
 
     harmful_hidden = harmful_hidden.to(dtype=torch.float32)
     harmless_hidden = harmless_hidden.to(dtype=torch.float32)
+    if normalize_hidden:
+        harmful_hidden = harmful_hidden / harmful_hidden.norm(dim=1, keepdim=True).clamp_min(eps)
+        harmless_hidden = harmless_hidden / harmless_hidden.norm(dim=1, keepdim=True).clamp_min(eps)
     harmless_mean = harmless_hidden.mean(dim=0)
     harmful_mean = harmful_hidden.mean(dim=0)
     mean_diff = harmful_mean - harmless_mean

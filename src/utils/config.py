@@ -139,6 +139,8 @@ class PhaseFInputConfig:
     train_targets_dir: str
     val_targets_dir: str
     pairing_path: str
+    train_anchor_dir: str = ""
+    val_anchor_dir: str = ""
 
 
 @dataclass
@@ -158,8 +160,15 @@ class PhaseFOptimConfig:
     micro_batch_size: int = 0
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
+    # Pan ICML 2025 §9.4: loss = sft_loss_weight * loss_out + layer_loss_weight * loss_layer.
+    # Defaults preserve the paper's unweighted SFT term and lambda=0.5 layer term.
     sft_loss_weight: float = 1.0
     layer_loss_weight: float = 0.5
+    # SFT/distill style hardening (Qwen3 official recipe + Tulu3 best practice):
+    warmup_ratio: float = 0.0
+    max_grad_norm: float = 0.0
+    lr_scheduler: str = "constant"
+    early_stopping_patience: int = 0
     max_length: int = 1024
     max_new_tokens: int = 256
     log_every_steps: int = 1
@@ -170,6 +179,10 @@ class PhaseFTargetConfig:
     mode: str = "semantic"
     random_seed: int = 2042
     match_l2_norm: bool = True
+    layer_loss_policy: str = "all"
+    harmful_layer_weight: float = 1.0
+    harmless_layer_weight: float = 1.0
+    filter_harmful_targets: bool = False
 
 
 @dataclass
@@ -301,7 +314,15 @@ def load_phasef_config(path: str | Path) -> PhaseFConfig:
     inputs = _resolve_path_in_mapping(
         dict(raw["inputs"]),
         base_dir,
-        ["train_split", "val_split", "train_targets_dir", "val_targets_dir", "pairing_path"],
+        [
+            "train_split",
+            "val_split",
+            "train_targets_dir",
+            "val_targets_dir",
+            "pairing_path",
+            "train_anchor_dir",
+            "val_anchor_dir",
+        ],
     )
     output = _resolve_path_in_mapping(
         dict(raw["output"]),

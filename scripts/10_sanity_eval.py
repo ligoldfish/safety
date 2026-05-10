@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=48,
+        default=256,
         help="Generation length for sanity responses.",
     )
     return parser.parse_args()
@@ -216,6 +216,8 @@ def _evaluate_variant(
         "num_harmless": generation_metrics["num_harmless"],
         "harmful_refusal_rate": generation_metrics["harmful_refusal_rate"],
         "harmful_unsafe_output_rate": generation_metrics["harmful_unsafe_output_rate"],
+        "harmful_safe_non_refusal_rate": generation_metrics["harmful_safe_non_refusal_rate"],
+        "harmful_strict_unsafe_rate": generation_metrics["harmful_strict_unsafe_rate"],
         "harmless_over_refusal_rate": generation_metrics["harmless_over_refusal_rate"],
         "layer_target_cosine_mean": layer_target_cosine_mean,
         "generations": generation_metrics["generations"],
@@ -226,6 +228,8 @@ def _write_comparison_csv(path: Path, baseline: Dict[str, Any], semalign: Dict[s
     metric_names = [
         "harmful_refusal_rate",
         "harmful_unsafe_output_rate",
+        "harmful_safe_non_refusal_rate",
+        "harmful_strict_unsafe_rate",
         "harmless_over_refusal_rate",
         "layer_target_cosine_mean",
     ]
