@@ -37,8 +37,8 @@ optim:
   micro_batch_size: 2
   learning_rate: 0.00005
   weight_decay: 0.0
-  sft_loss_weight: 1.0
-  layer_loss_weight: 0.5
+  sft_loss_weight: 0.8
+  layer_loss_weight: 0.2
   warmup_ratio: 0.03
   max_grad_norm: 1.0
   lr_scheduler: cosine

@@ -97,10 +97,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         default="auto",
-        choices=("auto", "cuda", "npu", "cpu"),
+        choices=("auto", "cuda", "npu", "ppu", "cpu"),
         help=(
-            "Target accelerator backend. 'auto' detects ASCEND_RT_VISIBLE_DEVICES / "
-            "CUDA_VISIBLE_DEVICES from the environment."
+            "Target accelerator backend. 'auto' detects PPU_VISIBLE_DEVICES / "
+            "ASCEND_RT_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES from the environment."
         ),
     )
     parser.add_argument(
@@ -168,8 +168,11 @@ def _resolve_opencompass_entry(opencompass_dir: Path) -> Path:
 def _detect_backend(requested: str) -> str:
     if requested != "auto":
         return requested
+    has_ppu = bool(os.environ.get("PPU_VISIBLE_DEVICES", "").strip())
     has_ascend = bool(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip())
     has_cuda = bool(os.environ.get("CUDA_VISIBLE_DEVICES", "").strip())
+    if has_ppu and not has_cuda:
+        return "ppu"
     if has_ascend and not has_cuda:
         return "npu"
     if has_cuda:
@@ -315,6 +318,18 @@ def main() -> None:
         # Propagate the user-selected devices; opencompass LocalRunner reads this.
         if "ASCEND_RT_VISIBLE_DEVICES" not in env:
             env["ASCEND_RT_VISIBLE_DEVICES"] = "0"
+    elif backend == "ppu":
+        # PPU: keep TORCH_DEVICE_BACKEND_AUTOLOAD enabled so torch_ppu (vendor
+        # PrivateUse1 extension) auto-loads in the OpenCompass subprocess. The
+        # PPU runtime is expected to follow torch_npu / Cambricon CATCH calling
+        # convention -- if your vendor SDK uses a different module name (e.g.
+        # torch_xpu, torch_mlu), the OC subprocess inherits whatever env the
+        # vendor runtime expects (PYTHONPATH, LD_LIBRARY_PATH). We propagate
+        # PPU_VISIBLE_DEVICES so the OpenCompass LocalRunner sees the same
+        # device selection used by 09/13/14 training scripts.
+        env.pop("TORCH_DEVICE_BACKEND_AUTOLOAD", None)
+        if "PPU_VISIBLE_DEVICES" not in env:
+            env["PPU_VISIBLE_DEVICES"] = "0"
     elif backend == "cpu":
         # Force opencompass onto the CPU path; block torch_npu auto-loading on Ascend hosts.
         env.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
