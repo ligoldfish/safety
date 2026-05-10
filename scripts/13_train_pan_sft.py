@@ -151,7 +151,36 @@ def main() -> None:
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=cfg.optim.learning_rate,
         weight_decay=cfg.optim.weight_decay,
+        betas=(0.9, 0.95),
     )
+    micro_batches_per_epoch = max(1, len(train_dataset) // max(int(cfg.optim.micro_batch_size or cfg.optim.batch_size), 1))
+    gradient_accumulation_steps_estimate = max(
+        1, math.ceil(int(cfg.optim.batch_size) / max(int(cfg.optim.micro_batch_size or cfg.optim.batch_size), 1))
+    )
+    num_training_steps = max(1, (micro_batches_per_epoch * int(cfg.optim.epochs)) // gradient_accumulation_steps_estimate)
+    warmup_ratio = float(getattr(cfg.optim, "warmup_ratio", 0.0) or 0.0)
+    num_warmup_steps = max(0, int(warmup_ratio * num_training_steps))
+    scheduler_kind = str(getattr(cfg.optim, "lr_scheduler", "constant") or "constant").strip().lower()
+    if scheduler_kind == "cosine":
+        from transformers import get_cosine_schedule_with_warmup
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps,
+        )
+    elif scheduler_kind == "linear":
+        from transformers import get_linear_schedule_with_warmup
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps,
+        )
+    elif scheduler_kind == "constant":
+        if num_warmup_steps > 0:
+            from transformers import get_constant_schedule_with_warmup
+            scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps)
+        else:
+            scheduler = None
+    else:
+        raise ValueError(f"Unknown lr_scheduler={scheduler_kind!r}; expected cosine|linear|constant.")
+    max_grad_norm = float(getattr(cfg.optim, "max_grad_norm", 0.0) or 0.0)
+    early_stopping_patience = int(getattr(cfg.optim, "early_stopping_patience", 0) or 0)
 
     checkpoints_dir = ensure_dir(output_root / "checkpoints")
     logs_dir = ensure_dir(output_root / "logs")
@@ -186,6 +215,9 @@ def main() -> None:
 
     val_metrics = {}
     global_step = 0
+    best_val_loss = float("inf")
+    best_epoch = 0
+    epochs_since_improve = 0
     for epoch in range(1, cfg.optim.epochs + 1):
         log_kv(logger, "epoch_start", epoch=epoch, total_epochs=int(cfg.optim.epochs))
         model.train()
@@ -207,6 +239,11 @@ def main() -> None:
                 or batch_idx == len(train_loader)
             )
             if should_step:
+                if max_grad_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad],
+                        max_grad_norm,
+                    )
                 if runtime_backend == "tpu":
                     if xla_model is None:
                         raise RuntimeError("TPU backend requested but torch_xla runtime is unavailable on the model.")
@@ -214,6 +251,8 @@ def main() -> None:
                     xla_model.mark_step()
                 else:
                     optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
                 global_step += 1
@@ -223,6 +262,7 @@ def main() -> None:
                 accumulation_loss = 0.0
 
                 if global_step % cfg.optim.log_every_steps == 0:
+                    current_lr = float(optimizer.param_groups[0]["lr"])
                     write_train_metric(
                         train_metrics_path,
                         {
@@ -230,7 +270,7 @@ def main() -> None:
                             "epoch": epoch,
                             "batch": batch_idx,
                             "loss_total": averaged_loss,
-                            "learning_rate": cfg.optim.learning_rate,
+                            "learning_rate": current_lr,
                             "effective_batch_size": cfg.optim.batch_size,
                             "micro_batch_size": micro_batch_size,
                             "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -278,6 +318,23 @@ def main() -> None:
             save_optimizer=bool(cfg.optim.save_optimizer_state),
         )
 
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            epochs_since_improve = 0
+        else:
+            epochs_since_improve += 1
+        if early_stopping_patience > 0 and epochs_since_improve >= early_stopping_patience:
+            log_kv(
+                logger,
+                "early_stop",
+                stopped_at_epoch=epoch,
+                best_epoch=best_epoch,
+                best_val_loss=best_val_loss,
+                patience=early_stopping_patience,
+            )
+            break
+
     manifest_mode = "sft" if training_mode == "lora" else "sft_full_finetune"
     manifest = {
         "config_path": str(Path(args.config).resolve()),
@@ -293,12 +350,19 @@ def main() -> None:
         "micro_batch_size": micro_batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "learning_rate": cfg.optim.learning_rate,
+        "warmup_ratio": float(getattr(cfg.optim, "warmup_ratio", 0.0) or 0.0),
+        "max_grad_norm": float(getattr(cfg.optim, "max_grad_norm", 0.0) or 0.0),
+        "lr_scheduler": str(getattr(cfg.optim, "lr_scheduler", "constant") or "constant"),
+        "early_stopping_patience": int(getattr(cfg.optim, "early_stopping_patience", 0) or 0),
         "gradient_checkpointing": bool(cfg.optim.gradient_checkpointing),
         "save_optimizer_state": bool(cfg.optim.save_optimizer_state),
         "train_num_samples": len(train_dataset),
         "val_num_samples": len(val_dataset),
         "trainable_parameters": trainable_params,
         "total_parameters": total_params,
+        "best_val_loss": best_val_loss if best_epoch else None,
+        "best_epoch": best_epoch,
+        "epochs_completed": epoch,
         "train_metrics_path": str(train_metrics_path),
         "val_metrics_path": str(val_metrics_path),
         "checkpoints_dir": str(checkpoints_dir),

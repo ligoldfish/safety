@@ -129,6 +129,10 @@ class BaselineOptimConfig:
     micro_batch_size: int = 1
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
+    warmup_ratio: float = 0.0
+    max_grad_norm: float = 0.0
+    lr_scheduler: str = "constant"
+    early_stopping_patience: int = 0
     max_length: int = 1024
     max_new_tokens: int = 256
     log_every_steps: int = 1

@@ -374,6 +374,12 @@ def evaluate_generation_refusal_metrics(
         first_pass_max_new_tokens = full_max_new_tokens
     can_retry = first_pass_max_new_tokens < full_max_new_tokens
 
+    eos_ids: List[int] = []
+    if isinstance(tokenizer.eos_token_id, (list, tuple)):
+        eos_ids = [int(eid) for eid in tokenizer.eos_token_id if eid is not None]
+    elif tokenizer.eos_token_id is not None:
+        eos_ids = [int(tokenizer.eos_token_id)]
+
     def _generate_batch(prompts: Sequence[str], gen_max_new_tokens: int) -> tuple[list[str], list[int]]:
         encoded = tokenizer(
             list(prompts),
@@ -395,11 +401,21 @@ def evaluate_generation_refusal_metrics(
         if runtime_backend == "tpu" and xla_model is not None:
             xla_model.mark_step()
         prompt_width = int(encoded["input_ids"].size(1))
+        generated_only = generated[:, prompt_width:]
         decoded = [
-            tokenizer.decode(generated[row_idx, prompt_width:], skip_special_tokens=True)
-            for row_idx in range(generated.size(0))
+            tokenizer.decode(generated_only[row_idx], skip_special_tokens=True)
+            for row_idx in range(generated_only.size(0))
         ]
-        used = [int(gen_max_new_tokens)] * generated.size(0)
+        used: list[int] = []
+        for row_idx in range(generated_only.size(0)):
+            row = generated_only[row_idx].tolist()
+            stop_idx = -1
+            if eos_ids:
+                for token_pos, token_id in enumerate(row):
+                    if token_id in eos_ids:
+                        stop_idx = token_pos + 1
+                        break
+            used.append(int(stop_idx if stop_idx > 0 else len(row)))
         return decoded, used
 
     effective_batch_size = max(1, int(batch_size))

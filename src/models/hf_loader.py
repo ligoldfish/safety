@@ -85,6 +85,23 @@ def load_hf_model(
         use_fast=False,
     )
     tokenizer.padding_side = "left"
+    # Qwen3.5 chat mode terminates each turn with <|im_end|>. The base tokenizer
+    # may default eos_token_id to <|endoftext|> (151643) which never appears in
+    # rendered chat conversations -> generate() runs to max_new_tokens, training
+    # labels never contain a learnable EOS, and 12_eval_baseline_suite reports
+    # used_max_new_tokens for every sample. Force the chat-mode EOS when the
+    # tokenizer exposes <|im_end|>.
+    im_end_id = None
+    try:
+        candidate = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        if isinstance(candidate, int) and candidate >= 0 and candidate != unk_id:
+            im_end_id = candidate
+    except Exception:
+        im_end_id = None
+    if im_end_id is not None:
+        tokenizer.eos_token = "<|im_end|>"
+        tokenizer.eos_token_id = im_end_id
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
@@ -108,6 +125,21 @@ def load_hf_model(
     model = AutoModelForCausalLM.from_pretrained(model_ref, **model_kwargs)
     if runtime["device"] is not None:
         model.to(runtime["device"])
+    # Mirror the Qwen3.5 chat EOS into model.generation_config so model.generate()
+    # and downstream save_pretrained inherit a stop-token list that includes
+    # <|im_end|>. We append rather than overwrite so existing eos_token_id (e.g.
+    # <|endoftext|>) still terminates legacy generations.
+    if im_end_id is not None and hasattr(model, "generation_config") and model.generation_config is not None:
+        existing = model.generation_config.eos_token_id
+        if existing is None:
+            model.generation_config.eos_token_id = im_end_id
+        elif isinstance(existing, (list, tuple)):
+            if im_end_id not in existing:
+                model.generation_config.eos_token_id = list(existing) + [im_end_id]
+        elif isinstance(existing, int) and existing != im_end_id:
+            model.generation_config.eos_token_id = [existing, im_end_id]
+        if model.generation_config.pad_token_id is None and tokenizer.pad_token_id is not None:
+            model.generation_config.pad_token_id = tokenizer.pad_token_id
     setattr(model, "_codex_runtime_backend", runtime["backend"] or str(device_map))
     setattr(model, "_codex_runtime_device", str(runtime["device"]) if runtime["device"] is not None else str(device_map))
     setattr(model, "_codex_xla_model", runtime["xla_model"])
