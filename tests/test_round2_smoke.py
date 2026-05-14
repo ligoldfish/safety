@@ -40,14 +40,10 @@ from src.data.safety_datasets import (
 
 
 PHASEF_YAMLS = (
-    "qwen35_08b_phaseF_npu.yaml",
-    "qwen35_08b_phaseF_ppu.yaml",
-    "qwen35_08b_phaseF_cpu.yaml",
-    "qwen35_08b_phaseF_npu_random.yaml",
-    "qwen35_08b_phaseF_ppu_random.yaml",
-    "qwen35_08b_phaseF_cpu_random.yaml",
-    "qwen35_08b_phaseF_smoke_npu.yaml",
-    "qwen35_08b_phaseF_smoke_ppu.yaml",
+    "qwen35_9b_to_08b_phaseF_npu.yaml",
+    "qwen35_9b_to_08b_phaseF_ppu.yaml",
+    "qwen35_9b_to_08b_phaseF_npu_random.yaml",
+    "qwen35_9b_to_08b_phaseF_ppu_random.yaml",
 )
 
 
@@ -79,12 +75,11 @@ class PhaseFLoRACapacityTests(unittest.TestCase):
                 )
 
     def test_npu_ppu_random_use_two_epochs(self) -> None:
-        # CPU / smoke YAMLs intentionally keep epochs=1 for fast iteration.
         for name in (
-            "qwen35_08b_phaseF_npu.yaml",
-            "qwen35_08b_phaseF_ppu.yaml",
-            "qwen35_08b_phaseF_npu_random.yaml",
-            "qwen35_08b_phaseF_ppu_random.yaml",
+            "qwen35_9b_to_08b_phaseF_npu.yaml",
+            "qwen35_9b_to_08b_phaseF_ppu.yaml",
+            "qwen35_9b_to_08b_phaseF_npu_random.yaml",
+            "qwen35_9b_to_08b_phaseF_ppu_random.yaml",
         ):
             yaml_path = PROJECT_ROOT / "configs" / name
             with self.subTest(yaml=name):

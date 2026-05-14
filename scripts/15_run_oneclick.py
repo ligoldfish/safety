@@ -113,17 +113,6 @@ FULL_PIPELINE_CONFIGS = {
     },
 }
 
-SMOKE_PIPELINE_CONFIGS = {
-    "npu": {
-        "phase1": "configs/qwen35_08b_phase1_smoke_npu.yaml",
-        "phasef": "configs/qwen35_08b_phaseF_smoke_npu.yaml",
-    },
-    "ppu": {
-        "phase1": "configs/qwen35_08b_phase1_smoke_ppu.yaml",
-        "phasef": "configs/qwen35_08b_phaseF_smoke_ppu.yaml",
-    },
-}
-
 RANDOM_PIPELINE_CONFIGS = {
     "npu": {
         "phase1": "configs/qwen35_9b_to_08b_phase1_npu.yaml",
@@ -131,7 +120,7 @@ RANDOM_PIPELINE_CONFIGS = {
     },
     "ppu": {
         "phase1": "configs/qwen35_9b_to_08b_phase1_ppu.yaml",
-        "phasef": "configs/qwen35_9b_to_08b_phaseF_tpu_random.yaml",
+        "phasef": "configs/qwen35_9b_to_08b_phaseF_ppu_random.yaml",
     },
 }
 
@@ -305,9 +294,6 @@ def parse_args() -> argparse.Namespace:
 
     full_parser = subparsers.add_parser("full", help="Run the original 00->11 full-stage pipeline.")
     add_common_flags(full_parser)
-
-    smoke_parser = subparsers.add_parser("smoke", help="Run a smoke-sized 00->11 pipeline.")
-    add_common_flags(smoke_parser)
     return parser.parse_args()
 
 
@@ -1449,7 +1435,7 @@ def _run_full_pipeline(
     opencompass_config: str = "",
 ) -> None:
     _validate_device_request(num_devices)
-    config_map = SMOKE_PIPELINE_CONFIGS if smoke else FULL_PIPELINE_CONFIGS
+    config_map = FULL_PIPELINE_CONFIGS
     phase1_config = _make_runtime_override_config(
         _resolve(config_map[device]["phase1"]),
         device=device,
@@ -1588,16 +1574,6 @@ def main() -> None:
             device_id=args.device_id,
             num_devices=args.num_devices,
             smoke=False,
-            dry_run=args.dry_run,
-            **oc_kwargs,
-        )
-        return
-    if args.command == "smoke":
-        _run_full_pipeline(
-            args.device,
-            device_id=args.device_id,
-            num_devices=args.num_devices,
-            smoke=True,
             dry_run=args.dry_run,
             **oc_kwargs,
         )

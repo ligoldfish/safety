@@ -44,10 +44,10 @@ optim:
   epochs: 1
   batch_size: 32
   micro_batch_size: 1
-  learning_rate: 1.0e-05
-  weight_decay: 0.1
-  warmup_ratio: 0.03
-  max_grad_norm: 1.0
+  learning_rate: 5.0e-06
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  max_grad_norm: 0.5
   lr_scheduler: cosine
   early_stopping_patience: 0
   max_length: 1024
