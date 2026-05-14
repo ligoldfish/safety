@@ -62,7 +62,7 @@ datasets:
     initial_max_new_tokens: 0
     exec_timeout_seconds: 3
 runtime:
-  max_length: 2048
+  max_length: 4096
   batch_size: 1
 output:
   output_root: ../outputs/baselines/eval_tulu3_safety_ppu
