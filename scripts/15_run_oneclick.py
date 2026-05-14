@@ -328,12 +328,20 @@ def _run_script(
     subprocess.run(cmd, cwd=PROJECT_ROOT, check=True, env=env)
 
 
-def _latest_checkpoint_path(training_dir: Path) -> Path:
+def _all_epoch_checkpoints(training_dir: Path, *, epochs: int, dry_run: bool) -> list[Path]:
+    """Every per-epoch checkpoint the trainer writes, oldest-first.
+
+    On a dry run the checkpoints do not exist yet, so synthesize the expected
+    ``epoch_001.pt .. epoch_{epochs}.pt`` names from the configured epoch count.
+    """
+
     checkpoint_dir = training_dir / "checkpoints"
+    if dry_run:
+        return [checkpoint_dir / f"epoch_{idx:03d}.pt" for idx in range(1, max(int(epochs), 1) + 1)]
     candidates = sorted(checkpoint_dir.glob("epoch_*.pt"))
     if not candidates:
         raise FileNotFoundError(f"No checkpoints found under: {checkpoint_dir}")
-    return candidates[-1]
+    return candidates
 
 
 def _validate_device_request(num_devices: int) -> None:
@@ -478,9 +486,13 @@ def _run_opencompass_for_adapter(
     datasets: Sequence[str],
     dry_run: bool,
     env_overrides: dict[str, str] | None = None,
+    merged_dir: Path | None = None,
+    work_dir: Path | None = None,
 ) -> Path:
-    merged_dir = training_output_root / "merged_hf"
-    work_dir = training_output_root / "opencompass"
+    if merged_dir is None:
+        merged_dir = training_output_root / "merged_hf"
+    if work_dir is None:
+        work_dir = training_output_root / "opencompass"
     _run_merge_lora(
         eval_config=eval_config,
         manifest_path=training_output_root / "manifest.json",
@@ -520,6 +532,105 @@ def _run_opencompass_for_base_model(
         env_overrides=env_overrides,
     )
     return work_dir
+
+
+def _eval_one_checkpoint(
+    *,
+    eval_config: Path,
+    training_output_root: Path,
+    checkpoint_path: Path,
+    eval_output_root: Path,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+    enable_opencompass: bool,
+    dry_run: bool,
+    env_overrides: dict[str, str] | None = None,
+    safety_eval_datasets: Sequence[str] = (),
+) -> None:
+    """Run safety eval (12_eval_baseline_suite) + general eval (OpenCompass) for
+    a single checkpoint, writing every artifact under ``eval_output_root``."""
+
+    if not dry_run:
+        eval_output_root.mkdir(parents=True, exist_ok=True)
+    eval_args = [
+        "--config",
+        str(eval_config),
+        "--adapter-manifest",
+        str(training_output_root / "manifest.json"),
+        "--adapter-checkpoint",
+        str(checkpoint_path),
+        "--output-dir",
+        str(eval_output_root),
+    ]
+    if safety_eval_datasets:
+        eval_args.extend(["--safety-eval-datasets", *safety_eval_datasets])
+    _run_script(
+        "12_eval_baseline_suite.py",
+        eval_args,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    oc_work_dir: Path | None = None
+    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
+        oc_work_dir = _run_opencompass_for_adapter(
+            eval_config=eval_config,
+            training_output_root=training_output_root,
+            checkpoint_path=checkpoint_path,
+            opencompass_dir=opencompass_dir,
+            datasets=opencompass_datasets,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+            merged_dir=eval_output_root / "merged_hf",
+            work_dir=eval_output_root / "opencompass",
+        )
+    _run_final_merge(
+        pan_summary_path=eval_output_root / "summary.json",
+        opencompass_work_dir=oc_work_dir,
+        output_path=eval_output_root / "final_summary.json",
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+
+def _eval_all_epoch_checkpoints(
+    *,
+    eval_config: Path,
+    training_output_root: Path,
+    epochs: int,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+    enable_opencompass: bool,
+    dry_run: bool,
+    env_overrides: dict[str, str] | None = None,
+    safety_eval_datasets: Sequence[str] = (),
+) -> None:
+    """Evaluate every per-epoch checkpoint the trainer wrote.
+
+    Each checkpoint's safety + general eval lands in its own
+    ``eval_suite/<epoch_NNN>/`` subdirectory so per-epoch progress is
+    inspectable instead of only the final epoch.
+    """
+
+    checkpoints = _all_epoch_checkpoints(
+        training_output_root, epochs=epochs, dry_run=dry_run
+    )
+    for checkpoint_path in checkpoints:
+        eval_output_root = training_output_root / "eval_suite" / checkpoint_path.stem
+        _eval_one_checkpoint(
+            eval_config=eval_config,
+            training_output_root=training_output_root,
+            checkpoint_path=checkpoint_path,
+            eval_output_root=eval_output_root,
+            opencompass_dir=opencompass_dir,
+            opencompass_datasets=opencompass_datasets,
+            skip_opencompass=skip_opencompass,
+            enable_opencompass=enable_opencompass,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+            safety_eval_datasets=safety_eval_datasets,
+        )
 
 
 def _override_model_runtime(model_payload: dict[str, Any], device: str, device_id: int) -> None:
@@ -932,11 +1043,13 @@ def _run_safety_full(
         env_overrides=env_overrides,
     )
 
-    # 7) PAN safety eval + OpenCompass general eval against the trained adapter.
+    # 7) PAN safety eval + OpenCompass general eval against every epoch checkpoint.
+    phasef_cfg = load_phasef_config(phasef_override)
     _run_adapter_eval(
         device=device,
         model_size="0.8b",
         training_output_root=safety_phasef_output_root,
+        epochs=int(phasef_cfg.optim.epochs),
         device_id=device_id,
         dry_run=dry_run,
         env_overrides=env_overrides,
@@ -1000,46 +1113,17 @@ def _run_safety_distill(
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
-    if dry_run:
-        checkpoint_path = Path(cfg.output.output_root) / "checkpoints" / f"epoch_{cfg.optim.epochs:03d}.pt"
-    else:
-        checkpoint_path = _latest_checkpoint_path(Path(cfg.output.output_root))
-    pan_output_root = Path(cfg.output.output_root) / "eval_suite"
-    eval_args = [
-        "--config",
-        str(eval_config),
-        "--adapter-manifest",
-        str(Path(cfg.output.output_root) / "manifest.json"),
-        "--adapter-checkpoint",
-        str(checkpoint_path),
-        "--output-dir",
-        str(pan_output_root),
-    ]
-    if safety_eval_datasets:
-        eval_args.extend(["--safety-eval-datasets", *safety_eval_datasets])
-    _run_script(
-        "12_eval_baseline_suite.py",
-        eval_args,
+    _eval_all_epoch_checkpoints(
+        eval_config=eval_config,
+        training_output_root=Path(cfg.output.output_root),
+        epochs=int(cfg.optim.epochs),
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
         dry_run=dry_run,
         env_overrides=env_overrides,
-    )
-    oc_work_dir: Path | None = None
-    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
-        oc_work_dir = _run_opencompass_for_adapter(
-            eval_config=eval_config,
-            training_output_root=Path(cfg.output.output_root),
-            checkpoint_path=checkpoint_path,
-            opencompass_dir=opencompass_dir,
-            datasets=opencompass_datasets,
-            dry_run=dry_run,
-            env_overrides=env_overrides,
-        )
-    _run_final_merge(
-        pan_summary_path=pan_output_root / "summary.json",
-        opencompass_work_dir=oc_work_dir,
-        output_path=pan_output_root / "final_summary.json",
-        dry_run=dry_run,
-        env_overrides=env_overrides,
+        safety_eval_datasets=safety_eval_datasets,
     )
 
 
@@ -1095,46 +1179,17 @@ def _run_safety_sft(
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
-    if dry_run:
-        checkpoint_path = Path(cfg.output.output_root) / "checkpoints" / f"epoch_{cfg.optim.epochs:03d}.pt"
-    else:
-        checkpoint_path = _latest_checkpoint_path(Path(cfg.output.output_root))
-    pan_output_root = Path(cfg.output.output_root) / "eval_suite"
-    eval_args = [
-        "--config",
-        str(eval_config),
-        "--adapter-manifest",
-        str(Path(cfg.output.output_root) / "manifest.json"),
-        "--adapter-checkpoint",
-        str(checkpoint_path),
-        "--output-dir",
-        str(pan_output_root),
-    ]
-    if safety_eval_datasets:
-        eval_args.extend(["--safety-eval-datasets", *safety_eval_datasets])
-    _run_script(
-        "12_eval_baseline_suite.py",
-        eval_args,
+    _eval_all_epoch_checkpoints(
+        eval_config=eval_config,
+        training_output_root=Path(cfg.output.output_root),
+        epochs=int(cfg.optim.epochs),
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
         dry_run=dry_run,
         env_overrides=env_overrides,
-    )
-    oc_work_dir: Path | None = None
-    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
-        oc_work_dir = _run_opencompass_for_adapter(
-            eval_config=eval_config,
-            training_output_root=Path(cfg.output.output_root),
-            checkpoint_path=checkpoint_path,
-            opencompass_dir=opencompass_dir,
-            datasets=opencompass_datasets,
-            dry_run=dry_run,
-            env_overrides=env_overrides,
-        )
-    _run_final_merge(
-        pan_summary_path=pan_output_root / "summary.json",
-        opencompass_work_dir=oc_work_dir,
-        output_path=pan_output_root / "final_summary.json",
-        dry_run=dry_run,
-        env_overrides=env_overrides,
+        safety_eval_datasets=safety_eval_datasets,
     )
 
 
@@ -1171,41 +1226,14 @@ def _run_baseline_sft(
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
-    if dry_run:
-        checkpoint_path = Path(cfg.output.output_root) / "checkpoints" / f"epoch_{cfg.optim.epochs:03d}.pt"
-    else:
-        checkpoint_path = _latest_checkpoint_path(Path(cfg.output.output_root))
-    pan_output_root = Path(cfg.output.output_root) / "eval_suite"
-    _run_script(
-        "12_eval_baseline_suite.py",
-        [
-            "--config",
-            str(eval_config),
-            "--adapter-manifest",
-            str(Path(cfg.output.output_root) / "manifest.json"),
-            "--adapter-checkpoint",
-            str(checkpoint_path),
-            "--output-dir",
-            str(pan_output_root),
-        ],
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-    )
-    oc_work_dir: Path | None = None
-    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
-        oc_work_dir = _run_opencompass_for_adapter(
-            eval_config=eval_config,
-            training_output_root=Path(cfg.output.output_root),
-            checkpoint_path=checkpoint_path,
-            opencompass_dir=opencompass_dir,
-            datasets=opencompass_datasets,
-            dry_run=dry_run,
-            env_overrides=env_overrides,
-        )
-    _run_final_merge(
-        pan_summary_path=pan_output_root / "summary.json",
-        opencompass_work_dir=oc_work_dir,
-        output_path=pan_output_root / "final_summary.json",
+    _eval_all_epoch_checkpoints(
+        eval_config=eval_config,
+        training_output_root=Path(cfg.output.output_root),
+        epochs=int(cfg.optim.epochs),
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
@@ -1243,41 +1271,14 @@ def _run_baseline_distill(
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
-    if dry_run:
-        checkpoint_path = Path(cfg.output.output_root) / "checkpoints" / f"epoch_{cfg.optim.epochs:03d}.pt"
-    else:
-        checkpoint_path = _latest_checkpoint_path(Path(cfg.output.output_root))
-    pan_output_root = Path(cfg.output.output_root) / "eval_suite"
-    _run_script(
-        "12_eval_baseline_suite.py",
-        [
-            "--config",
-            str(eval_config),
-            "--adapter-manifest",
-            str(Path(cfg.output.output_root) / "manifest.json"),
-            "--adapter-checkpoint",
-            str(checkpoint_path),
-            "--output-dir",
-            str(pan_output_root),
-        ],
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-    )
-    oc_work_dir: Path | None = None
-    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
-        oc_work_dir = _run_opencompass_for_adapter(
-            eval_config=eval_config,
-            training_output_root=Path(cfg.output.output_root),
-            checkpoint_path=checkpoint_path,
-            opencompass_dir=opencompass_dir,
-            datasets=opencompass_datasets,
-            dry_run=dry_run,
-            env_overrides=env_overrides,
-        )
-    _run_final_merge(
-        pan_summary_path=pan_output_root / "summary.json",
-        opencompass_work_dir=oc_work_dir,
-        output_path=pan_output_root / "final_summary.json",
+    _eval_all_epoch_checkpoints(
+        eval_config=eval_config,
+        training_output_root=Path(cfg.output.output_root),
+        epochs=int(cfg.optim.epochs),
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
@@ -1288,6 +1289,7 @@ def _run_adapter_eval(
     device: str,
     model_size: str,
     training_output_root: Path,
+    epochs: int,
     device_id: int,
     dry_run: bool,
     env_overrides: dict[str, str] | None = None,
@@ -1308,46 +1310,17 @@ def _run_adapter_eval(
         device=device,
         device_id=device_id,
     )
-    if dry_run:
-        checkpoint_path = training_output_root / "checkpoints" / "epoch_999.pt"
-    else:
-        checkpoint_path = _latest_checkpoint_path(training_output_root)
-    pan_output_root = training_output_root / "eval_suite"
-    eval_args = [
-        "--config",
-        str(eval_config),
-        "--adapter-manifest",
-        str(training_output_root / "manifest.json"),
-        "--adapter-checkpoint",
-        str(checkpoint_path),
-        "--output-dir",
-        str(pan_output_root),
-    ]
-    if safety_eval_datasets:
-        eval_args.extend(["--safety-eval-datasets", *safety_eval_datasets])
-    _run_script(
-        "12_eval_baseline_suite.py",
-        eval_args,
+    _eval_all_epoch_checkpoints(
+        eval_config=eval_config,
+        training_output_root=training_output_root,
+        epochs=epochs,
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
         dry_run=dry_run,
         env_overrides=env_overrides,
-    )
-    oc_work_dir: Path | None = None
-    if _should_run_opencompass(opencompass_dir, skip_opencompass, enable_opencompass):
-        oc_work_dir = _run_opencompass_for_adapter(
-            eval_config=eval_config,
-            training_output_root=training_output_root,
-            checkpoint_path=checkpoint_path,
-            opencompass_dir=opencompass_dir,
-            datasets=opencompass_datasets,
-            dry_run=dry_run,
-            env_overrides=env_overrides,
-        )
-    _run_final_merge(
-        pan_summary_path=pan_output_root / "summary.json",
-        opencompass_work_dir=oc_work_dir,
-        output_path=pan_output_root / "final_summary.json",
-        dry_run=dry_run,
-        env_overrides=env_overrides,
+        safety_eval_datasets=safety_eval_datasets,
     )
 
 
@@ -1411,6 +1384,7 @@ def _run_random_baseline(
         device=device,
         model_size="0.8b",
         training_output_root=Path(phasef_cfg.output.output_root),
+        epochs=int(phasef_cfg.optim.epochs),
         device_id=device_id,
         dry_run=dry_run,
         env_overrides=env_overrides,
@@ -1464,6 +1438,7 @@ def _run_full_pipeline(
         device=device,
         model_size="0.8b",
         training_output_root=Path(phasef_cfg.output.output_root),
+        epochs=int(phasef_cfg.optim.epochs),
         device_id=device_id,
         dry_run=dry_run,
         env_overrides=env_overrides,

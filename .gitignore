@@ -5,6 +5,9 @@ __pycache__/
 .pytest_cache/
 tmp_pytest/
 outputs/
+configs/*_launcher_*.yaml
+configs/*_safety_*_npu_*.yaml
+configs/*_safety_*_ppu_*.yaml
 *.log
 .DS_Store
 *.pdf
