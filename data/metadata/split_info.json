@@ -1,0 +1,107 @@
+{
+  "seed": 42,
+  "copied_files": {
+    "toxicity.csv": "D:\\safety\\data\\raw\\pan\\toxicity.csv",
+    "safety.csv": "D:\\safety\\data\\raw\\pan\\safety.csv",
+    "add_moderation.csv": "D:\\safety\\data\\raw\\pan\\add_moderation.csv",
+    "sr_moderation.csv": "D:\\safety\\data\\raw\\pan\\sr_moderation.csv"
+  },
+  "pan_train_size": 2600,
+  "pan_test_size": 960,
+  "pan_reconstruction": {
+    "exposure_size": 60,
+    "pan_test_size_per_type": 60,
+    "pan_train_size": 2600,
+    "max_prompt_chars": 2048,
+    "harmful_size": 1300,
+    "safe_size": 1300,
+    "harmful_remaining_from_add_moderation": 820,
+    "harmful_methods": [
+      "our",
+      "pair",
+      "simple",
+      "gptfuzz",
+      "flip",
+      "gcg",
+      "renellm",
+      "codechaeleom"
+    ],
+    "train_source_counts": {
+      "or-bench": 1300,
+      "data/adv_moderation.csv": 507,
+      "data/sr_moderation.csv": 313,
+      "our": 60,
+      "pair": 60,
+      "simple": 60,
+      "gptfuzz": 60,
+      "flip": 60,
+      "gcg": 60,
+      "renellm": 60,
+      "codechaeleom": 60
+    },
+    "test_source_counts": {
+      "or-bench": 480,
+      "our": 60,
+      "pair": 60,
+      "simple": 60,
+      "gptfuzz": 60,
+      "flip": 60,
+      "gcg": 60,
+      "renellm": 60,
+      "codechaeleom": 60
+    }
+  },
+  "alignment_size": 2100,
+  "analysis_val_size": 500,
+  "alignment_label_counts": {
+    "harmful": 1050,
+    "harmless": 1050
+  },
+  "analysis_val_label_counts": {
+    "harmful": 250,
+    "harmless": 250
+  },
+  "alignment_source_counts": {
+    "or-bench": 1050,
+    "data/adv_moderation.csv": 409,
+    "data/sr_moderation.csv": 252,
+    "gptfuzz": 49,
+    "our": 49,
+    "pair": 49,
+    "renellm": 49,
+    "simple": 49,
+    "codechaeleom": 48,
+    "flip": 48,
+    "gcg": 48
+  },
+  "analysis_val_source_counts": {
+    "or-bench": 250,
+    "data/adv_moderation.csv": 98,
+    "data/sr_moderation.csv": 61,
+    "codechaeleom": 12,
+    "flip": 12,
+    "gcg": 12,
+    "gptfuzz": 11,
+    "our": 11,
+    "pair": 11,
+    "renellm": 11,
+    "simple": 11
+  },
+  "sanity_test_size": 400,
+  "sanity_test_size_per_label": 200,
+  "sanity_test_label_counts": {
+    "harmful": 200,
+    "harmless": 200
+  },
+  "sanity_test_source_counts": {
+    "or-bench": 200,
+    "pair": 32,
+    "codechaeleom": 30,
+    "our": 28,
+    "renellm": 25,
+    "gptfuzz": 23,
+    "gcg": 23,
+    "simple": 21,
+    "flip": 18
+  }
+}

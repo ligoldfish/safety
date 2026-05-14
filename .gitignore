@@ -5,9 +5,6 @@ __pycache__/
 .pytest_cache/
 tmp_pytest/
 outputs/
-data/processed/
-data/raw/
-external/
 *.log
 .DS_Store
 *.pdf
