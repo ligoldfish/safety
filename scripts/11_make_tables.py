@@ -164,7 +164,16 @@ def main() -> None:
         "key_layers": key_layers,
         "layer_pairs": layer_pair_rows,
         "training": {
-            "paired_student_layers": training_manifest["paired_student_layers"],
+            "pair_to_student_layer": training_manifest.get(
+                "pair_to_student_layer",
+                training_manifest.get("paired_student_layers"),
+            ),
+            "unique_student_layers": training_manifest.get(
+                "unique_student_layers",
+                sorted(
+                    set((training_manifest.get("pair_to_student_layer") or {}).values())
+                ) if training_manifest.get("pair_to_student_layer") else None,
+            ),
             "train_num_samples": training_manifest["train_num_samples"],
             "val_num_samples": training_manifest["val_num_samples"],
             "epochs": training_manifest["epochs"],
