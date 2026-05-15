@@ -51,55 +51,11 @@ def parse_args() -> argparse.Namespace:
         default="float16",
         help="On-disk dtype for recomposed student targets.",
     )
-    parser.add_argument(
-        "--allow-multi-teacher-mean",
-        action="store_true",
-        help=(
-            "Opt-in: when multiple teacher key layers map to the same student "
-            "layer via the pairing table, element-wise average their recomposed "
-            "targets. Default (strict): fail fast with a clear error message "
-            "instead of silently mixing teacher layers."
-        ),
-    )
     return parser.parse_args()
 
 
 def _load_json(path: Path) -> Dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def resolve_multi_teacher_reduction(
-    teacher_to_student: Dict[int, int],
-    *,
-    allow_multi_teacher_mean: bool,
-    pairing_path: Path | str = "<pairing>",
-) -> tuple[str, Dict[str, List[int]]]:
-    """Return the reduction strategy and (if any) multi-teacher collision groups.
-
-    Strict (default): raise ValueError if any student layer has more than one
-    teacher layer mapped to it. Opt-in: return ``"mean"`` and the collision
-    groups for manifest/log recording.
-    """
-
-    student_to_teachers: Dict[int, List[int]] = defaultdict(list)
-    for teacher_layer, student_layer in teacher_to_student.items():
-        student_to_teachers[int(student_layer)].append(int(teacher_layer))
-    multi_layer_groups = {
-        str(student_layer): sorted(teachers)
-        for student_layer, teachers in student_to_teachers.items()
-        if len(teachers) > 1
-    }
-    reduction_strategy = "mean" if allow_multi_teacher_mean else "strict_single"
-    if multi_layer_groups and not allow_multi_teacher_mean:
-        raise ValueError(
-            "Multi-teacher-to-one-student layer collision detected in pairing "
-            f"file {pairing_path}: {multi_layer_groups}. Default recomposition "
-            "is strict (one teacher per student layer). Resolve the pairing or "
-            "re-run with --allow-multi-teacher-mean to explicitly average the "
-            "recomposed targets (the chosen strategy will be recorded in the "
-            "manifest as multi_to_one_reduction='mean')."
-        )
-    return reduction_strategy, multi_layer_groups
 
 
 def main() -> None:
@@ -121,21 +77,28 @@ def main() -> None:
     student_basis_payload = torch.load(student_basis_path, map_location="cpu", weights_only=True)
     student_basis = student_basis_payload["basis"]
     pairing_payload = _load_json(pairing_path)
-    teacher_to_student = {
-        int(item["teacher_layer"]): int(item["student_layer"])
-        for item in pairing_payload["pairs"]
-    }
+    raw_pairs = list(pairing_payload["pairs"])
+    if not raw_pairs:
+        raise ValueError(f"No pairs found in pairing file: {pairing_path}")
 
-    # Detect multi-teacher-to-one-student collisions up front. The 方案详述 fixes
-    # the pairing rule as "relative depth, no interpolation" and does not
-    # prescribe how to combine multiple teachers pointing at the same student
-    # layer. Silent averaging would quietly change the supervision signal, so
-    # by default we refuse to run and require an explicit opt-in.
-    reduction_strategy, multi_layer_groups = resolve_multi_teacher_reduction(
-        teacher_to_student,
-        allow_multi_teacher_mean=bool(args.allow_multi_teacher_mean),
-        pairing_path=pairing_path,
-    )
+    # Preserve pair list order from 04 so pair_idx is deterministic. Each pair
+    # contributes one independent alignment target; multiple pairs may share the
+    # same student layer (cross-scale collision is expected when teacher has
+    # more layers than student). Per the 方案详述 §5.3 rule we do NOT modify the
+    # pairing, and per the user's option-a choice we keep one target per pair
+    # rather than averaging colliding teachers, so the loss can sum K
+    # independent cosine terms.
+    pair_index_to_pair: List[Dict[str, int]] = [
+        {
+            "pair_idx": idx,
+            "teacher_layer": int(pair["teacher_layer"]),
+            "student_layer": int(pair["student_layer"]),
+        }
+        for idx, pair in enumerate(raw_pairs)
+    ]
+    student_to_pair_indices: Dict[int, List[int]] = defaultdict(list)
+    for entry in pair_index_to_pair:
+        student_to_pair_indices[entry["student_layer"]].append(entry["pair_idx"])
 
     part_paths = sorted(input_dir.glob("part_*.pt"))
     if not part_paths:
@@ -149,52 +112,43 @@ def main() -> None:
         output_dir=str(output_dir),
         student_basis_path=str(student_basis_path),
         pairing_path=str(pairing_path),
-        num_pairs=len(teacher_to_student),
+        num_pairs=len(pair_index_to_pair),
+        student_to_pair_indices={
+            str(student_layer): sorted(pair_indices)
+            for student_layer, pair_indices in student_to_pair_indices.items()
+        },
         num_parts=len(part_paths),
         storage_dtype=args.storage_dtype,
-        multi_to_one_reduction=reduction_strategy,
-        allow_multi_teacher_mean=bool(args.allow_multi_teacher_mean),
-        multi_teacher_to_one_student_groups=multi_layer_groups,
         log_path=str(log_path),
     )
 
     manifest_files: List[str] = []
     for part_path in part_paths:
         payload = torch.load(part_path, map_location="cpu", weights_only=True)
-        accumulators: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        semantic_coeffs_by_layer = payload["semantic_coeffs_by_layer"]
 
-        for teacher_layer_text, coeff_payload in payload["semantic_coeffs_by_layer"].items():
-            teacher_layer = int(teacher_layer_text)
-            if teacher_layer not in teacher_to_student:
-                continue
-            student_layer = teacher_to_student[teacher_layer]
+        student_safe_target_by_pair: Dict[str, torch.Tensor] = {}
+        for entry in pair_index_to_pair:
+            teacher_layer = entry["teacher_layer"]
+            teacher_layer_key = str(teacher_layer)
+            if teacher_layer_key not in semantic_coeffs_by_layer:
+                raise KeyError(
+                    f"semantic coeff shard {part_path} is missing teacher layer "
+                    f"{teacher_layer} required by pair_idx={entry['pair_idx']}."
+                )
+            coeff_payload = semantic_coeffs_by_layer[teacher_layer_key]
             recomposed = recompose_from_sparse_coeffs(
                 student_basis,
                 coeff_payload["top_indices"],
                 coeff_payload["top_values"],
             )
-            accumulators[student_layer].append(recomposed)
-
-        student_safe_target_by_layer: Dict[str, torch.Tensor] = {}
-        # Reduction rule:
-        #   * strict_single (default): each student layer has exactly one
-        #     teacher; the collision check above already rejected any other
-        #     configuration, so ``tensors`` always has length 1 and we write
-        #     the single recomposed target through unchanged.
-        #   * mean (opt-in via --allow-multi-teacher-mean): element-wise
-        #     average of all teacher-layer recompositions mapped to the same
-        #     student layer. Strategy is echoed in the manifest.
-        for student_layer, tensors in sorted(accumulators.items()):
-            if len(tensors) == 1:
-                combined = tensors[0]
-            else:
-                combined = torch.stack(tensors, dim=0).mean(dim=0)
-            student_safe_target_by_layer[str(student_layer)] = combined.to(dtype=storage_dtype)
+            student_safe_target_by_pair[str(entry["pair_idx"])] = recomposed.to(dtype=storage_dtype)
 
         output_payload = {
             "sample_ids": payload["sample_ids"],
             "labels": payload["labels"],
-            "student_safe_target_by_layer": student_safe_target_by_layer,
+            "student_safe_target_by_pair": student_safe_target_by_pair,
+            "pair_index_to_pair": pair_index_to_pair,
         }
         target_path = output_dir / part_path.name
         torch.save(output_payload, target_path)
@@ -206,23 +160,9 @@ def main() -> None:
             part_path=str(part_path),
             output_path=str(target_path),
             sample_count=len(payload["sample_ids"]),
-            student_layers=sorted(int(layer_idx) for layer_idx in student_safe_target_by_layer.keys()),
+            pair_indices=sorted(int(key) for key in student_safe_target_by_pair.keys()),
         )
 
-    student_to_teachers: Dict[int, List[int]] = defaultdict(list)
-    for teacher_layer, student_layer in teacher_to_student.items():
-        student_to_teachers[int(student_layer)].append(int(teacher_layer))
-    if reduction_strategy == "mean":
-        reduction_doc = (
-            "student_safe_target_by_layer[l_S] = mean over teacher layers l_T "
-            "paired to l_S of (student_basis @ sparse_a_{l_T}). Explicit opt-in "
-            "via --allow-multi-teacher-mean."
-        )
-    else:
-        reduction_doc = (
-            "student_safe_target_by_layer[l_S] = student_basis @ sparse_a_{l_T} "
-            "for the unique teacher layer l_T paired to l_S (strict 1:1 rule)."
-        )
     write_json(
         output_dir / "manifest.json",
         {
@@ -231,20 +171,19 @@ def main() -> None:
             "semantic_coeff_dir": str(input_dir),
             "student_basis_path": str(student_basis_path),
             "pairing_path": str(pairing_path),
-            "teacher_to_student": teacher_to_student,
-            "student_to_teachers": {
-                str(student_layer): sorted(teachers)
-                for student_layer, teachers in student_to_teachers.items()
+            "pair_index_to_pair": pair_index_to_pair,
+            "student_to_pair_indices": {
+                str(student_layer): sorted(pair_indices)
+                for student_layer, pair_indices in student_to_pair_indices.items()
             },
-            "multi_teacher_to_one_student_groups": multi_layer_groups,
-            "multi_to_one_reduction": reduction_strategy,
-            "allow_multi_teacher_mean": bool(args.allow_multi_teacher_mean),
             "storage_dtype": args.storage_dtype,
             "target_semantics": (
-                f"{reduction_doc} sparse_a_{{l_T}} is the top-256 teacher "
-                "semantic coefficient vector from step 07. Lives in student "
-                "hidden space; supervises cosine alignment against student "
-                "layer output at the generation-prompt last-token position."
+                "student_safe_target_by_pair[pair_idx] = student_basis @ "
+                "sparse_a_{l_T(pair_idx)}. Each pair_idx is one row of the "
+                "pairing list from 04_pair_layers; multiple pair_idx values may "
+                "share the same student_layer (cross-scale collision) and the "
+                "trainer feeds K independent cosine alignment terms — one per "
+                "pair — into loss_layer per the user's option-a setting."
             ),
             "files": manifest_files,
         },
@@ -256,7 +195,11 @@ def main() -> None:
             {
                 "split": args.split,
                 "output_dir": str(output_dir),
-                "num_pairs": len(teacher_to_student),
+                "num_pairs": len(pair_index_to_pair),
+                "student_to_pair_indices": {
+                    str(student_layer): sorted(pair_indices)
+                    for student_layer, pair_indices in student_to_pair_indices.items()
+                },
             },
             ensure_ascii=False,
             indent=2,

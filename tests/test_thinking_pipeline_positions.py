@@ -125,7 +125,12 @@ class FirstGeneratedTokenPositionTests(unittest.TestCase):
         record = _build_record()
         prompt_text = render_qwen_generation_prompt(tokenizer, record["messages"])
 
-        collator = SemAlignCollator(tokenizer, max_length=1024, layer_ids=[0])
+        collator = SemAlignCollator(
+            tokenizer,
+            max_length=1024,
+            layer_ids=[0],
+            pair_to_student_layer={0: 0},
+        )
         batch = collator(
             [
                 {

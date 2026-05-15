@@ -22,6 +22,7 @@ from src.training import (
     evaluate_generation_refusal_metrics,
     evaluate_layer_alignment,
     forward_semalign_batch,
+    load_pair_to_student_layer,
     load_records,
     load_student_anchor_map,
     load_student_target_map,
@@ -68,17 +69,18 @@ def main() -> None:
             "Expected 'all', 'harmful_only', 'label_weighted', or 'harmless_anchor'."
         )
 
-    semantic_train_target_map, train_layer_ids = load_student_target_map(cfg.inputs.train_targets_dir)
-    semantic_val_target_map, val_layer_ids = load_student_target_map(cfg.inputs.val_targets_dir)
-    if train_layer_ids != val_layer_ids:
-        raise ValueError("Train and validation student target layers do not match.")
-    layer_ids = train_layer_ids
-    pairing_payload = json.loads(Path(cfg.inputs.pairing_path).read_text(encoding="utf-8"))
-    paired_student_layers = sorted(int(item["student_layer"]) for item in pairing_payload["pairs"])
-    if layer_ids != paired_student_layers:
+    semantic_train_target_map, train_pair_keys = load_student_target_map(cfg.inputs.train_targets_dir)
+    semantic_val_target_map, val_pair_keys = load_student_target_map(cfg.inputs.val_targets_dir)
+    if train_pair_keys != val_pair_keys:
+        raise ValueError("Train and validation student target pair indices do not match.")
+    layer_ids = train_pair_keys
+    pair_to_student_layer = load_pair_to_student_layer(cfg.inputs.pairing_path)
+    expected_pair_keys = sorted(pair_to_student_layer.keys())
+    if layer_ids != expected_pair_keys:
         raise ValueError(
-            f"Student target layers {layer_ids} do not match pairing file layers {paired_student_layers}."
+            f"Student target pair indices {layer_ids} do not match pairing file indices {expected_pair_keys}."
         )
+    unique_student_layers = sorted(set(pair_to_student_layer.values()))
     train_anchor_map = None
     val_anchor_map = None
     if layer_loss_policy == "harmless_anchor":
@@ -87,8 +89,8 @@ def main() -> None:
                 "target.layer_loss_policy='harmless_anchor' requires inputs.train_anchor_dir "
                 "and inputs.val_anchor_dir."
             )
-        train_anchor_map = load_student_anchor_map(cfg.inputs.train_anchor_dir, layer_ids=layer_ids)
-        val_anchor_map = load_student_anchor_map(cfg.inputs.val_anchor_dir, layer_ids=layer_ids)
+        train_anchor_map = load_student_anchor_map(cfg.inputs.train_anchor_dir, layer_ids=unique_student_layers)
+        val_anchor_map = load_student_anchor_map(cfg.inputs.val_anchor_dir, layer_ids=unique_student_layers)
 
     if target_mode == "semantic":
         train_target_map = semantic_train_target_map
@@ -148,7 +150,12 @@ def main() -> None:
     freeze_non_lora_parameters(model)
     trainable_params, total_params = count_trainable_parameters(model)
 
-    collator = SemAlignCollator(tokenizer, max_length=cfg.optim.max_length, layer_ids=layer_ids)
+    collator = SemAlignCollator(
+        tokenizer,
+        max_length=cfg.optim.max_length,
+        layer_ids=layer_ids,
+        pair_to_student_layer=pair_to_student_layer,
+    )
     micro_batch_size = int(cfg.optim.micro_batch_size or cfg.optim.batch_size)
     micro_batch_size = max(1, min(micro_batch_size, int(cfg.optim.batch_size)))
     gradient_accumulation_steps = max(1, math.ceil(cfg.optim.batch_size / micro_batch_size))
@@ -274,6 +281,7 @@ def main() -> None:
                 batch,
                 device=device,
                 layer_ids=layer_ids,
+                pair_to_student_layer=pair_to_student_layer,
                 layer_loss_weight=cfg.optim.layer_loss_weight,
                 sft_loss_weight=cfg.optim.sft_loss_weight,
                 layer_loss_policy=layer_loss_policy,
@@ -337,6 +345,7 @@ def main() -> None:
             val_loader,
             device=device,
             layer_ids=layer_ids,
+            pair_to_student_layer=pair_to_student_layer,
             layer_loss_policy=layer_loss_policy,
             harmful_layer_weight=float(cfg.target.harmful_layer_weight),
             harmless_layer_weight=float(cfg.target.harmless_layer_weight),
@@ -348,6 +357,7 @@ def main() -> None:
                 semantic_reference_val_loader,
                 device=device,
                 layer_ids=layer_ids,
+                pair_to_student_layer=pair_to_student_layer,
                 layer_loss_policy=layer_loss_policy,
                 harmful_layer_weight=float(cfg.target.harmful_layer_weight),
                 harmless_layer_weight=float(cfg.target.harmless_layer_weight),

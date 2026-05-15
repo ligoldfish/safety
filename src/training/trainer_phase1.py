@@ -25,22 +25,48 @@ from src.utils.io import ensure_dir, read_jsonl, write_json
 
 
 def load_student_target_map(target_dir: str | Path) -> tuple[Dict[str, Dict[int, torch.Tensor]], List[int]]:
+    """Load per-pair recomposed safety targets emitted by 08_recompose.
+
+    Returns ``(target_map, pair_keys)`` where ``target_map[sample_id][pair_idx]``
+    is the K-th recomposed target tensor for that sample and ``pair_keys`` is
+    the sorted list of pair indices [0, 1, ..., K-1]. Per the user's option-a
+    setting in 08, each pair_idx is one independent alignment term; multiple
+    pair_idx values may share the same student_layer (cross-scale collision).
+    The pair_idx -> (teacher_layer, student_layer) resolution lives in the
+    pairing file from 04 and the per-shard ``pair_index_to_pair`` metadata
+    written by 08; load it via ``load_pair_to_student_layer`` separately.
+    """
+
     target_path = Path(target_dir)
     part_paths = sorted(target_path.glob("part_*.pt"))
     if not part_paths:
         raise FileNotFoundError(f"No student target shards found under: {target_path}")
 
     target_map: Dict[str, Dict[int, torch.Tensor]] = {}
-    layer_ids: set[int] = set()
+    pair_keys: set[int] = set()
     for part_path in part_paths:
         payload = torch.load(part_path, map_location="cpu", weights_only=True)
+        if "student_safe_target_by_pair" not in payload:
+            raise KeyError(
+                f"Target shard {part_path} lacks 'student_safe_target_by_pair'. "
+                "Re-run 08_recompose_student_targets.py to produce per-pair "
+                "targets (option-a layout)."
+            )
         sample_ids = [str(sample_id) for sample_id in payload["sample_ids"]]
-        for layer_text, tensor in payload["student_safe_target_by_layer"].items():
-            layer_idx = int(layer_text)
-            layer_ids.add(layer_idx)
+        for pair_text, tensor in payload["student_safe_target_by_pair"].items():
+            pair_idx = int(pair_text)
+            pair_keys.add(pair_idx)
             for row_idx, sample_id in enumerate(sample_ids):
-                target_map.setdefault(sample_id, {})[layer_idx] = tensor[row_idx].to(dtype=torch.float32)
-    return target_map, sorted(layer_ids)
+                target_map.setdefault(sample_id, {})[pair_idx] = tensor[row_idx].to(dtype=torch.float32)
+    return target_map, sorted(pair_keys)
+
+
+def load_pair_to_student_layer(pairing_path: str | Path) -> Dict[int, int]:
+    """Read 04's pairing file and return ``{pair_idx: student_layer}``."""
+
+    payload = json.loads(Path(pairing_path).read_text(encoding="utf-8"))
+    pairs = list(payload["pairs"])
+    return {idx: int(pair["student_layer"]) for idx, pair in enumerate(pairs)}
 
 
 def load_student_anchor_map(
@@ -182,12 +208,30 @@ class SemAlignCollator:
     teacher/student "first generated token" hidden states. The supervision mask
     sets labels to ``-100`` on the prompt span so only the assistant response
     contributes to ``L_out``.
+
+    ``layer_ids`` is the list of pair indices (one per row of the pairing file
+    from 04). ``pair_to_student_layer`` resolves each pair_idx back to its real
+    student layer; the collator uses it when stacking per-pair anchors keyed by
+    the actual student layer in ``anchor_dict``.
     """
 
-    def __init__(self, tokenizer: Any, *, max_length: int, layer_ids: Sequence[int]) -> None:
+    def __init__(
+        self,
+        tokenizer: Any,
+        *,
+        max_length: int,
+        layer_ids: Sequence[int],
+        pair_to_student_layer: Dict[int, int],
+    ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
         self.layer_ids = [int(layer_idx) for layer_idx in layer_ids]
+        self.pair_to_student_layer = {int(k): int(v) for k, v in pair_to_student_layer.items()}
+        missing = [pair_idx for pair_idx in self.layer_ids if pair_idx not in self.pair_to_student_layer]
+        if missing:
+            raise KeyError(
+                f"pair_to_student_layer is missing entries for pair_idx values: {missing}"
+            )
 
     def __call__(self, batch: Sequence[Dict[str, Any]]) -> BatchPayload:
         records = [item["record"] for item in batch]
@@ -232,19 +276,20 @@ class SemAlignCollator:
             labels[row_idx, :prompt_len] = -100
 
         layer_targets = {
-            layer_idx: torch.stack([target_dict[layer_idx] for target_dict in target_dicts], dim=0)
-            for layer_idx in self.layer_ids
+            pair_idx: torch.stack([target_dict[pair_idx] for target_dict in target_dicts], dim=0)
+            for pair_idx in self.layer_ids
         }
         layer_anchors = None
         if any(anchor_dict is not None for anchor_dict in anchor_dicts):
             layer_anchors = {}
-            for layer_idx in self.layer_ids:
-                layer_anchors[layer_idx] = torch.stack(
+            for pair_idx in self.layer_ids:
+                student_layer = self.pair_to_student_layer[pair_idx]
+                layer_anchors[pair_idx] = torch.stack(
                     [
                         (
-                            anchor_dict[layer_idx]
-                            if anchor_dict is not None and layer_idx in anchor_dict
-                            else target_dicts[row_idx][layer_idx]
+                            anchor_dict[student_layer]
+                            if anchor_dict is not None and student_layer in anchor_dict
+                            else target_dicts[row_idx][pair_idx]
                         )
                         for row_idx, anchor_dict in enumerate(anchor_dicts)
                     ],
@@ -284,16 +329,25 @@ def _capture_layer_outputs(
     layer_ids: Sequence[int],
     prompt_last_positions: torch.Tensor,
     cache: Dict[int, torch.Tensor],
+    pair_to_student_layer: Dict[int, int],
 ):
-    hooks = []
-    for layer_idx in layer_ids:
-        layer = model.model.layers[layer_idx]
+    """Register one forward hook per pair_idx. The hook target is the actual
+    student transformer block ``pair_to_student_layer[pair_idx]``; multiple
+    pair_idx values that share the same student layer end up registering
+    multiple hooks on that same block, each writing the same hidden tensor to
+    its own ``cache[pair_idx]`` slot. This gives every pair its own predicted
+    tensor and keeps the K-term alignment loss correct under collisions."""
 
-        def hook(_module, _inputs, output, current_layer_idx=layer_idx):
+    hooks = []
+    for pair_idx in layer_ids:
+        student_layer = int(pair_to_student_layer[int(pair_idx)])
+        layer = model.model.layers[student_layer]
+
+        def hook(_module, _inputs, output, current_pair_idx=int(pair_idx)):
             hidden = output[0] if isinstance(output, tuple) else output
             batch_indices = torch.arange(hidden.size(0), device=hidden.device)
             selected = hidden[batch_indices, prompt_last_positions.to(hidden.device), :]
-            cache[current_layer_idx] = selected
+            cache[current_pair_idx] = selected
             return output
 
         hooks.append(layer.register_forward_hook(hook))
@@ -344,6 +398,7 @@ def forward_semalign_batch(
     *,
     device: torch.device,
     layer_ids: Sequence[int],
+    pair_to_student_layer: Dict[int, int],
     layer_loss_weight: float,
     sft_loss_weight: float = 1.0,
     layer_loss_policy: str = "all",
@@ -362,6 +417,7 @@ def forward_semalign_batch(
         layer_ids=layer_ids,
         prompt_last_positions=prompt_last_positions,
         cache=cache,
+        pair_to_student_layer=pair_to_student_layer,
     )
     try:
         outputs = model(**inputs, use_cache=False, return_dict=True)
@@ -439,6 +495,7 @@ def evaluate_layer_alignment(
     *,
     device: torch.device,
     layer_ids: Sequence[int],
+    pair_to_student_layer: Dict[int, int],
     layer_loss_policy: str = "all",
     harmful_layer_weight: float = 1.0,
     harmless_layer_weight: float = 1.0,
@@ -457,6 +514,7 @@ def evaluate_layer_alignment(
             layer_ids=layer_ids,
             prompt_last_positions=prompt_last_positions,
             cache=cache,
+            pair_to_student_layer=pair_to_student_layer,
         )
         try:
             model(**inputs, use_cache=False, return_dict=True)

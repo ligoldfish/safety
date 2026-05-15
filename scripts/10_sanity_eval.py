@@ -22,6 +22,7 @@ from src.training import (
     build_dataloader,
     evaluate_generation_refusal_metrics,
     evaluate_layer_alignment,
+    load_pair_to_student_layer,
     load_records,
     load_student_target_map,
 )
@@ -177,12 +178,18 @@ def _evaluate_variant(
     records: Sequence[Dict[str, Any]],
     target_map: Dict[str, Dict[int, torch.Tensor]],
     layer_ids: Sequence[int],
+    pair_to_student_layer: Dict[int, int],
     batch_size: int,
     max_length: int,
     max_new_tokens: int,
 ) -> Dict[str, Any]:
     dataset = SemAlignDataset(records, target_map)
-    collator = SemAlignCollator(tokenizer, max_length=max_length, layer_ids=layer_ids)
+    collator = SemAlignCollator(
+        tokenizer,
+        max_length=max_length,
+        layer_ids=layer_ids,
+        pair_to_student_layer=pair_to_student_layer,
+    )
     dataloader = build_dataloader(
         dataset,
         batch_size=batch_size,
@@ -199,6 +206,7 @@ def _evaluate_variant(
         dataloader,
         device=device,
         layer_ids=layer_ids,
+        pair_to_student_layer=pair_to_student_layer,
     )
     generation_metrics = evaluate_generation_refusal_metrics(
         model,
@@ -281,6 +289,8 @@ def main() -> None:
         target_dir = fallback_target_dir
         records_path = Path(cfg.dataset.processed_dir) / "pan_test_set.jsonl"
     target_map, layer_ids = load_student_target_map(target_dir)
+    pairing_path = output_root / "layer_pairing" / "teacher_student_layer_pairs.json"
+    pair_to_student_layer = load_pair_to_student_layer(pairing_path)
     records = load_records(records_path)
     records = _select_records_with_targets(records, target_map, args.max_samples_per_label)
     if not records:
@@ -307,6 +317,7 @@ def main() -> None:
         records=records,
         target_map=target_map,
         layer_ids=layer_ids,
+        pair_to_student_layer=pair_to_student_layer,
         batch_size=args.batch_size,
         max_length=args.max_length,
         max_new_tokens=args.max_new_tokens,
@@ -333,6 +344,7 @@ def main() -> None:
         records=records,
         target_map=target_map,
         layer_ids=layer_ids,
+        pair_to_student_layer=pair_to_student_layer,
         batch_size=args.batch_size,
         max_length=args.max_length,
         max_new_tokens=args.max_new_tokens,
