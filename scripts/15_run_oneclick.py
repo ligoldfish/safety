@@ -124,6 +124,22 @@ RANDOM_PIPELINE_CONFIGS = {
     },
 }
 
+# sft1 ablation: sft_loss_weight=1.0, layer_loss_weight=0.0. Same phase1
+# precompute as the main ours run; only the phaseF training step swaps in
+# the sft1 yaml whose output_root is "<phase1>/training_sft1" (so it does
+# not collide with the main "<phase1>/training" or the random ablation's
+# "<phase1>/training_random_same_norm").
+SFT1_PIPELINE_CONFIGS = {
+    "npu": {
+        "phase1": "configs/qwen35_9b_to_08b_phase1_npu.yaml",
+        "phasef": "configs/qwen35_9b_to_08b_phaseF_npu_sft1.yaml",
+    },
+    "ppu": {
+        "phase1": "configs/qwen35_9b_to_08b_phase1_ppu.yaml",
+        "phasef": "configs/qwen35_9b_to_08b_phaseF_ppu_sft1.yaml",
+    },
+}
+
 PIPELINE_SPLITS = ["alignment", "analysis_val", "pan_test", "sanity_test"]
 
 
@@ -292,7 +308,43 @@ def parse_args() -> argparse.Namespace:
     )
     add_common_flags(random_parser)
 
+    sft1_parser = subparsers.add_parser(
+        "sft1",
+        help=(
+            "Run the sft1 ablation (sft_loss_weight=1.0, layer_loss_weight=0.0). "
+            "When --baseline is 'pan' (default) the PAN sft1 phaseF yaml is used "
+            "and phase1 reuses ../outputs/qwen35_9b_to_08b_phase1_<device>/. When "
+            "--baseline is a safety dataset the safety-full pipeline is run with "
+            "the sft1 phaseF base, writing under phase1/training_sft1/ so the main "
+            "ours / random / safety-full results stay intact."
+        ),
+    )
+    sft1_parser.add_argument(
+        "--baseline",
+        choices=["pan", *SAFETY_SFT_BASELINES],
+        default="pan",
+        help=(
+            "'pan' (default) runs the PAN sft1 ablation. The three safety values "
+            "run safety-full's pipeline with the sft1 phaseF yaml on that dataset."
+        ),
+    )
+    sft1_parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Re-materialize the safety JSONL even when it exists (safety baselines only).",
+    )
+    add_common_flags(sft1_parser)
+
     full_parser = subparsers.add_parser("full", help="Run the original 00->11 full-stage pipeline.")
+    full_parser.add_argument(
+        "--phasef-config",
+        default="",
+        help=(
+            "Optional PhaseF YAML override. Use this for ablations that reuse the "
+            "same Phase1 artifacts but write PhaseF training/eval outputs to a "
+            "different output.output_root."
+        ),
+    )
     add_common_flags(full_parser)
     return parser.parse_args()
 
@@ -1395,6 +1447,322 @@ def _run_random_baseline(
     )
 
 
+def _run_pan_sft1_ablation(
+    device: str,
+    *,
+    device_id: int,
+    num_devices: int,
+    dry_run: bool,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+    enable_opencompass: bool,
+    opencompass_config: str = "",
+) -> None:
+    """sft1 ablation on the PAN corpus.
+
+    Same Phase 1 precompute (00->08) as the main ours run; the scripts
+    detect existing shards via ``extraction.skip_existing`` so this is a
+    no-op when Phase 1 is already on disk. Only the PhaseF training stage
+    swaps in the sft1 yaml whose output_root ends in ``/training_sft1``,
+    keeping main / random / sft1 results isolated.
+    """
+
+    _validate_device_request(num_devices)
+    phase1_config = _make_runtime_override_config(
+        _resolve(SFT1_PIPELINE_CONFIGS[device]["phase1"]),
+        device=device,
+        device_id=device_id,
+    )
+    phasef_config = _make_runtime_override_config(
+        _resolve(SFT1_PIPELINE_CONFIGS[device]["phasef"]),
+        device=device,
+        device_id=device_id,
+    )
+    phasef_cfg = load_phasef_config(phasef_config)
+
+    env_overrides = _build_env_overrides(device, device_id)
+    _run_phase1_precompute(phase1_config, smoke=False, dry_run=dry_run, env_overrides=env_overrides)
+    _run_script("09_train_student_semalign.py", ["--config", str(phasef_config)], dry_run=dry_run, env_overrides=env_overrides)
+    _run_script(
+        "10_sanity_eval.py",
+        [
+            "--config",
+            str(phase1_config),
+            "--training-dir",
+            str(Path(phasef_cfg.output.output_root)),
+            "--output-dir-name",
+            "sanity_eval_sft1",
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    _run_script(
+        "11_make_tables.py",
+        [
+            "--config",
+            str(phase1_config),
+            "--training-dir-name",
+            Path(phasef_cfg.output.output_root).name,
+            "--sanity-dir-name",
+            "sanity_eval_sft1",
+            "--tables-dir-name",
+            "tables_sft1",
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    _run_adapter_eval(
+        device=device,
+        model_size="0.8b",
+        training_output_root=Path(phasef_cfg.output.output_root),
+        epochs=int(phasef_cfg.optim.epochs),
+        device_id=device_id,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
+    )
+
+
+def _make_safety_sft1_overrides(
+    *,
+    device: str,
+    device_id: int,
+    baseline_name: str,
+    safety_processed_dir: Path,
+    safety_phase1_output_root: Path,
+    safety_phasef_output_root: Path,
+) -> tuple[Path, Path]:
+    """Mirror of ``_make_safety_full_overrides`` but with the sft1 phaseF
+    yaml as the base (same Phase 1 yaml, since the precompute is shared).
+    Override file names use the ``_sft1_`` infix so they do not collide
+    with the main-ours safety overrides on disk."""
+
+    base_phase1 = _resolve(FULL_PIPELINE_CONFIGS[device]["phase1"])
+    base_phasef = _resolve(SFT1_PIPELINE_CONFIGS[device]["phasef"])
+
+    phase1_raw = yaml.safe_load(base_phase1.read_text(encoding="utf-8"))
+    if not isinstance(phase1_raw, dict):
+        raise ValueError(f"Phase 1 config must be a mapping: {base_phase1}")
+    phase1_raw.setdefault("dataset", {})["processed_dir"] = str(safety_processed_dir)
+    phase1_raw.setdefault("extraction", {})["output_root"] = str(safety_phase1_output_root)
+    if isinstance(phase1_raw.get("models"), dict):
+        for entry in phase1_raw["models"].values():
+            if isinstance(entry, dict):
+                _override_model_runtime(entry, device, device_id)
+    if isinstance(phase1_raw.get("model"), dict):
+        _override_model_runtime(phase1_raw["model"], device, device_id)
+
+    phase1_override_path = (
+        base_phase1.parent
+        / f"{base_phase1.stem}_sft1_{baseline_name}_{device}_{device_id}_{uuid.uuid4().hex[:8]}.yaml"
+    )
+    phase1_override_path.write_text(
+        yaml.safe_dump(phase1_raw, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    phasef_raw = yaml.safe_load(base_phasef.read_text(encoding="utf-8"))
+    if not isinstance(phasef_raw, dict):
+        raise ValueError(f"PhaseF config must be a mapping: {base_phasef}")
+    phasef_inputs = phasef_raw.setdefault("inputs", {})
+    phasef_inputs["train_split"] = str(safety_processed_dir / "alignment_set.jsonl")
+    phasef_inputs["val_split"] = str(safety_processed_dir / "analysis_val_set.jsonl")
+    phasef_inputs["train_targets_dir"] = str(
+        safety_phase1_output_root / "student_targets" / "student_safe_targets_alignment"
+    )
+    phasef_inputs["val_targets_dir"] = str(
+        safety_phase1_output_root / "student_targets" / "student_safe_targets_val"
+    )
+    phasef_inputs["pairing_path"] = str(
+        safety_phase1_output_root / "layer_pairing" / "teacher_student_layer_pairs.json"
+    )
+    phasef_inputs["train_anchor_dir"] = str(
+        safety_phase1_output_root / "hidden_states" / "student_alignment"
+    )
+    phasef_inputs["val_anchor_dir"] = str(
+        safety_phase1_output_root / "hidden_states" / "student_analysis_val"
+    )
+    phasef_raw.setdefault("output", {})["output_root"] = str(safety_phasef_output_root)
+    if isinstance(phasef_raw.get("model"), dict):
+        _override_model_runtime(phasef_raw["model"], device, device_id)
+
+    phasef_override_path = (
+        base_phasef.parent
+        / f"{base_phasef.stem}_sft1_{baseline_name}_{device}_{device_id}_{uuid.uuid4().hex[:8]}.yaml"
+    )
+    phasef_override_path.write_text(
+        yaml.safe_dump(phasef_raw, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    return phase1_override_path, phasef_override_path
+
+
+def _run_safety_sft1(
+    device: str,
+    *,
+    baseline_name: str,
+    device_id: int,
+    num_devices: int,
+    dry_run: bool,
+    force_rebuild: bool,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+    enable_opencompass: bool,
+    opencompass_config: str = "",
+) -> None:
+    """sft1 ablation on a safety corpus (BT / STL / Tülu3).
+
+    Shares the full safety-full pipeline (19_prepare + 20_split + Phase 1
+    precompute against the per-baseline safety processed_dir) so the
+    phase1 artefacts under ``safety_full_<bl>_<device>/phase1/`` are
+    reused by both the main safety-full run and this ablation. Only the
+    PhaseF stage swaps in the sft1 yaml, with output_root pointing at
+    ``safety_full_<bl>_<device>/phase1/training_sft1`` to keep the main
+    safety-full training_dir intact.
+    """
+
+    _validate_device_request(num_devices)
+    config_key = (device, "0.8b", baseline_name)
+    if config_key not in SAFETY_SFT_CONFIGS:
+        raise ValueError(
+            f"safety-sft1 needs an SFT-style safety config for {config_key}; "
+            f"known: {sorted(SAFETY_SFT_CONFIGS.keys())}."
+        )
+    sft_safety_config = _make_runtime_override_config(
+        _resolve(SAFETY_SFT_CONFIGS[config_key]),
+        device=device,
+        device_id=device_id,
+    )
+    eval_config_src = _resolve(_safety_eval_config(device, "0.8b", baseline_name))
+    eval_config = _make_runtime_override_config(
+        eval_config_src,
+        device=device,
+        device_id=device_id,
+    )
+    safety_eval_datasets = SAFETY_EVAL_DATASETS_BY_BASELINE.get(baseline_name, ())
+    sft_cfg = load_sft_config(sft_safety_config)
+    safety_jsonl_path = Path(sft_cfg.data.train_split).resolve()
+    env_overrides = _build_env_overrides(device, device_id)
+
+    prep_args = ["--config", str(sft_safety_config)]
+    if force_rebuild:
+        prep_args.append("--force-rebuild")
+    _run_script(
+        "19_prepare_safety_data.py",
+        prep_args,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+    safety_processed_dir = (
+        PROJECT_ROOT / "data" / "processed" / f"safety_full_{baseline_name}"
+    ).resolve()
+    pan_processed_dir = (PROJECT_ROOT / "data" / "processed").resolve()
+    if not dry_run:
+        safety_processed_dir.mkdir(parents=True, exist_ok=True)
+    _run_script(
+        "20_split_safety_for_semalign.py",
+        [
+            "--safety-jsonl",
+            str(safety_jsonl_path),
+            "--output-dir",
+            str(safety_processed_dir),
+            "--pan-processed-dir",
+            str(pan_processed_dir),
+            "--harmless-source",
+            "auto",
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+    safety_phase1_output_root = (
+        PROJECT_ROOT
+        / "outputs"
+        / f"safety_full_{baseline_name}_{device}"
+        / "phase1"
+    ).resolve()
+    # sft1 lands beside the main "training/" so the two ablations share
+    # the same phase1 artefacts without overwriting each other's
+    # checkpoints, eval_suite, sanity_eval or tables.
+    safety_phasef_output_root = (safety_phase1_output_root / "training_sft1").resolve()
+    phase1_override, phasef_override = _make_safety_sft1_overrides(
+        device=device,
+        device_id=device_id,
+        baseline_name=baseline_name,
+        safety_processed_dir=safety_processed_dir,
+        safety_phase1_output_root=safety_phase1_output_root,
+        safety_phasef_output_root=safety_phasef_output_root,
+    )
+
+    _run_phase1_precompute(
+        phase1_override,
+        smoke=False,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+        skip_prepare=True,
+    )
+
+    _run_script(
+        "09_train_student_semalign.py",
+        ["--config", str(phasef_override)],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+    _run_script(
+        "10_sanity_eval.py",
+        [
+            "--config",
+            str(phase1_override),
+            "--training-dir",
+            str(safety_phasef_output_root),
+            "--output-dir-name",
+            "sanity_eval_sft1",
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    _run_script(
+        "11_make_tables.py",
+        [
+            "--config",
+            str(phase1_override),
+            "--training-dir-name",
+            "training_sft1",
+            "--sanity-dir-name",
+            "sanity_eval_sft1",
+            "--tables-dir-name",
+            "tables_sft1",
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+    phasef_cfg = load_phasef_config(phasef_override)
+    _run_adapter_eval(
+        device=device,
+        model_size="0.8b",
+        training_output_root=safety_phasef_output_root,
+        epochs=int(phasef_cfg.optim.epochs),
+        device_id=device_id,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
+        safety_eval_datasets=safety_eval_datasets,
+        eval_config_path=str(eval_config_src),
+    )
+
+
 def _run_full_pipeline(
     device: str,
     *,
@@ -1407,6 +1775,7 @@ def _run_full_pipeline(
     skip_opencompass: bool,
     enable_opencompass: bool,
     opencompass_config: str = "",
+    phasef_config_path: str = "",
 ) -> None:
     _validate_device_request(num_devices)
     config_map = FULL_PIPELINE_CONFIGS
@@ -1415,8 +1784,13 @@ def _run_full_pipeline(
         device=device,
         device_id=device_id,
     )
+    phasef_config_src = (
+        _resolve(phasef_config_path)
+        if phasef_config_path
+        else _resolve(config_map[device]["phasef"])
+    )
     phasef_config = _make_runtime_override_config(
-        _resolve(config_map[device]["phasef"]),
+        phasef_config_src,
         device=device,
         device_id=device_id,
     )
@@ -1427,17 +1801,53 @@ def _run_full_pipeline(
     env_overrides = _build_env_overrides(device, device_id)
     _run_phase1_precompute(phase1_config, smoke=smoke, dry_run=dry_run, env_overrides=env_overrides)
 
+    training_output_root = Path(phasef_cfg.output.output_root)
+    phase1_output_root = Path(phase1_cfg.extraction.output_root)
+    default_training_output_root = phase1_output_root / "training"
+    uses_default_training_dir = (
+        training_output_root.resolve() == default_training_output_root.resolve()
+    )
+
     sanity_args = ["--config", str(phase1_config)]
+    tables_args = ["--config", str(phase1_config)]
+    if not uses_default_training_dir:
+        try:
+            training_dir_name = str(training_output_root.resolve().relative_to(phase1_output_root.resolve()))
+        except ValueError as exc:
+            raise ValueError(
+                "Custom PhaseF output.output_root must live under the Phase1 "
+                "extraction.output_root so 10_sanity_eval.py and 11_make_tables.py "
+                "can keep experiment artifacts isolated by directory name. "
+                f"Got PhaseF output_root={training_output_root} and "
+                f"Phase1 output_root={phase1_output_root}."
+            ) from exc
+        suffix = training_output_root.name
+        sanity_dir_name = f"sanity_eval_{suffix}"
+        tables_dir_name = f"tables_{suffix}"
+        sanity_args += [
+            "--training-dir",
+            str(training_output_root),
+            "--output-dir-name",
+            sanity_dir_name,
+        ]
+        tables_args += [
+            "--training-dir-name",
+            training_dir_name,
+            "--sanity-dir-name",
+            sanity_dir_name,
+            "--tables-dir-name",
+            tables_dir_name,
+        ]
     if smoke:
         sanity_args += ["--max-samples-per-label", "8", "--max-new-tokens", "32"]
 
     _run_script("09_train_student_semalign.py", ["--config", str(phasef_config)], dry_run=dry_run, env_overrides=env_overrides)
     _run_script("10_sanity_eval.py", sanity_args, dry_run=dry_run, env_overrides=env_overrides)
-    _run_script("11_make_tables.py", ["--config", str(phase1_config)], dry_run=dry_run, env_overrides=env_overrides)
+    _run_script("11_make_tables.py", tables_args, dry_run=dry_run, env_overrides=env_overrides)
     _run_adapter_eval(
         device=device,
         model_size="0.8b",
-        training_output_root=Path(phasef_cfg.output.output_root),
+        training_output_root=training_output_root,
         epochs=int(phasef_cfg.optim.epochs),
         device_id=device_id,
         dry_run=dry_run,
@@ -1456,6 +1866,7 @@ def _run_full_pipeline(
             "smoke": smoke,
             "phase1_output_root": phase1_cfg.extraction.output_root,
             "phasef_output_root": phasef_cfg.output.output_root,
+            "phasef_config": str(phasef_config_src),
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
 
@@ -1543,6 +1954,26 @@ def main() -> None:
             **oc_kwargs,
         )
         return
+    if args.command == "sft1":
+        if args.baseline == "pan":
+            _run_pan_sft1_ablation(
+                args.device,
+                device_id=args.device_id,
+                num_devices=args.num_devices,
+                dry_run=args.dry_run,
+                **oc_kwargs,
+            )
+        else:
+            _run_safety_sft1(
+                args.device,
+                baseline_name=args.baseline,
+                device_id=args.device_id,
+                num_devices=args.num_devices,
+                dry_run=args.dry_run,
+                force_rebuild=bool(args.force_rebuild),
+                **oc_kwargs,
+            )
+        return
     if args.command == "full":
         _run_full_pipeline(
             args.device,
@@ -1550,6 +1981,7 @@ def main() -> None:
             num_devices=args.num_devices,
             smoke=False,
             dry_run=args.dry_run,
+            phasef_config_path=args.phasef_config,
             **oc_kwargs,
         )
         return

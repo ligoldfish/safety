@@ -42,6 +42,7 @@ from src.data.safety_datasets import (
 PHASEF_YAMLS = (
     "qwen35_9b_to_08b_phaseF_npu.yaml",
     "qwen35_9b_to_08b_phaseF_ppu.yaml",
+    "qwen35_9b_to_08b_phaseF_npu_sft1.yaml",
     "qwen35_9b_to_08b_phaseF_npu_random.yaml",
     "qwen35_9b_to_08b_phaseF_ppu_random.yaml",
 )
@@ -78,6 +79,7 @@ class PhaseFLoRACapacityTests(unittest.TestCase):
         for name in (
             "qwen35_9b_to_08b_phaseF_npu.yaml",
             "qwen35_9b_to_08b_phaseF_ppu.yaml",
+            "qwen35_9b_to_08b_phaseF_npu_sft1.yaml",
             "qwen35_9b_to_08b_phaseF_npu_random.yaml",
             "qwen35_9b_to_08b_phaseF_ppu_random.yaml",
         ):
@@ -85,6 +87,13 @@ class PhaseFLoRACapacityTests(unittest.TestCase):
             with self.subTest(yaml=name):
                 cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
                 self.assertEqual(int(cfg["optim"]["epochs"]), 2, msg=name)
+
+    def test_npu_sft1_ablation_is_sft_only_and_isolated(self) -> None:
+        yaml_path = PROJECT_ROOT / "configs" / "qwen35_9b_to_08b_phaseF_npu_sft1.yaml"
+        cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        self.assertEqual(float(cfg["optim"]["sft_loss_weight"]), 1.0)
+        self.assertEqual(float(cfg["optim"]["layer_loss_weight"]), 0.0)
+        self.assertTrue(str(cfg["output"]["output_root"]).endswith("/training_sft1"))
 
 
 class BeaverTailsLabelStrategyTests(unittest.TestCase):
