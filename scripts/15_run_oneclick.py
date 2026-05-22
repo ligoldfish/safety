@@ -511,6 +511,7 @@ def _run_opencompass_eval(
     datasets: Sequence[str],
     dry_run: bool,
     env_overrides: dict[str, str] | None = None,
+    batch_size: int = 32,
 ) -> None:
     _run_script(
         "17_eval_opencompass.py",
@@ -521,6 +522,8 @@ def _run_opencompass_eval(
             str(Path(opencompass_dir).expanduser()),
             "--work-dir",
             str(work_dir),
+            "--batch-size",
+            str(int(batch_size)),
             "--datasets",
             *datasets,
         ],

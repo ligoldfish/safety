@@ -298,16 +298,22 @@ class Tulu3SafetyV2Tests(unittest.TestCase):
         # Mixture entries other than personahub dropped.
         self.assertNotIn("skip-other-source", by_id)
         self.assertEqual(by_id["wgm-harmful"]["label"], "harmful")
+        # WGM harmful prompt with upstream response_harm_label=unharmful now
+        # rides the upstream refusal text verbatim instead of being replaced
+        # by a synthetic template — this is the "diversify refusal target"
+        # intervention.
         self.assertEqual(
-            by_id["wgm-harmful"]["target_response"],
-            safety_datasets.DEFAULT_SAFETY_REFUSAL_TEMPLATE,
+            by_id["wgm-harmful"]["target_response"], "I cannot help with that."
         )
         self.assertEqual(by_id["wgm-benign"]["label"], "harmless")
         self.assertEqual(by_id["wgm-benign"]["target_response"], "Mix flour, water, yeast.")
         self.assertEqual(by_id["wjb-adv-harmful"]["label"], "harmful")
-        self.assertEqual(
+        # WildJailbreak has no per-row response-safety field, so harmful rows
+        # always fall back to the refusal-template pool. Assert pool
+        # membership rather than locking the exact string.
+        self.assertIn(
             by_id["wjb-adv-harmful"]["target_response"],
-            safety_datasets.DEFAULT_SAFETY_REFUSAL_TEMPLATE,
+            safety_datasets.DEFAULT_SAFETY_REFUSAL_TEMPLATES,
         )
         self.assertEqual(by_id["wjb-adv-benign"]["label"], "harmless")
         self.assertEqual(by_id["wjb-adv-benign"]["target_response"], "Sure, here is a benign answer.")

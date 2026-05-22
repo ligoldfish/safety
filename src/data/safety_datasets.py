@@ -19,6 +19,7 @@ Supported training corpora (see plan):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from dataclasses import dataclass, field
@@ -34,6 +35,74 @@ DEFAULT_SAFETY_REFUSAL_TEMPLATE = (
     "If your goal is legitimate or safety-related, I can help with a safer "
     "alternative, prevention guidance, or high-level information."
 )
+
+# Eight paraphrased refusals used when the upstream dataset's own response
+# field is unsafe (or absent) and we need to substitute a synthetic refusal.
+# Indexing is deterministic per (seed, prompt) via ``pick_refusal_template``
+# so the same prompt always lands on the same template across reruns.
+# The first slot is the historical single-string template so any consumer
+# that still references DEFAULT_SAFETY_REFUSAL_TEMPLATE keeps the original
+# wording.
+DEFAULT_SAFETY_REFUSAL_TEMPLATES: Tuple[str, ...] = (
+    DEFAULT_SAFETY_REFUSAL_TEMPLATE,
+    (
+        "I'm not able to help with that. If you're trying to understand the "
+        "topic for safety, education or harm prevention I can offer general "
+        "background, point you to vetted resources, or talk through a safer "
+        "alternative."
+    ),
+    (
+        "Sorry, I won't help with this. Following through could enable real "
+        "harm, and that's not something I'll provide. I'm happy to discuss "
+        "the underlying concern through a safer angle."
+    ),
+    (
+        "I have to decline this request. Producing it could lead to harm to "
+        "others or to you, and I'd rather not contribute to that outcome. "
+        "If your goal is legitimate (research, prevention, support), let me "
+        "know and I'll help from that direction instead."
+    ),
+    (
+        "I'm going to pass on this. The kind of guidance you're asking for "
+        "could enable serious harm, and it's outside what I can responsibly "
+        "provide. I can speak to prevention, policy, or general safety "
+        "background if that helps."
+    ),
+    (
+        "I can't go down this path. The request would push me into producing "
+        "content that could be misused. If there is a legal, safety-related "
+        "or educational concern behind it, share more context and I'll try "
+        "to help from there."
+    ),
+    (
+        "Helping with this would put real people at risk, so I won't. I do "
+        "want to be useful though: if there is a non-harmful version of what "
+        "you're trying to accomplish, describe it and I'll work that with you."
+    ),
+    (
+        "This is a request I'll decline. I'm built to avoid output that could "
+        "cause harm, even indirectly, and that applies here. I'm glad to help "
+        "with related but safer questions — let me know which angle matters "
+        "to you and I'll take it from there."
+    ),
+)
+
+
+def pick_refusal_template(prompt: str, *, seed: int = 42) -> str:
+    """Deterministic per-prompt selection from ``DEFAULT_SAFETY_REFUSAL_TEMPLATES``.
+
+    Uses sha256 over (seed, prompt) so behaviour is stable across Python
+    processes (the built-in ``hash`` is randomised since Python 3.3 and
+    would change selection from run to run). The same prompt under the
+    same seed always returns the same template, so rebuilding a dataset
+    is reproducible.
+    """
+
+    digest = hashlib.sha256(
+        f"{int(seed)}|{prompt}".encode("utf-8")
+    ).hexdigest()
+    idx = int(digest, 16) % len(DEFAULT_SAFETY_REFUSAL_TEMPLATES)
+    return DEFAULT_SAFETY_REFUSAL_TEMPLATES[idx]
 
 DEFAULT_TULU3_SAFETY_SOURCES: Tuple[str, ...] = (
     "ai2-adapt-dev/tulu_v3.9_wildguardmix",
@@ -295,6 +364,7 @@ def _collect_wildguardmix_train_rows(
     cache_dir: Optional[str],
     system_prompt: str,
     refusal_template: str,
+    seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """Pull harmful/harmless rows directly from upstream WildGuardMix train.
 
@@ -322,9 +392,9 @@ def _collect_wildguardmix_train_rows(
         mapped = _classify_wildguardmix_label(raw_label)
         if mapped is None:
             continue
+        response = str(row.get("response", "") or "").strip()
+        response_harm = str(row.get("response_harm_label", "")).strip().lower()
         if mapped == "harmless":
-            response = str(row.get("response", "") or "").strip()
-            response_harm = str(row.get("response_harm_label", "")).strip().lower()
             # Skip rows whose response itself is harmful even though the
             # prompt is benign — keeping them would teach unsafe completion
             # on a harmless prompt.
@@ -332,7 +402,17 @@ def _collect_wildguardmix_train_rows(
                 continue
             target = response
         else:
-            target = refusal_template
+            # Harmful prompt: prefer the upstream response when WildGuardMix
+            # tagged it as a safe completion (``response_harm_label="unharmful"``)
+            # so we ride the dataset's own natural-language refusal/redirect
+            # text instead of substituting one synthetic template. Fall back
+            # to the per-prompt refusal pool when the upstream response is
+            # missing or itself unsafe — both cases would otherwise produce
+            # bad training targets.
+            if response and response_harm == "unharmful":
+                target = response
+            else:
+                target = pick_refusal_template(prompt, seed=seed)
         out.append(
             _build_v2_record(
                 record_id=str(row.get("id") or f"tulu3v2_wgm_{index:08d}"),
@@ -354,6 +434,7 @@ def _collect_wildjailbreak_train_rows(
     cache_dir: Optional[str],
     system_prompt: str,
     refusal_template: str,
+    seed: int = 42,
 ) -> List[Dict[str, Any]]:
     try:
         loaded = _load_dataset(
@@ -391,7 +472,11 @@ def _collect_wildjailbreak_train_rows(
             if not target:
                 continue
         else:
-            target = refusal_template
+            # WildJailbreak ``completion`` for harmful (adversarial / vanilla)
+            # rows is the upstream successful-jailbreak output and is unsafe
+            # by construction, so we cannot ride it. Use the per-prompt
+            # refusal pool so distinct prompts land on distinct refusals.
+            target = pick_refusal_template(prompt, seed=seed)
         out.append(
             _build_v2_record(
                 record_id=str(row.get("id") or f"tulu3v2_wjb_{index:08d}"),
@@ -460,6 +545,7 @@ def build_tulu3_safety_v2_records(
             cache_dir=cache_dir,
             system_prompt=system_prompt,
             refusal_template=refusal_template,
+            seed=seed,
         )
     )
     safety_records.extend(
@@ -469,6 +555,7 @@ def build_tulu3_safety_v2_records(
             cache_dir=cache_dir,
             system_prompt=system_prompt,
             refusal_template=refusal_template,
+            seed=seed,
         )
     )
 
@@ -730,6 +817,7 @@ def build_beavertails_records(
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     dedup_prompts: bool = True,
     label_strategy: str = "category_any",
+    seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """Materialize a BeaverTails SFT split.
 
@@ -795,7 +883,18 @@ def build_beavertails_records(
                 continue
         else:
             label = "harmless" if is_safe else "harmful"
-        assistant_text = original_response if label == "harmless" else refusal_template
+        if label == "harmless":
+            assistant_text = original_response
+        elif is_safe and original_response:
+            # Upstream BT response was tagged safe for this harmful prompt — use
+            # it verbatim instead of synthesising a refusal. Under the default
+            # ``label_strategy="category_any"`` the alignment-mismatch drop above
+            # makes this branch unreachable (category-harmful rows always carry
+            # is_safe=False), but the conditional keeps the more permissive
+            # ``label_strategy="is_safe"`` path correct.
+            assistant_text = original_response
+        else:
+            assistant_text = pick_refusal_template(prompt, seed=seed)
         if not assistant_text:
             continue
         messages = [
@@ -874,6 +973,7 @@ def _build_beavertails(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
         system_prompt=spec.system_prompt or DEFAULT_SYSTEM_PROMPT,
         dedup_prompts=bool(spec.dedup_prompts),
         label_strategy=spec.label_strategy or "category_any",
+        seed=int(spec.seed),
     )
 
 
@@ -886,6 +986,7 @@ def _build_tulu3_safety_v2(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
         system_prompt=spec.system_prompt or DEFAULT_SYSTEM_PROMPT,
         helpful_sources=tuple(spec.helpful_sources or DEFAULT_TULU3_HELPFUL_SOURCES),
         helpful_max_samples=spec.helpful_max_samples,
+        seed=int(spec.seed),
     )
 
 

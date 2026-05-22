@@ -67,7 +67,7 @@ datasets:
 
 runtime:
   max_length: 4096
-  batch_size: 1
+  batch_size: 16
 
 output:
   output_root: ../outputs/baselines/no_sft_qwen35_08b_ppu

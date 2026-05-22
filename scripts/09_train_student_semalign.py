@@ -107,8 +107,31 @@ def main() -> None:
             match_l2_norm=bool(cfg.target.match_l2_norm),
         )
 
-    train_records = load_records(cfg.inputs.train_split)
-    val_records = load_records(cfg.inputs.val_split)
+    train_records_all = load_records(cfg.inputs.train_split)
+    val_records_all = load_records(cfg.inputs.val_split)
+    # Harmful-only training for the ours pipeline as well. The harmless side
+    # of the alignment_set is reserved for evaluation only (per-baseline test
+    # JSONL still carries both polarities so harmless_over_refusal_rate keeps
+    # being computed by 12_eval_baseline_suite). SemAlignDataset's existing
+    # filter_harmful_targets flag continues to filter *malformed* harmful rows
+    # (empty / unsafe target_response) and is orthogonal to this pre-filter.
+    train_records = [r for r in train_records_all if str(r.get("label", "")).lower() == "harmful"]
+    val_records = [r for r in val_records_all if str(r.get("label", "")).lower() == "harmful"]
+    log_kv(
+        logger,
+        "harmful_only_filter_applied",
+        train_total=len(train_records_all),
+        train_kept=len(train_records),
+        train_dropped_harmless=len(train_records_all) - len(train_records),
+        val_total=len(val_records_all),
+        val_kept=len(val_records),
+        val_dropped_harmless=len(val_records_all) - len(val_records),
+    )
+    if not train_records:
+        raise ValueError(
+            f"Harmful-only filter left 0 train records (loaded {len(train_records_all)} total). "
+            f"Verify that {cfg.inputs.train_split} contains rows with label=='harmful'."
+        )
     train_dataset = SemAlignDataset(
         train_records,
         train_target_map,

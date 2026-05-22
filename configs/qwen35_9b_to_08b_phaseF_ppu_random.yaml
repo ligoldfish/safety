@@ -17,8 +17,8 @@ inputs:
   train_targets_dir: ../outputs/qwen35_9b_to_08b_phase1_ppu/student_targets/student_safe_targets_alignment
   val_targets_dir: ../outputs/qwen35_9b_to_08b_phase1_ppu/student_targets/student_safe_targets_val
   pairing_path: ../outputs/qwen35_9b_to_08b_phase1_ppu/layer_pairing/teacher_student_layer_pairs.json
-  train_anchor_dir: ../outputs/qwen35_9b_to_08b_phase1_ppu/hidden_states/student_alignment
-  val_anchor_dir: ../outputs/qwen35_9b_to_08b_phase1_ppu/hidden_states/student_analysis_val
+  train_anchor_dir: ""
+  val_anchor_dir: ""
 
 lora:
   rank: 16
@@ -51,7 +51,7 @@ target:
   mode: random_same_norm
   random_seed: 2042
   match_l2_norm: true
-  layer_loss_policy: harmless_anchor
+  layer_loss_policy: harmful_only
   harmful_layer_weight: 1.0
   harmless_layer_weight: 0.5
   filter_harmful_targets: true

@@ -63,6 +63,6 @@ datasets:
     exec_timeout_seconds: 3
 runtime:
   max_length: 4096
-  batch_size: 1
+  batch_size: 16
 output:
   output_root: ../outputs/baselines/eval_safety_tuned_llamas_ppu

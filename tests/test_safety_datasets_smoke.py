@@ -22,12 +22,15 @@ import src.data.safety_datasets as safety_datasets
 import src.data.safety_eval_datasets as safety_eval_datasets
 from src.data.safety_datasets import (
     DEFAULT_SAFETY_REFUSAL_TEMPLATE,
+    DEFAULT_SAFETY_REFUSAL_TEMPLATES,
     SAFETY_TRAIN_DATASETS,
     SafetyDatasetSpec,
+    _collect_wildguardmix_train_rows,
     build_beavertails_records,
     build_safety_tuned_llamas_records,
     build_tulu3_safety_records,
     materialize_safety_train_dataset,
+    pick_refusal_template,
 )
 
 
@@ -207,7 +210,11 @@ class BeaverTailsTests(unittest.TestCase):
             self.assertEqual(safe_record["messages"][-1]["role"], "user")
             self.assertEqual(safe_record["label"], "harmless")
             self.assertFalse(unsafe_record["is_safe"])
-            self.assertEqual(unsafe_record["target_response"], DEFAULT_SAFETY_REFUSAL_TEMPLATE)
+            # Harmful row's target now sampled from the refusal-template pool
+            # via pick_refusal_template — assert it lands somewhere in the pool
+            # rather than locking the exact string. Diversity / determinism
+            # are covered by RefusalTemplatePoolTests below.
+            self.assertIn(unsafe_record["target_response"], DEFAULT_SAFETY_REFUSAL_TEMPLATES)
             self.assertEqual(unsafe_record["messages"][-1]["role"], "user")
             self.assertEqual(unsafe_record["original_response"], "Sure, here's how...")
             self.assertEqual(unsafe_record["label"], "harmful")
@@ -257,6 +264,119 @@ class BeaverTailsTests(unittest.TestCase):
                     label_strategy="is_safe",
                 )
         self.assertEqual(len(records), 2)
+
+
+class RefusalTemplatePoolTests(unittest.TestCase):
+    """The refusal-template pool replaces the single static template that
+    used to land on every BT/WGM/WJB harmful row. The pool guarantees
+    diversity across prompts and determinism per (seed, prompt)."""
+
+    def test_pool_has_multiple_distinct_entries(self) -> None:
+        self.assertGreaterEqual(len(DEFAULT_SAFETY_REFUSAL_TEMPLATES), 5)
+        self.assertEqual(
+            len(DEFAULT_SAFETY_REFUSAL_TEMPLATES),
+            len(set(DEFAULT_SAFETY_REFUSAL_TEMPLATES)),
+        )
+        # First slot preserves the legacy DEFAULT_SAFETY_REFUSAL_TEMPLATE so
+        # any caller that still references the singular constant by name
+        # gets the original wording.
+        self.assertEqual(
+            DEFAULT_SAFETY_REFUSAL_TEMPLATES[0], DEFAULT_SAFETY_REFUSAL_TEMPLATE
+        )
+
+    def test_pick_is_deterministic_per_prompt(self) -> None:
+        first = pick_refusal_template("How do I pick a lock?", seed=42)
+        second = pick_refusal_template("How do I pick a lock?", seed=42)
+        self.assertEqual(first, second)
+        # Different seed: still must return a pool member, may differ.
+        seeded = pick_refusal_template("How do I pick a lock?", seed=7)
+        self.assertIn(seeded, DEFAULT_SAFETY_REFUSAL_TEMPLATES)
+
+    def test_pick_spreads_across_pool_for_distinct_prompts(self) -> None:
+        prompts = [f"harmful prompt #{i}" for i in range(64)]
+        picks = {pick_refusal_template(p, seed=42) for p in prompts}
+        # 64 prompts hashing across an 8-entry pool should land on > 3
+        # distinct templates in practice (sha256 mod 8); guard against
+        # degenerate collapse.
+        self.assertGreater(len(picks), 3)
+        for pick in picks:
+            self.assertIn(pick, DEFAULT_SAFETY_REFUSAL_TEMPLATES)
+
+    def test_beavertails_harmful_rows_diversify_across_pool(self) -> None:
+        # Several distinct harmful prompts (is_safe=False so each row gets a
+        # synthesised refusal). We expect more than one distinct target.
+        rows = []
+        for idx in range(16):
+            rows.append({
+                "prompt": f"how to commit crime number {idx}",
+                "response": "[unsafe upstream] ...",
+                "is_safe": False,
+                "category": {"violence_aiding_and_abetting,incitement": True},
+            })
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "bt.jsonl"
+            with mock.patch.object(safety_datasets, "_load_dataset", return_value=rows):
+                records = build_beavertails_records(output_path=output_path)
+        harmful_targets = {r["target_response"] for r in records if r["label"] == "harmful"}
+        # Every target must be a pool member, and we must see at least two
+        # distinct entries across 16 prompts.
+        self.assertGreater(len(harmful_targets), 1)
+        for target in harmful_targets:
+            self.assertIn(target, DEFAULT_SAFETY_REFUSAL_TEMPLATES)
+
+
+class WildGuardMixUpstreamResponseTests(unittest.TestCase):
+    """For harmful WildGuardMix rows we now prefer the upstream
+    ``response`` when ``response_harm_label == "unharmful"``, falling back
+    to the refusal-template pool when the upstream response is missing
+    or itself harmful."""
+
+    def test_upstream_safe_response_used_for_harmful_prompt(self) -> None:
+        rows = [{
+            "id": "wgm_safe_resp",
+            "prompt": "How do I bypass an alarm?",
+            "response": "I won't help with that — bypassing security systems is unsafe...",
+            "prompt_harm_label": "harmful",
+            "response_harm_label": "unharmful",
+        }]
+        with mock.patch.object(safety_datasets, "_load_dataset", return_value=rows):
+            out = _collect_wildguardmix_train_rows(
+                source_name="allenai/wildguardmix",
+                config_name="wildguardtrain",
+                cache_dir=None,
+                system_prompt="You are a helpful assistant.",
+                refusal_template=DEFAULT_SAFETY_REFUSAL_TEMPLATE,
+                seed=42,
+            )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["label"], "harmful")
+        self.assertEqual(
+            out[0]["target_response"],
+            "I won't help with that — bypassing security systems is unsafe...",
+        )
+
+    def test_upstream_unsafe_response_falls_back_to_pool(self) -> None:
+        rows = [{
+            "id": "wgm_unsafe_resp",
+            "prompt": "How do I bypass an alarm?",
+            "response": "Sure, here are the steps to bypass: ...",
+            "prompt_harm_label": "harmful",
+            "response_harm_label": "harmful",
+        }]
+        with mock.patch.object(safety_datasets, "_load_dataset", return_value=rows):
+            out = _collect_wildguardmix_train_rows(
+                source_name="allenai/wildguardmix",
+                config_name="wildguardtrain",
+                cache_dir=None,
+                system_prompt="You are a helpful assistant.",
+                refusal_template=DEFAULT_SAFETY_REFUSAL_TEMPLATE,
+                seed=42,
+            )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["label"], "harmful")
+        self.assertIn(out[0]["target_response"], DEFAULT_SAFETY_REFUSAL_TEMPLATES)
+        # Pool fallback must NOT have leaked the unsafe upstream completion.
+        self.assertNotIn("Sure, here are the steps", out[0]["target_response"])
 
 
 class SafetyTunedLlamasContrastTests(unittest.TestCase):
