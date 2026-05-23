@@ -8,6 +8,40 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import resource as _resource  # POSIX only; Windows has no equivalent
+except ImportError:  # pragma: no cover - Windows fallback, 17 runs on Linux only
+    _resource = None
+
+
+def _raise_nofile_limit(target: int = 65536) -> None:
+    """Lift RLIMIT_NOFILE so the OpenCompass mbpp / humaneval evaluators can
+    fork enough ProcessPoolExecutor workers. Each forked worker opens one
+    ``os.pipe()`` pair (2 FDs); mbpp_gen runs 500 samples and exhausts the
+    default soft limit of 1024 well before completion, crashing with
+    ``OSError: [Errno 24] Too many open files``.
+    """
+
+    if _resource is None:
+        return
+    try:
+        soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        return
+    if hard == _resource.RLIM_INFINITY:
+        new_soft = target
+    else:
+        new_soft = min(target, hard)
+    if new_soft <= soft:
+        return
+    try:
+        _resource.setrlimit(_resource.RLIMIT_NOFILE, (new_soft, hard))
+    except (ValueError, OSError) as exc:
+        print(
+            f"[WARN] failed to raise RLIMIT_NOFILE to {new_soft}: {exc}",
+            file=sys.stderr,
+        )
+
 
 # Verified against the vendored copy at external/opencompass on 2026-05-04:
 #   opencompass/configs/datasets/mmlu/mmlu_gen.py        (delegates to
@@ -308,6 +342,13 @@ def main() -> None:
         json.dumps(invocation, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    _raise_nofile_limit()
+    if _resource is not None:
+        _soft, _hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+        print(
+            f"[INFO] RLIMIT_NOFILE = ({_soft}, {_hard}) before OC launch",
+            flush=True,
+        )
     print(f"Running OpenCompass (backend={backend}, num_gpus={num_gpus}):")
     print("  " + " ".join(cmd))
     env = os.environ.copy()

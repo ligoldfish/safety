@@ -78,28 +78,8 @@ def main() -> None:
     output_root = ensure_dir(cfg.output.output_root)
     logger, log_path = setup_stage_logger("13_train_pan_sft", output_root / "logs")
 
-    train_records_all = load_records(cfg.data.train_split)
-    val_records_all = load_records(cfg.data.val_split)
-    # Harmful-only training: every safety experiment (sft / distill / ours)
-    # trains exclusively on the harmful subset; both polarities are exercised
-    # at eval time via the held-out test JSONL produced by 21_build_baseline_eval_jsonls.
-    train_records = [r for r in train_records_all if str(r.get("label", "")).lower() == "harmful"]
-    val_records = [r for r in val_records_all if str(r.get("label", "")).lower() == "harmful"]
-    log_kv(
-        logger,
-        "harmful_only_filter_applied",
-        train_total=len(train_records_all),
-        train_kept=len(train_records),
-        train_dropped_harmless=len(train_records_all) - len(train_records),
-        val_total=len(val_records_all),
-        val_kept=len(val_records),
-        val_dropped_harmless=len(val_records_all) - len(val_records),
-    )
-    if not train_records:
-        raise ValueError(
-            f"Harmful-only filter left 0 train records (loaded {len(train_records_all)} total). "
-            f"Verify that {cfg.data.train_split} contains rows with label=='harmful'."
-        )
+    train_records = load_records(cfg.data.train_split)
+    val_records = load_records(cfg.data.val_split)
     train_dataset = PanSupervisedDataset(train_records)
     val_dataset = PanSupervisedDataset(val_records)
 
