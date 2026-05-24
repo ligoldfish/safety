@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -821,29 +822,31 @@ def build_beavertails_records(
 ) -> List[Dict[str, Any]]:
     """Materialize a BeaverTails SFT split.
 
-    Unsafe rows (``is_safe == False``) get their assistant turn replaced
-    with the project-wide refusal template; safe rows keep the original
-    response. Both branches share the same ``messages`` schema.
-
     BeaverTails 30k_train ships multiple ``is_safe``-tagged responses per
-    prompt. ``dedup_prompts=True`` (default) keeps only the first record
-    per prompt to flatten that response-level inflation.
+    prompt (different model generations). When ``dedup_prompts=True`` (default)
+    we group rows by prompt and pick a single canonical response per group,
+    preferring an upstream ``is_safe=True`` response as the refusal target.
+    This matches the BeaverTails paper SFT protocol and avoids the synthetic
+    8-template refusal pool except as last-resort fallback.
 
-    ``label_strategy`` selects the binary label semantics:
+    Per-prompt selection rule (``dedup_prompts=True``):
 
-    * ``"category_any"`` (default, Round 2): prompt-level — ``harmful``
-      when any flag in the BT ``category`` dict is True, ``harmless``
-      otherwise. To prevent target/label mismatch (e.g. a benign-category
-      prompt paired with an ``is_safe=False`` unsafe response would teach
-      the model to refuse benign prompts), this strategy **drops** rows
-      where the prompt-level label disagrees with response-level
-      ``is_safe``. The kept rows have aligned signal:
-      ``(harmful, is_safe=False)`` → refusal target, and
-      ``(harmless, is_safe=True)`` → keep the original safe response.
-    * ``"is_safe"`` (legacy, Round 1): response-level — flips the upstream
-      ``is_safe`` boolean (``True → harmless``, ``False → harmful``).
-      Retained for reproducibility of older runs but biased toward refusal
-      style rather than prompt content.
+    1. Determine prompt-level danger label:
+       * ``label_strategy="is_safe"``: prompt is ``harmful`` if any row in the
+         group has ``is_safe=False`` (i.e. at least one model failed to refuse),
+         else ``harmless``.
+       * ``label_strategy="category_any"``: prompt is ``harmful`` if any flag
+         in the BT ``category`` dict is True, else ``harmless``. Prompts whose
+         category label disagrees with the per-group ``is_safe`` distribution
+         (e.g. benign category but all upstream responses unsafe) are dropped.
+    2. Pick assistant target:
+       * harmful prompt → prefer first ``is_safe=True`` response in the group
+         (natural BT refusal text). Fallback to ``pick_refusal_template``
+         (8-string pool) only when no safe response exists for that prompt.
+       * harmless prompt → use first ``is_safe=True`` response in the group.
+
+    When ``dedup_prompts=False`` we keep the legacy per-row emission for
+    backward compatibility with older runs.
     """
 
     if split not in SUPPORTED_BEAVERTAILS_TRAIN_SPLITS:
@@ -861,60 +864,115 @@ def build_beavertails_records(
 
     dataset = _load_dataset(source_name, split=split, cache_dir=cache_dir)
     records: List[Dict[str, Any]] = []
-    seen_prompts: set[str] = set()
-    for index, row in enumerate(dataset):
-        prompt = str(row.get("prompt", "")).strip()
-        if not prompt:
-            continue
-        if dedup_prompts:
-            if prompt in seen_prompts:
+
+    if dedup_prompts:
+        # Group all rows by prompt so we can pick the best response per prompt.
+        prompt_groups: Dict[str, List[Tuple[int, Dict[str, Any]]]] = defaultdict(list)
+        for index, row in enumerate(dataset):
+            prompt = str(row.get("prompt", "")).strip()
+            if not prompt:
                 continue
-            seen_prompts.add(prompt)
-        is_safe = bool(row.get("is_safe", False))
-        original_response = str(row.get("response", "")).strip()
-        category = row.get("category")
-        if label_strategy == "category_any":
-            label = _bt_label_from_category(category)
-            response_label = "harmless" if is_safe else "harmful"
-            if label != response_label:
-                # BT noise: drop prompts where category-level harmfulness
-                # disagrees with response-level is_safe. Keeping these
-                # would teach the model the wrong association.
+            prompt_groups[prompt].append((index, dict(row)))
+
+        for prompt, group in prompt_groups.items():
+            safe_rows = [(i, r) for i, r in group if bool(r.get("is_safe", False))]
+            unsafe_rows = [(i, r) for i, r in group if not bool(r.get("is_safe", False))]
+
+            if label_strategy == "category_any":
+                category = group[0][1].get("category")
+                label = _bt_label_from_category(category)
+                # Drop when prompt-level harmfulness disagrees with the actual
+                # distribution of upstream is_safe flags for this prompt:
+                #   * harmful category but no unsafe response → not actually risky
+                #   * harmless category but no safe response → suspicious labelling
+                if label == "harmful" and not unsafe_rows:
+                    continue
+                if label == "harmless" and not safe_rows:
+                    continue
+            else:  # "is_safe"
+                label = "harmful" if unsafe_rows else "harmless"
+
+            if safe_rows:
+                chosen_index, chosen_row = safe_rows[0]
+                assistant_text = str(chosen_row.get("response", "")).strip()
+                chosen_is_safe = True
+                refusal_source = "upstream_safe"
+            else:
+                chosen_index, chosen_row = unsafe_rows[0]
+                assistant_text = pick_refusal_template(prompt, seed=seed)
+                chosen_is_safe = False
+                refusal_source = "template_pool"
+
+            if not assistant_text:
                 continue
-        else:
-            label = "harmless" if is_safe else "harmful"
-        if label == "harmless":
-            assistant_text = original_response
-        elif is_safe and original_response:
-            # Upstream BT response was tagged safe for this harmful prompt — use
-            # it verbatim instead of synthesising a refusal. Under the default
-            # ``label_strategy="category_any"`` the alignment-mismatch drop above
-            # makes this branch unreachable (category-harmful rows always carry
-            # is_safe=False), but the conditional keeps the more permissive
-            # ``label_strategy="is_safe"`` path correct.
-            assistant_text = original_response
-        else:
-            assistant_text = pick_refusal_template(prompt, seed=seed)
-        if not assistant_text:
-            continue
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ]
-        record = {
-            "id": f"beavertails_{split}_{index:08d}",
-            "messages": messages,
-            "target_response": assistant_text,
-            "original_response": original_response,
-            "is_safe": is_safe,
-            "category": category,
-            "label": label,
-            "label_strategy": label_strategy,
-            "source": source_name,
-            "split": split,
-            "dataset": "beavertails",
-        }
-        records.append(record)
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            records.append(
+                {
+                    "id": f"beavertails_{split}_{chosen_index:08d}",
+                    "messages": messages,
+                    "target_response": assistant_text,
+                    "original_response": str(chosen_row.get("response", "")).strip(),
+                    "is_safe": chosen_is_safe,
+                    "category": chosen_row.get("category"),
+                    "label": label,
+                    "label_strategy": label_strategy,
+                    "source": source_name,
+                    "split": split,
+                    "dataset": "beavertails",
+                    "refusal_source": refusal_source,
+                    "prompt_group_size": len(group),
+                    "prompt_group_safe_count": len(safe_rows),
+                    "prompt_group_unsafe_count": len(unsafe_rows),
+                }
+            )
+    else:
+        # Legacy per-row path. Kept for backward compatibility; emits one
+        # record per dataset row using the response that row carries.
+        for index, row in enumerate(dataset):
+            prompt = str(row.get("prompt", "")).strip()
+            if not prompt:
+                continue
+            is_safe = bool(row.get("is_safe", False))
+            original_response = str(row.get("response", "")).strip()
+            category = row.get("category")
+            if label_strategy == "category_any":
+                label = _bt_label_from_category(category)
+                response_label = "harmless" if is_safe else "harmful"
+                if label != response_label:
+                    continue
+            else:
+                label = "harmless" if is_safe else "harmful"
+            if label == "harmless":
+                assistant_text = original_response
+            elif is_safe and original_response:
+                assistant_text = original_response
+            else:
+                assistant_text = pick_refusal_template(prompt, seed=seed)
+            if not assistant_text:
+                continue
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            records.append(
+                {
+                    "id": f"beavertails_{split}_{index:08d}",
+                    "messages": messages,
+                    "target_response": assistant_text,
+                    "original_response": original_response,
+                    "is_safe": is_safe,
+                    "category": category,
+                    "label": label,
+                    "label_strategy": label_strategy,
+                    "source": source_name,
+                    "split": split,
+                    "dataset": "beavertails",
+                }
+            )
 
     if not records:
         raise RuntimeError(

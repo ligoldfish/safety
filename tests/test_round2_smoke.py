@@ -75,7 +75,8 @@ class PhaseFLoRACapacityTests(unittest.TestCase):
                     msg=f"{name} missing: {self.REQUIRED_TARGETS - targets}",
                 )
 
-    def test_npu_ppu_random_use_two_epochs(self) -> None:
+    def test_npu_ppu_random_use_design_spec_epochs(self) -> None:
+        """方案详述 §9.6 fixes epochs=3 for PhaseF training."""
         for name in (
             "qwen35_9b_to_08b_phaseF_npu.yaml",
             "qwen35_9b_to_08b_phaseF_ppu.yaml",
@@ -86,7 +87,7 @@ class PhaseFLoRACapacityTests(unittest.TestCase):
             yaml_path = PROJECT_ROOT / "configs" / name
             with self.subTest(yaml=name):
                 cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-                self.assertEqual(int(cfg["optim"]["epochs"]), 2, msg=name)
+                self.assertEqual(int(cfg["optim"]["epochs"]), 3, msg=name)
 
     def test_npu_sft1_ablation_is_sft_only_and_isolated(self) -> None:
         yaml_path = PROJECT_ROOT / "configs" / "qwen35_9b_to_08b_phaseF_npu_sft1.yaml"
