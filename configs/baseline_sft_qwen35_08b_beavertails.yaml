@@ -21,9 +21,11 @@ data:
     refusal_template: I can't help with requests that could cause harm or enable unsafe
       behavior. If your goal is legitimate or safety-related, I can help with a safer
       alternative, prevention guidance, or high-level information.
-    # Round 2: prompt-level labels via BT category dict (any True -> harmful)
-    # so 20_split sees both poles in-domain and never injects PAN harmless.
-    label_strategy: category_any
+    # Switched to response-level is_safe (matches BeaverTails paper SFT
+    # protocol). Keeps upstream is_safe=True responses as natural diverse
+    # refusal targets and drops the 8-template pool fallback for the
+    # majority of harmful rows.
+    label_strategy: is_safe
     dedup_prompts: true
     force_rebuild: false
 lora:

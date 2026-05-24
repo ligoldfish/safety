@@ -145,7 +145,7 @@ def _build_beavertails_test(
             split="30k_train",
             cache_dir=cache_dir,
             dedup_prompts=True,
-            label_strategy="category_any",
+            label_strategy="is_safe",
         )
 
     held_out = [r for r in all_records if r["id"] not in train_ids]

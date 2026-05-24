@@ -32,7 +32,7 @@ data:
     refusal_template: I can't help with requests that could cause harm or enable unsafe
       behavior. If your goal is legitimate or safety-related, I can help with a safer
       alternative, prevention guidance, or high-level information.
-    label_strategy: category_any
+    label_strategy: is_safe
     dedup_prompts: true
     force_rebuild: false
 lora:
