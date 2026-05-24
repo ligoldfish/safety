@@ -51,8 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rank",
         type=int,
-        default=8,
-        help="Subspace rank k. The proposal fixes this to 8 for stage C.",
+        default=16,
+        help="Subspace rank k for the SVD on Δ_l. Default 16 (raised from "
+        "the design doc's initial k=8 placeholder; PAN paper Section 4 "
+        "shows effective rank can reach ~50 at peak layers, so 16 is a "
+        "more representative mid-range choice).",
     )
     parser.add_argument(
         "--no-balance-labels",
@@ -185,7 +188,7 @@ def main() -> None:
                 "mean_diff": result.mean_diff,
                 "harmful_mean": result.harmful_mean,
                 "harmless_mean": result.harmless_mean,
-                "explained_ratio_top8": result.explained_ratio_topk,
+                "explained_ratio_topk": result.explained_ratio_topk,
                 "harmful_count": result.harmful_count,
                 "harmless_count": result.harmless_count,
                 "normalize_hidden": not args.no_normalize_hidden,

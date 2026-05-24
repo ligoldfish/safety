@@ -24,7 +24,7 @@ def build_teacher_safe_subspace(
     layer_idx: int,
     harmful_hidden: torch.Tensor,
     harmless_hidden: torch.Tensor,
-    k: int = 8,
+    k: int = 16,
     normalize_hidden: bool = False,
     eps: float = 1e-12,
 ) -> SafeSubspaceResult:
