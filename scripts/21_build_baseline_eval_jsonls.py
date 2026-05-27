@@ -31,6 +31,7 @@ Per-baseline mappings:
 Usage:
     python scripts/21_build_baseline_eval_jsonls.py --baseline all
     python scripts/21_build_baseline_eval_jsonls.py --baseline tulu3_safety --force-rebuild
+    python scripts/21_build_baseline_eval_jsonls.py --baseline wildjailbreak --max-eval-samples 2000
 """
 
 from __future__ import annotations
@@ -50,8 +51,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data.safety_datasets import (
     DEFAULT_TULU3_SAFETY_SOURCES,
+    build_beavertails_category_records,
     build_beavertails_records,
+    build_hh_rlhf_records,
     build_safety_tuned_llamas_records,
+    build_wildguardmix_records,
+    build_wildjailbreak_records,
 )
 from src.data.safety_eval_datasets import (
     SafetyEvalExample,
@@ -62,7 +67,16 @@ from src.data.template_qwen import DEFAULT_SYSTEM_PROMPT, build_qwen_messages
 from src.utils.io import ensure_dir, read_jsonl, write_jsonl
 
 
-SUPPORTED_BASELINES = ("pan", "beavertails", "tulu3_safety", "safety_tuned_llamas")
+SUPPORTED_BASELINES = (
+    "pan",
+    "beavertails",
+    "tulu3_safety",
+    "safety_tuned_llamas",
+    "wildjailbreak",
+    "wildguardmix",
+    "hh_rlhf",
+    "beavertails_category",
+)
 EVAL_DIR = PROJECT_ROOT / "data" / "processed" / "eval"
 
 
@@ -96,6 +110,23 @@ def parse_args() -> argparse.Namespace:
         "--cache-dir",
         default="",
         help="Optional HF datasets cache dir.",
+    )
+    parser.add_argument(
+        "--max-eval-samples",
+        type=int,
+        default=0,
+        help="Cap for new in-domain safety tests (0 = full official test).",
+    )
+    parser.add_argument(
+        "--max-eval-samples-per-label",
+        type=int,
+        default=0,
+        help="Per-label cap for new in-domain safety tests (0 = infer from max-eval-samples).",
+    )
+    parser.add_argument(
+        "--eval-full",
+        action="store_true",
+        help="Use full available test split for new baselines. This is already the default.",
     )
     parser.add_argument(
         "--stl-repo-path",
@@ -309,6 +340,63 @@ def _build_safety_tuned_llamas_test(
     return out
 
 
+def _build_new_dataset_test(
+    baseline: str,
+    *,
+    seed: int,
+    cache_dir: Optional[str],
+    eval_subset_mode: bool,
+    max_eval_samples: int,
+    max_eval_samples_per_label: int,
+) -> Path:
+    out = _eval_jsonl_path(baseline)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_jsonl = Path(tmpdir) / f"{baseline}_train.jsonl"
+        common = {
+            "eval_output_path": out,
+            "eval_subset_mode": bool(eval_subset_mode),
+            "max_eval_samples": int(max_eval_samples),
+            "max_eval_samples_per_label": int(max_eval_samples_per_label),
+            "seed": int(seed),
+            "cache_dir": cache_dir,
+        }
+        if baseline == "wildjailbreak":
+            build_wildjailbreak_records(
+                output_path=tmp_jsonl,
+                train_subset_mode=True,
+                max_train_samples=20000,
+                max_train_samples_per_label=10000,
+                **common,
+            )
+        elif baseline == "wildguardmix":
+            build_wildguardmix_records(
+                output_path=tmp_jsonl,
+                train_subset_mode=True,
+                max_train_samples=20000,
+                max_train_samples_per_label=10000,
+                **common,
+            )
+        elif baseline == "hh_rlhf":
+            build_hh_rlhf_records(
+                output_path=tmp_jsonl,
+                train_subset_mode=True,
+                max_train_samples=20000,
+                max_train_samples_per_label=10000,
+                **common,
+            )
+        elif baseline == "beavertails_category":
+            build_beavertails_category_records(
+                output_path=tmp_jsonl,
+                train_subset_mode=False,
+                max_train_samples=0,
+                max_train_samples_per_label=0,
+                **common,
+            )
+        else:  # pragma: no cover -- guarded by caller
+            raise ValueError(f"Unsupported new dataset baseline: {baseline}")
+    return out
+
+
 def main() -> None:
     args = parse_args()
     targets = list(SUPPORTED_BASELINES) if args.baseline == "all" else [args.baseline]
@@ -339,6 +427,20 @@ def main() -> None:
                 repo_path=Path(args.stl_repo_path).expanduser().resolve(),
                 seed=int(args.seed),
                 holdout_fraction=float(args.holdout_fraction),
+            )
+        elif baseline in {
+            "wildjailbreak",
+            "wildguardmix",
+            "hh_rlhf",
+            "beavertails_category",
+        }:
+            written = _build_new_dataset_test(
+                baseline,
+                seed=int(args.seed),
+                cache_dir=cache_dir,
+                eval_subset_mode=not bool(args.eval_full) and int(args.max_eval_samples) != 0,
+                max_eval_samples=int(args.max_eval_samples),
+                max_eval_samples_per_label=int(args.max_eval_samples_per_label),
             )
         else:  # pragma: no cover -- guarded by argparse choices
             raise ValueError(f"Unknown baseline: {baseline}")

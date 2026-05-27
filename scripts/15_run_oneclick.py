@@ -43,7 +43,15 @@ BASELINE_DISTILL_CONFIGS = {
 # Keyed by (device, model, baseline_name); only 0.8B has explicit configs
 # because the upstream Tülu/Safety-Tuned-LLaMAs/BeaverTails recipes were
 # specified for that scale.
-SAFETY_SFT_BASELINES = ("tulu3_safety", "safety_tuned_llamas", "beavertails")
+SAFETY_SFT_BASELINES = (
+    "tulu3_safety",
+    "safety_tuned_llamas",
+    "beavertails",
+    "wildjailbreak",
+    "wildguardmix",
+    "hh_rlhf",
+    "beavertails_category",
+)
 # Keep all one-click experiment summaries comparable while this experiment
 # matrix is still exploratory: safety-specific variants default to the same
 # PAN transfer test as the ordinary baselines. External safety suites remain
@@ -56,6 +64,10 @@ SAFETY_SFT_CONFIGS: dict[tuple[str, str, str], str] = {
     ("ppu", "0.8b", "safety_tuned_llamas"): "configs/baseline_sft_qwen35_08b_safety_tuned_llamas_ppu.yaml",
     ("npu", "0.8b", "beavertails"): "configs/baseline_sft_qwen35_08b_beavertails_npu.yaml",
     ("ppu", "0.8b", "beavertails"): "configs/baseline_sft_qwen35_08b_beavertails_ppu.yaml",
+    ("npu", "0.8b", "wildjailbreak"): "configs/baseline_sft_qwen35_08b_wildjailbreak_npu.yaml",
+    ("npu", "0.8b", "wildguardmix"): "configs/baseline_sft_qwen35_08b_wildguardmix_npu.yaml",
+    ("npu", "0.8b", "hh_rlhf"): "configs/baseline_sft_qwen35_08b_hh_rlhf_npu.yaml",
+    ("npu", "0.8b", "beavertails_category"): "configs/baseline_sft_qwen35_08b_beavertails_category_npu.yaml",
 }
 
 # Distillation safety baselines: 9B teacher → 0.8B student, training corpus
@@ -70,6 +82,10 @@ SAFETY_EVAL_CONFIGS: dict[tuple[str, str, str], str] = {
     ("ppu", "0.8b", "safety_tuned_llamas"): "configs/baseline_eval_qwen35_08b_safety_tuned_llamas_ppu.yaml",
     ("npu", "0.8b", "beavertails"): "configs/baseline_eval_qwen35_08b_beavertails_npu.yaml",
     ("ppu", "0.8b", "beavertails"): "configs/baseline_eval_qwen35_08b_beavertails_ppu.yaml",
+    ("npu", "0.8b", "wildjailbreak"): "configs/baseline_eval_qwen35_08b_wildjailbreak_npu.yaml",
+    ("npu", "0.8b", "wildguardmix"): "configs/baseline_eval_qwen35_08b_wildguardmix_npu.yaml",
+    ("npu", "0.8b", "hh_rlhf"): "configs/baseline_eval_qwen35_08b_hh_rlhf_npu.yaml",
+    ("npu", "0.8b", "beavertails_category"): "configs/baseline_eval_qwen35_08b_beavertails_category_npu.yaml",
 }
 
 # Per-baseline external safety suites passed via --safety-eval-datasets.
@@ -81,6 +97,10 @@ SAFETY_EVAL_DATASETS_BY_BASELINE: dict[str, tuple[str, ...]] = {
     "tulu3_safety": ("coconot_contrast",),
     "safety_tuned_llamas": (),
     "beavertails": (),
+    "wildjailbreak": (),
+    "wildguardmix": (),
+    "hh_rlhf": (),
+    "beavertails_category": (),
 }
 
 
@@ -100,6 +120,10 @@ SAFETY_DISTILL_CONFIGS: dict[tuple[str, str], str] = {
     ("ppu", "safety_tuned_llamas"): "configs/baseline_distill_qwen35_9b_to_08b_safety_tuned_llamas_ppu.yaml",
     ("npu", "beavertails"): "configs/baseline_distill_qwen35_9b_to_08b_beavertails_npu.yaml",
     ("ppu", "beavertails"): "configs/baseline_distill_qwen35_9b_to_08b_beavertails_ppu.yaml",
+    ("npu", "wildjailbreak"): "configs/baseline_distill_qwen35_9b_to_08b_wildjailbreak_npu.yaml",
+    ("npu", "wildguardmix"): "configs/baseline_distill_qwen35_9b_to_08b_wildguardmix_npu.yaml",
+    ("npu", "hh_rlhf"): "configs/baseline_distill_qwen35_9b_to_08b_hh_rlhf_npu.yaml",
+    ("npu", "beavertails_category"): "configs/baseline_distill_qwen35_9b_to_08b_beavertails_category_npu.yaml",
 }
 
 FULL_PIPELINE_CONFIGS = {
@@ -231,9 +255,31 @@ def parse_args() -> argparse.Namespace:
 
     sft_parser = subparsers.add_parser("sft", help="Run PAN SFT and then benchmark evaluation.")
     sft_parser.add_argument("--model", choices=["0.8b", "9b"], required=True)
+    sft_parser.add_argument(
+        "--baseline",
+        choices=["pan", *SAFETY_SFT_BASELINES],
+        default="pan",
+        help="'pan' keeps the legacy PAN SFT flow; safety values route to safety-sft.",
+    )
+    sft_parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Re-materialize the safety JSONL when --baseline is not pan.",
+    )
     add_common_flags(sft_parser)
 
     distill_parser = subparsers.add_parser("distill", help="Run PAN distillation and then benchmark evaluation.")
+    distill_parser.add_argument(
+        "--baseline",
+        choices=["pan", *SAFETY_SFT_BASELINES],
+        default="pan",
+        help="'pan' keeps the legacy PAN distill flow; safety values route to safety-distill.",
+    )
+    distill_parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Re-materialize the safety JSONL when --baseline is not pan.",
+    )
     add_common_flags(distill_parser)
 
     safety_parser = subparsers.add_parser(
@@ -306,6 +352,17 @@ def parse_args() -> argparse.Namespace:
         "random",
         help="Run the random-vector baseline on the original 00->11 pipeline.",
     )
+    random_parser.add_argument(
+        "--baseline",
+        choices=["pan", *SAFETY_SFT_BASELINES],
+        default="pan",
+        help="'pan' keeps the legacy PAN random flow; safety values run random on that safety corpus.",
+    )
+    random_parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Re-materialize the safety JSONL when --baseline is not pan.",
+    )
     add_common_flags(random_parser)
 
     sft1_parser = subparsers.add_parser(
@@ -336,6 +393,17 @@ def parse_args() -> argparse.Namespace:
     add_common_flags(sft1_parser)
 
     full_parser = subparsers.add_parser("full", help="Run the original 00->11 full-stage pipeline.")
+    full_parser.add_argument(
+        "--baseline",
+        choices=["pan", *SAFETY_SFT_BASELINES],
+        default="pan",
+        help="'pan' keeps the legacy PAN full flow; safety values route to safety-full.",
+    )
+    full_parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Re-materialize the safety JSONL when --baseline is not pan.",
+    )
     full_parser.add_argument(
         "--phasef-config",
         default="",
@@ -821,6 +889,11 @@ def _run_baseline_nosft_one(
             raise ValueError(
                 f"--baseline {baseline_name} only supports --model 0.8b; "
                 "per-baseline eval YAMLs only exist for the 0.8B model."
+            )
+        if (device, model_size, baseline_name) not in SAFETY_EVAL_CONFIGS:
+            raise ValueError(
+                f"No per-baseline eval config registered for {(device, model_size, baseline_name)}. "
+                "New dataset baselines are NPU-only unless an explicit config is added."
             )
         eval_yaml_src = _resolve(_safety_eval_config(device, model_size, baseline_name))
 
@@ -1605,6 +1678,216 @@ def _make_safety_sft1_overrides(
     return phase1_override_path, phasef_override_path
 
 
+def _make_safety_random_overrides(
+    *,
+    device: str,
+    device_id: int,
+    baseline_name: str,
+    safety_processed_dir: Path,
+    safety_phase1_output_root: Path,
+    safety_phasef_output_root: Path,
+) -> tuple[Path, Path]:
+    base_phase1 = _resolve(FULL_PIPELINE_CONFIGS[device]["phase1"])
+    base_phasef = _resolve(RANDOM_PIPELINE_CONFIGS[device]["phasef"])
+
+    phase1_raw = yaml.safe_load(base_phase1.read_text(encoding="utf-8"))
+    if not isinstance(phase1_raw, dict):
+        raise ValueError(f"Phase 1 config must be a mapping: {base_phase1}")
+    phase1_raw.setdefault("dataset", {})["processed_dir"] = str(safety_processed_dir)
+    phase1_raw.setdefault("extraction", {})["output_root"] = str(safety_phase1_output_root)
+    if isinstance(phase1_raw.get("models"), dict):
+        for entry in phase1_raw["models"].values():
+            if isinstance(entry, dict):
+                _override_model_runtime(entry, device, device_id)
+    if isinstance(phase1_raw.get("model"), dict):
+        _override_model_runtime(phase1_raw["model"], device, device_id)
+
+    phase1_override_path = (
+        base_phase1.parent
+        / f"{base_phase1.stem}_random_{baseline_name}_{device}_{device_id}_{uuid.uuid4().hex[:8]}.yaml"
+    )
+    phase1_override_path.write_text(
+        yaml.safe_dump(phase1_raw, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    phasef_raw = yaml.safe_load(base_phasef.read_text(encoding="utf-8"))
+    if not isinstance(phasef_raw, dict):
+        raise ValueError(f"PhaseF config must be a mapping: {base_phasef}")
+    phasef_inputs = phasef_raw.setdefault("inputs", {})
+    phasef_inputs["train_split"] = str(safety_processed_dir / "alignment_set.jsonl")
+    phasef_inputs["val_split"] = str(safety_processed_dir / "analysis_val_set.jsonl")
+    phasef_inputs["train_targets_dir"] = str(
+        safety_phase1_output_root / "student_targets" / "student_safe_targets_alignment"
+    )
+    phasef_inputs["val_targets_dir"] = str(
+        safety_phase1_output_root / "student_targets" / "student_safe_targets_val"
+    )
+    phasef_inputs["pairing_path"] = str(
+        safety_phase1_output_root / "layer_pairing" / "teacher_student_layer_pairs.json"
+    )
+    phasef_inputs["train_anchor_dir"] = str(
+        safety_phase1_output_root / "hidden_states" / "student_alignment"
+    )
+    phasef_inputs["val_anchor_dir"] = str(
+        safety_phase1_output_root / "hidden_states" / "student_analysis_val"
+    )
+    phasef_raw.setdefault("output", {})["output_root"] = str(safety_phasef_output_root)
+    if isinstance(phasef_raw.get("model"), dict):
+        _override_model_runtime(phasef_raw["model"], device, device_id)
+
+    phasef_override_path = (
+        base_phasef.parent
+        / f"{base_phasef.stem}_random_{baseline_name}_{device}_{device_id}_{uuid.uuid4().hex[:8]}.yaml"
+    )
+    phasef_override_path.write_text(
+        yaml.safe_dump(phasef_raw, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return phase1_override_path, phasef_override_path
+
+
+def _run_safety_random(
+    device: str,
+    *,
+    baseline_name: str,
+    device_id: int,
+    num_devices: int,
+    dry_run: bool,
+    force_rebuild: bool,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+    enable_opencompass: bool,
+    opencompass_config: str = "",
+) -> None:
+    _validate_device_request(num_devices)
+    config_key = (device, "0.8b", baseline_name)
+    if config_key not in SAFETY_SFT_CONFIGS:
+        raise ValueError(
+            f"safety-random needs an SFT-style safety config for {config_key}; "
+            f"known: {sorted(SAFETY_SFT_CONFIGS.keys())}."
+        )
+    sft_safety_config = _make_runtime_override_config(
+        _resolve(SAFETY_SFT_CONFIGS[config_key]),
+        device=device,
+        device_id=device_id,
+    )
+    eval_config_src = _resolve(_safety_eval_config(device, "0.8b", baseline_name))
+    safety_eval_datasets = SAFETY_EVAL_DATASETS_BY_BASELINE.get(baseline_name, ())
+    sft_cfg = load_sft_config(sft_safety_config)
+    safety_jsonl_path = Path(sft_cfg.data.train_split).resolve()
+    env_overrides = _build_env_overrides(device, device_id)
+
+    prep_args = ["--config", str(sft_safety_config)]
+    if force_rebuild:
+        prep_args.append("--force-rebuild")
+    _run_script(
+        "19_prepare_safety_data.py",
+        prep_args,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+    safety_processed_dir = (
+        PROJECT_ROOT / "data" / "processed" / f"safety_full_{baseline_name}"
+    ).resolve()
+    pan_processed_dir = (PROJECT_ROOT / "data" / "processed").resolve()
+    if not dry_run:
+        safety_processed_dir.mkdir(parents=True, exist_ok=True)
+    _run_script(
+        "20_split_safety_for_semalign.py",
+        [
+            "--safety-jsonl",
+            str(safety_jsonl_path),
+            "--output-dir",
+            str(safety_processed_dir),
+            "--pan-processed-dir",
+            str(pan_processed_dir),
+            "--harmless-source",
+            "auto",
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+    safety_phase1_output_root = (
+        PROJECT_ROOT
+        / "outputs"
+        / f"safety_full_{baseline_name}_{device}"
+        / "phase1"
+    ).resolve()
+    safety_phasef_output_root = (
+        safety_phase1_output_root / "training_random_same_norm"
+    ).resolve()
+    phase1_override, phasef_override = _make_safety_random_overrides(
+        device=device,
+        device_id=device_id,
+        baseline_name=baseline_name,
+        safety_processed_dir=safety_processed_dir,
+        safety_phase1_output_root=safety_phase1_output_root,
+        safety_phasef_output_root=safety_phasef_output_root,
+    )
+
+    _run_phase1_precompute(
+        phase1_override,
+        smoke=False,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+        skip_prepare=True,
+    )
+    _run_script(
+        "09_train_student_semalign.py",
+        ["--config", str(phasef_override)],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    _run_script(
+        "10_sanity_eval.py",
+        [
+            "--config",
+            str(phase1_override),
+            "--training-dir",
+            str(safety_phasef_output_root),
+            "--output-dir-name",
+            "sanity_eval_random_same_norm",
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    _run_script(
+        "11_make_tables.py",
+        [
+            "--config",
+            str(phase1_override),
+            "--training-dir-name",
+            "training_random_same_norm",
+            "--sanity-dir-name",
+            "sanity_eval_random_same_norm",
+            "--tables-dir-name",
+            "tables_random_same_norm",
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    phasef_cfg = load_phasef_config(phasef_override)
+    _run_adapter_eval(
+        device=device,
+        model_size="0.8b",
+        training_output_root=safety_phasef_output_root,
+        epochs=int(phasef_cfg.optim.epochs),
+        device_id=device_id,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
+        safety_eval_datasets=safety_eval_datasets,
+        eval_config_path=str(eval_config_src),
+    )
+
+
 def _run_safety_sft1(
     device: str,
     *,
@@ -1895,6 +2178,18 @@ def main() -> None:
         )
         return
     if args.command == "sft":
+        if args.baseline != "pan":
+            _run_safety_sft(
+                args.device,
+                baseline_name=args.baseline,
+                model_size=args.model,
+                device_id=args.device_id,
+                num_devices=args.num_devices,
+                dry_run=args.dry_run,
+                force_rebuild=bool(args.force_rebuild),
+                **oc_kwargs,
+            )
+            return
         _run_baseline_sft(
             args.device,
             args.model,
@@ -1905,6 +2200,17 @@ def main() -> None:
         )
         return
     if args.command == "distill":
+        if args.baseline != "pan":
+            _run_safety_distill(
+                args.device,
+                baseline_name=args.baseline,
+                device_id=args.device_id,
+                num_devices=args.num_devices,
+                dry_run=args.dry_run,
+                force_rebuild=bool(args.force_rebuild),
+                **oc_kwargs,
+            )
+            return
         _run_baseline_distill(
             args.device,
             device_id=args.device_id,
@@ -1949,6 +2255,17 @@ def main() -> None:
         )
         return
     if args.command == "random":
+        if args.baseline != "pan":
+            _run_safety_random(
+                args.device,
+                baseline_name=args.baseline,
+                device_id=args.device_id,
+                num_devices=args.num_devices,
+                dry_run=args.dry_run,
+                force_rebuild=bool(args.force_rebuild),
+                **oc_kwargs,
+            )
+            return
         _run_random_baseline(
             args.device,
             device_id=args.device_id,
@@ -1978,6 +2295,20 @@ def main() -> None:
             )
         return
     if args.command == "full":
+        if args.baseline != "pan":
+            if args.phasef_config:
+                raise ValueError("--phasef-config is only supported when --baseline pan.")
+            _run_safety_full(
+                args.device,
+                baseline_name=args.baseline,
+                device_id=args.device_id,
+                num_devices=args.num_devices,
+                dry_run=args.dry_run,
+                force_rebuild=bool(args.force_rebuild),
+                smoke=False,
+                **oc_kwargs,
+            )
+            return
         _run_full_pipeline(
             args.device,
             device_id=args.device_id,

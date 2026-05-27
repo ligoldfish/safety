@@ -96,6 +96,15 @@ class SafetyDatasetConfig:
     # Round 2: Tülu3 v2 helpful slices (in-domain harmless contrast).
     helpful_sources: list[str] = field(default_factory=list)
     helpful_max_samples: int = 0  # 0 = match harmful count automatically
+    # New dataset materialization knobs. Train/eval sampling are independent:
+    # max_* == 0 or subset_mode == False means "use the full available split".
+    train_subset_mode: bool = True
+    max_train_samples: int = 0
+    max_train_samples_per_label: int = 0
+    eval_subset_mode: bool = False
+    max_eval_samples: int = 0
+    max_eval_samples_per_label: int = 0
+    eval_output_path: str = ""
 
 
 @dataclass

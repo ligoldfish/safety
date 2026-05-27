@@ -4,10 +4,10 @@ Covers:
 
 * ``--baseline pan`` (default) keeps invoking the PAN eval YAML — i.e. the
   pre-Round-3 byte-for-byte behaviour for back-compat.
-* ``--baseline {tulu3_safety, beavertails, safety_tuned_llamas}`` routes to
+* ``--baseline {tulu3_safety, beavertails, safety_tuned_llamas, ...}`` routes to
   the per-baseline eval YAML and lifts the over-refusal probe from
   ``SAFETY_EVAL_DATASETS_BY_BASELINE``.
-* ``--baseline all`` loops PAN + the three safety baselines once each.
+* ``--baseline all`` loops PAN + every registered safety baseline once each.
 * ``--baseline beavertails`` does NOT add ``--safety-eval-datasets`` (the
   registry maps BT/STL to an empty tuple).
 * ``--model 9b --baseline beavertails`` raises ``ValueError`` because the
@@ -148,9 +148,9 @@ class NosftBaselineRoutingTests(unittest.TestCase):
         self.assertIn("baseline_eval_qwen35_08b_safety_tuned_llamas_npu.yaml", joined)
         self.assertNotIn("--safety-eval-datasets", args)
 
-    def test_all_iterates_four_baselines(self) -> None:
+    def test_all_iterates_registered_baselines(self) -> None:
         calls = self._run(baseline_name="all")
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 1 + len(self.launcher.SAFETY_SFT_BASELINES))
         joined_per_call = [" ".join(args) for _, args in calls]
         self.assertTrue(any("baseline_eval_qwen35_08b_npu.yaml" in j for j in joined_per_call))
         self.assertTrue(
@@ -160,6 +160,10 @@ class NosftBaselineRoutingTests(unittest.TestCase):
         self.assertTrue(
             any("safety_tuned_llamas_npu.yaml" in j for j in joined_per_call)
         )
+        self.assertTrue(any("wildjailbreak_npu.yaml" in j for j in joined_per_call))
+        self.assertTrue(any("wildguardmix_npu.yaml" in j for j in joined_per_call))
+        self.assertTrue(any("hh_rlhf_npu.yaml" in j for j in joined_per_call))
+        self.assertTrue(any("beavertails_category_npu.yaml" in j for j in joined_per_call))
 
     def test_9b_with_baseline_other_than_pan_raises(self) -> None:
         with self.assertRaises(ValueError) as ctx:

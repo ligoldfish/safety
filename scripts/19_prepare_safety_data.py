@@ -89,6 +89,14 @@ def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSp
             f"{config_path} does not declare data.safety_dataset.name; "
             "cannot determine which safety dataset to build."
         )
+    eval_output_path = safety_cfg.eval_output_path or ""
+    if not eval_output_path and safety_cfg.name in {
+        "wildjailbreak",
+        "wildguardmix",
+        "hh_rlhf",
+        "beavertails_category",
+    }:
+        eval_output_path = data.test_split
     spec = SafetyDatasetSpec(
         name=safety_cfg.name,
         output_path=data.train_split,
@@ -116,6 +124,13 @@ def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSp
             if safety_cfg.helpful_max_samples
             else None
         ),
+        train_subset_mode=bool(safety_cfg.train_subset_mode),
+        max_train_samples=int(safety_cfg.max_train_samples or 0),
+        max_train_samples_per_label=int(safety_cfg.max_train_samples_per_label or 0),
+        eval_subset_mode=bool(safety_cfg.eval_subset_mode),
+        max_eval_samples=int(safety_cfg.max_eval_samples or 0),
+        max_eval_samples_per_label=int(safety_cfg.max_eval_samples_per_label or 0),
+        eval_output_path=eval_output_path or None,
         seed=seed,
     )
     return spec, kind
@@ -154,6 +169,9 @@ def main() -> None:
         "force_rebuild": spec.force_rebuild,
         "labels": _summarize_labels(output_path),
     }
+    if spec.eval_output_path:
+        summary["eval_output_path"] = str(Path(spec.eval_output_path))
+        summary["eval_labels"] = _summarize_labels(Path(spec.eval_output_path))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

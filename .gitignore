@@ -11,3 +11,4 @@ configs/*_safety_*_ppu_*.yaml
 *.log
 .DS_Store
 *.pdf
+sweep_results.csv
