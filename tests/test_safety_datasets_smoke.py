@@ -1011,6 +1011,8 @@ class ConfigWiringSmokeTests(unittest.TestCase):
             self.assertFalse(distill_cfg.data.safety_dataset.eval_subset_mode)
             self.assertEqual(distill_cfg.data.safety_dataset.max_eval_samples, 0)
             self.assertEqual(distill_cfg.data.safety_dataset.max_eval_samples_per_label, 0)
+            self.assertEqual(sft_cfg.data.safety_dataset.eval_output_path, sft_cfg.data.test_split)
+            self.assertEqual(distill_cfg.data.safety_dataset.eval_output_path, distill_cfg.data.test_split)
             self.assertIn(dataset, SAFETY_TRAIN_DATASETS)
             self.assertIn(f"{dataset}_test.jsonl", eval_cfg.datasets.pan.path)
 

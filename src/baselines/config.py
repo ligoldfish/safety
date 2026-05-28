@@ -283,6 +283,8 @@ def _to_safety_dataset_config(raw: Dict[str, Any], base_dir: Path) -> SafetyData
         data["repo_or_data_path"] = _resolve_path(str(data["repo_or_data_path"]), base_dir)
     if "cache_dir" in data and data["cache_dir"]:
         data["cache_dir"] = _resolve_path(str(data["cache_dir"]), base_dir)
+    if "eval_output_path" in data and data["eval_output_path"]:
+        data["eval_output_path"] = _resolve_path(str(data["eval_output_path"]), base_dir)
     if "sources" in data and data["sources"] is not None:
         data["sources"] = [str(item) for item in data["sources"]]
     if "helpful_sources" in data and data["helpful_sources"] is not None:
