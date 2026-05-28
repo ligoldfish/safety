@@ -235,7 +235,16 @@ def _split_prompt_messages_and_target(
     for index in range(len(normalized) - 1, -1, -1):
         if str(normalized[index].get("role", "")).strip().lower() == "assistant":
             target = str(normalized[index].get("content", "")).strip()
-            return normalized[:index], target
+            prompt_messages = list(normalized[:index])
+            # Some upstream transcripts contain literal "\n\nAssistant:" text
+            # inside an assistant answer. The simple turn parser can split that
+            # into consecutive assistant messages; merge those back into the
+            # target so prompt messages still end at the user turn.
+            while prompt_messages and str(prompt_messages[-1].get("role", "")).strip().lower() == "assistant":
+                previous = str(prompt_messages.pop().get("content", "")).strip()
+                if previous:
+                    target = f"{previous}\n\n{target}" if target else previous
+            return prompt_messages, target
     return normalized, ""
 
 
@@ -1112,6 +1121,29 @@ def _response_is_explicit_compliance(value: Any) -> bool:
     return text in {"compliance", "non-refusal", "non_refusal", "nonrefusal", "answer"}
 
 
+def _response_text_looks_like_refusal(text: str) -> bool:
+    if not str(text or "").strip():
+        return False
+    try:
+        from src.training.eval_utils import looks_like_refusal
+    except ModuleNotFoundError:
+        import importlib.util
+        import sys
+
+        eval_utils_path = Path(__file__).resolve().parents[1] / "training" / "eval_utils.py"
+        spec = importlib.util.spec_from_file_location(
+            "_safety_eval_utils_standalone",
+            eval_utils_path,
+        )
+        if spec is None or spec.loader is None:
+            raise
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        looks_like_refusal = module.looks_like_refusal
+    return bool(looks_like_refusal(str(text)))
+
+
 def _load_wildguardmix_rows(
     *,
     source_name: str,
@@ -1169,14 +1201,19 @@ def _build_wildguardmix_pool(
                     drop_counts.get("harmless_unsafe_response", 0) + 1
                 )
                 continue
-            if not for_eval and not _response_is_explicit_compliance(response_refusal):
-                drop_key = (
-                    "harmless_refusal_response"
-                    if _response_is_refusal(response_refusal)
-                    else "harmless_missing_or_unknown_refusal_label"
-                )
-                drop_counts[drop_key] = drop_counts.get(drop_key, 0) + 1
-                continue
+            if not for_eval:
+                if _response_is_refusal(response_refusal):
+                    drop_counts["harmless_refusal_response"] = (
+                        drop_counts.get("harmless_refusal_response", 0) + 1
+                    )
+                    continue
+                if not _response_is_explicit_compliance(response_refusal):
+                    if _response_text_looks_like_refusal(response):
+                        drop_counts["harmless_refusal_response_heuristic"] = (
+                            drop_counts.get("harmless_refusal_response_heuristic", 0) + 1
+                        )
+                        continue
+                    metadata["response_refusal_label_imputed"] = "non_refusal_by_text"
             if not response and not for_eval:
                 drop_counts["harmless_missing_response"] = (
                     drop_counts.get("harmless_missing_response", 0) + 1

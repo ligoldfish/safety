@@ -608,6 +608,14 @@ class StandaloneSafetyDatasetTests(unittest.TestCase):
                 "response_refusal_label": None,
             },
             {
+                "id": "benign_missing_refusal_but_text_refuses",
+                "prompt": "How do I restart a service?",
+                "response": "I cannot help with that request.",
+                "prompt_harm_label": "unharmful",
+                "response_harm_label": "unharmful",
+                "response_refusal_label": None,
+            },
+            {
                 "id": "prompt_only",
                 "prompt": "How do I bypass a lock?",
                 "response": "",
@@ -623,10 +631,12 @@ class StandaloneSafetyDatasetTests(unittest.TestCase):
                     eval_output_path=None,
                 )
         ids = {r["id"] for r in records}
-        self.assertEqual(ids, {"harm_safe", "harm_unsafe", "benign_clean"})
+        self.assertEqual(ids, {"harm_safe", "harm_unsafe", "benign_clean", "benign_missing_refusal"})
         unsafe = next(r for r in records if r["id"] == "harm_unsafe")
         self.assertIn(unsafe["target_response"], DEFAULT_SAFETY_REFUSAL_TEMPLATES)
         self.assertEqual(next(r for r in records if r["id"] == "benign_clean")["label"], "harmless")
+        imputed = next(r for r in records if r["id"] == "benign_missing_refusal")
+        self.assertEqual(imputed["metadata"]["response_refusal_label_imputed"], "non_refusal_by_text")
 
     def test_eval_fallback_reason_is_recorded(self) -> None:
         train_rows = [
@@ -703,6 +713,15 @@ class StandaloneSafetyDatasetTests(unittest.TestCase):
         self.assertEqual(target, "I can discuss prevention and safety planning.")
         self.assertEqual(messages[-1]["role"], "user")
         self.assertNotEqual(messages[-1]["content"], target)
+
+        split_chosen = "\n\nHuman: Explain the format.\n\nAssistant: First part.\n\nAssistant: Second part."
+        split_messages, split_target = _parse_hh_messages(
+            split_chosen,
+            system_prompt="You are a helpful assistant.",
+        )
+        self.assertEqual(split_messages[-1]["role"], "user")
+        self.assertIn("First part.", split_target)
+        self.assertIn("Second part.", split_target)
 
         def fake_load_dataset(source, subset, *args, **kwargs):
             if subset == "harmless-base":
