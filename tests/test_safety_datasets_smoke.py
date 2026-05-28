@@ -592,6 +592,28 @@ class StandaloneSafetyDatasetTests(unittest.TestCase):
                 "response_refusal_label": "refusal",
             },
             {
+                "id": "benign_prompt_only_before_clean",
+                "prompt": "How do I convert CSV to JSON?",
+                "response": "",
+                "prompt_harm_label": "unharmful",
+            },
+            {
+                "id": "benign_refusal_before_clean",
+                "prompt": "How do I convert CSV to JSON?",
+                "response": "I cannot help with that.",
+                "prompt_harm_label": "unharmful",
+                "response_harm_label": "unharmful",
+                "response_refusal_label": "refusal",
+            },
+            {
+                "id": "benign_clean_after_invalid_dupes",
+                "prompt": "How do I convert CSV to JSON?",
+                "response": "Use Python's csv module to read rows and json.dump to write them.",
+                "prompt_harm_label": "unharmful",
+                "response_harm_label": "unharmful",
+                "response_refusal_label": "compliance",
+            },
+            {
                 "id": "benign_clean",
                 "prompt": "How do I list Linux processes?",
                 "response": "Use ps aux or top.",
@@ -631,9 +653,24 @@ class StandaloneSafetyDatasetTests(unittest.TestCase):
                     eval_output_path=None,
                 )
         ids = {r["id"] for r in records}
-        self.assertEqual(ids, {"harm_safe", "harm_unsafe", "benign_clean", "benign_missing_refusal"})
+        self.assertEqual(
+            ids,
+            {
+                "harm_safe",
+                "harm_unsafe",
+                "benign_clean_after_invalid_dupes",
+                "benign_clean",
+                "benign_missing_refusal",
+            },
+        )
         unsafe = next(r for r in records if r["id"] == "harm_unsafe")
         self.assertIn(unsafe["target_response"], DEFAULT_SAFETY_REFUSAL_TEMPLATES)
+        self.assertEqual(
+            next(r for r in records if r["id"] == "benign_clean_after_invalid_dupes")[
+                "target_response"
+            ],
+            "Use Python's csv module to read rows and json.dump to write them.",
+        )
         self.assertEqual(next(r for r in records if r["id"] == "benign_clean")["label"], "harmless")
         imputed = next(r for r in records if r["id"] == "benign_missing_refusal")
         self.assertEqual(imputed["metadata"]["response_refusal_label_imputed"], "non_refusal_by_text")

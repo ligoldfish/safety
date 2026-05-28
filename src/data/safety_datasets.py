@@ -1179,10 +1179,6 @@ def _build_wildguardmix_pool(
                 drop_counts.get("unknown_prompt_harm_label", 0) + 1
             )
             continue
-        if prompt in seen:
-            drop_counts["duplicate_prompt"] = drop_counts.get("duplicate_prompt", 0) + 1
-            continue
-        seen.add(prompt)
         response = str(row.get("response", "") or row.get("completion", "") or "").strip()
         response_harm = _normalize_raw_label(row.get("response_harm_label"))
         response_refusal = _normalize_raw_label(row.get("response_refusal_label"))
@@ -1228,6 +1224,10 @@ def _build_wildguardmix_pool(
             else:
                 target = pick_refusal_template(prompt, seed=seed)
                 metadata["target_source"] = "template_pool"
+        if prompt in seen:
+            drop_counts["duplicate_prompt"] = drop_counts.get("duplicate_prompt", 0) + 1
+            continue
+        seen.add(prompt)
         records.append(
             _build_binary_record(
                 record_id=str(row.get("id") or f"wildguardmix_{config_name}_{index:08d}"),
