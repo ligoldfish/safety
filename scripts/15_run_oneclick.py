@@ -421,7 +421,50 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional PhaseF YAML override. Use this for ablations that reuse the "
             "same Phase1 artifacts but write PhaseF training/eval outputs to a "
-            "different output.output_root."
+            "different output.output_root. For safety baselines, this overrides "
+            "the per-baseline PhaseF base yaml before _make_safety_full_overrides "
+            "injects safety-specific paths."
+        ),
+    )
+    full_parser.add_argument(
+        "--phase1-config",
+        default="",
+        help=(
+            "Optional Phase1 YAML override. Used for parallel sweep cells to "
+            "isolate Phase1 outputs into per-cell directories without racing on "
+            "the shared base yaml. For safety baselines, overrides the Phase1 "
+            "base before _make_safety_full_overrides redirects processed_dir."
+        ),
+    )
+    full_parser.add_argument(
+        "--phase1-analyze-extra",
+        default="[]",
+        help=(
+            "JSON list of extra CLI tokens forwarded to 02_analyze_teacher_layers.py, "
+            'e.g. --phase1-analyze-extra=\'["--top-k","5"]\'. Use to ablate top-K '
+            "key layers without modifying the script default. JSON form chosen so "
+            'argparse does not mis-parse "--"-prefixed values as new flags.'
+        ),
+    )
+    full_parser.add_argument(
+        "--phase1-subspace-extra",
+        default="[]",
+        help=(
+            "JSON list of extra CLI tokens forwarded to 03_build_teacher_safe_subspace.py, "
+            'e.g. --phase1-subspace-extra=\'["--rank","8"]\' or '
+            '--phase1-subspace-extra=\'["--no-balance-labels"]\'. JSON list (see '
+            "--phase1-analyze-extra rationale)."
+        ),
+    )
+    full_parser.add_argument(
+        "--cell-id",
+        default="",
+        help=(
+            "Optional sweep cell identifier (e.g. 'B1'). When set on a safety "
+            "baseline run, appends '_<cell-id>' to outputs/safety_full_<baseline>_<device>/ "
+            "so concurrent sweep cells write to isolated dirs and do not clobber "
+            "each other's checkpoints / eval_suite. PAN flow gets isolation via "
+            "--phase1-config / --phasef-config output_root overrides instead."
         ),
     )
     add_common_flags(full_parser)
@@ -801,6 +844,8 @@ def _run_phase1_precompute(
     dry_run: bool,
     env_overrides: dict[str, str] | None = None,
     skip_prepare: bool = False,
+    analyze_extras: Sequence[str] | None = None,
+    subspace_extras: Sequence[str] | None = None,
 ) -> None:
     if not skip_prepare:
         _run_script("00_prepare_data.py", ["--config", str(phase1_config)], dry_run=dry_run, env_overrides=env_overrides)
@@ -830,6 +875,10 @@ def _run_phase1_precompute(
     analyze_args = ["--config", str(phase1_config)]
     subspace_args = ["--config", str(phase1_config)]
     semantic_args_suffix: list[str] = ["--config", str(phase1_config)]
+    if analyze_extras:
+        analyze_args.extend(str(tok) for tok in analyze_extras)
+    if subspace_extras:
+        subspace_args.extend(str(tok) for tok in subspace_extras)
     if smoke:
         analyze_args += [
             "--top-k",
@@ -976,6 +1025,8 @@ def _make_safety_full_overrides(
     safety_processed_dir: Path,
     safety_phase1_output_root: Path,
     safety_phasef_output_root: Path,
+    phasef_base_override: str = "",
+    phase1_base_override: str = "",
 ) -> tuple[Path, Path]:
     """Generate runtime override yamls for Phase 1 + PhaseF on safety data.
 
@@ -990,8 +1041,16 @@ def _make_safety_full_overrides(
       * output.output_root → safety_phasef_output_root
     """
 
-    base_phase1 = _resolve(FULL_PIPELINE_CONFIGS[device]["phase1"])
-    base_phasef = _resolve(FULL_PIPELINE_CONFIGS[device]["phasef"])
+    base_phase1 = (
+        _resolve(phase1_base_override)
+        if phase1_base_override
+        else _resolve(FULL_PIPELINE_CONFIGS[device]["phase1"])
+    )
+    base_phasef = (
+        _resolve(phasef_base_override)
+        if phasef_base_override
+        else _resolve(FULL_PIPELINE_CONFIGS[device]["phasef"])
+    )
 
     phase1_raw = yaml.safe_load(base_phase1.read_text(encoding="utf-8"))
     if not isinstance(phase1_raw, dict):
@@ -1065,6 +1124,11 @@ def _run_safety_full(
     skip_opencompass: bool,
     enable_opencompass: bool,
     opencompass_config: str = "",
+    phasef_config_path: str = "",
+    phase1_config_path: str = "",
+    analyze_extras: Sequence[str] | None = None,
+    subspace_extras: Sequence[str] | None = None,
+    cell_id: str = "",
 ) -> None:
     _validate_device_request(num_devices)
     if smoke:
@@ -1129,10 +1193,13 @@ def _run_safety_full(
     )
 
     # 3) Generate Phase 1 + PhaseF override yamls pointing at the safety dir.
+    # Per-cell isolated output dirs when cell_id provided (parallel sweep mode);
+    # else fall back to per-baseline shared dir (sequential default).
+    cell_suffix = f"_{cell_id}" if cell_id else ""
     safety_phase1_output_root = (
         PROJECT_ROOT
         / "outputs"
-        / f"safety_full_{baseline_name}_{device}"
+        / f"safety_full_{baseline_name}_{device}{cell_suffix}"
         / "phase1"
     ).resolve()
     # PhaseF output lives under phase1/training so that 10_sanity_eval and
@@ -1146,6 +1213,8 @@ def _run_safety_full(
         safety_processed_dir=safety_processed_dir,
         safety_phase1_output_root=safety_phase1_output_root,
         safety_phasef_output_root=safety_phasef_output_root,
+        phasef_base_override=phasef_config_path,
+        phase1_base_override=phase1_config_path,
     )
 
     # 4) Run Phase 1-E (skip 00 — safety splits are already on disk).
@@ -1155,6 +1224,8 @@ def _run_safety_full(
         dry_run=dry_run,
         env_overrides=env_overrides,
         skip_prepare=True,
+        analyze_extras=analyze_extras,
+        subspace_extras=subspace_extras,
     )
 
     # 5) PhaseF training.
@@ -2070,11 +2141,19 @@ def _run_full_pipeline(
     enable_opencompass: bool,
     opencompass_config: str = "",
     phasef_config_path: str = "",
+    phase1_config_path: str = "",
+    analyze_extras: Sequence[str] | None = None,
+    subspace_extras: Sequence[str] | None = None,
 ) -> None:
     _validate_device_request(num_devices)
     config_map = FULL_PIPELINE_CONFIGS
+    phase1_base = (
+        _resolve(phase1_config_path)
+        if phase1_config_path
+        else _resolve(config_map[device]["phase1"])
+    )
     phase1_config = _make_runtime_override_config(
-        _resolve(config_map[device]["phase1"]),
+        phase1_base,
         device=device,
         device_id=device_id,
     )
@@ -2093,7 +2172,14 @@ def _run_full_pipeline(
     phasef_cfg = load_phasef_config(phasef_config)
 
     env_overrides = _build_env_overrides(device, device_id)
-    _run_phase1_precompute(phase1_config, smoke=smoke, dry_run=dry_run, env_overrides=env_overrides)
+    _run_phase1_precompute(
+        phase1_config,
+        smoke=smoke,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+        analyze_extras=analyze_extras,
+        subspace_extras=subspace_extras,
+    )
 
     training_output_root = Path(phasef_cfg.output.output_root)
     phase1_output_root = Path(phase1_cfg.extraction.output_root)
@@ -2303,9 +2389,22 @@ def main() -> None:
             )
         return
     if args.command == "full":
+        try:
+            analyze_extras_raw = getattr(args, "phase1_analyze_extra", "[]") or "[]"
+            analyze_extras = json.loads(analyze_extras_raw) if isinstance(analyze_extras_raw, str) else list(analyze_extras_raw)
+            subspace_extras_raw = getattr(args, "phase1_subspace_extra", "[]") or "[]"
+            subspace_extras = json.loads(subspace_extras_raw) if isinstance(subspace_extras_raw, str) else list(subspace_extras_raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"--phase1-analyze-extra / --phase1-subspace-extra must be JSON lists; "
+                f"got analyze={args.phase1_analyze_extra!r} subspace={args.phase1_subspace_extra!r}"
+            ) from exc
+        if not isinstance(analyze_extras, list) or not all(isinstance(x, str) for x in analyze_extras):
+            raise ValueError("--phase1-analyze-extra must be a JSON list of strings")
+        if not isinstance(subspace_extras, list) or not all(isinstance(x, str) for x in subspace_extras):
+            raise ValueError("--phase1-subspace-extra must be a JSON list of strings")
+        phase1_config_path = getattr(args, "phase1_config", "") or ""
         if args.baseline != "pan":
-            if args.phasef_config:
-                raise ValueError("--phasef-config is only supported when --baseline pan.")
             _run_safety_full(
                 args.device,
                 baseline_name=args.baseline,
@@ -2314,6 +2413,11 @@ def main() -> None:
                 dry_run=args.dry_run,
                 force_rebuild=bool(args.force_rebuild),
                 smoke=False,
+                phasef_config_path=args.phasef_config,
+                phase1_config_path=phase1_config_path,
+                analyze_extras=analyze_extras,
+                subspace_extras=subspace_extras,
+                cell_id=getattr(args, "cell_id", "") or "",
                 **oc_kwargs,
             )
             return
@@ -2324,6 +2428,9 @@ def main() -> None:
             smoke=False,
             dry_run=args.dry_run,
             phasef_config_path=args.phasef_config,
+            phase1_config_path=phase1_config_path,
+            analyze_extras=analyze_extras,
+            subspace_extras=subspace_extras,
             **oc_kwargs,
         )
         return

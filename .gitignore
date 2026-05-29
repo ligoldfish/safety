@@ -12,3 +12,6 @@ configs/*_safety_*_ppu_*.yaml
 .DS_Store
 *.pdf
 sweep_results.csv
+configs/_sweep/
+outputs/sweep_runs/
+outputs/sweep/
