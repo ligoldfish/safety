@@ -2,9 +2,17 @@
 # Unified sweep dispatcher. Run from project root.
 #
 # Subcommands:
-#   axis <ID> [DEVICE=npu] [DEV_ID=0]              -- run all cells in axis (e.g. B, A, G, C, ...)
-#   cell <CELL_ID> <BASELINE> [DEVICE] [DEV_ID]    -- run single cell (B1+beavertails etc)
-#   combo <NAME> [DEVICE] [DEV_ID]                 -- run named combo (defined below)
+#   axis <ID> [DEVICE=npu] [DEV_ID=0]              -- sequential: all cells in axis on one card
+#   axis_fanout <ID> [N_CARDS=3] [START_ID=0]      -- parallel: one cell per card, queue refills
+#                                                    (e.g. axis B has 9 pairs, N=9 cards => all
+#                                                    9 run concurrently, finish ~3-6h)
+#   axis_parallel <ID> [N_CARDS=3] [START_ID=0]    -- per-cell baselines parallel, cells sequential
+#   axis_per_cell <ID> [N_CARDS=3] [START_ID=0]    -- one cell per card (all baselines sequential
+#                                                    within card); e.g. axis B 3 cells -> 3 cards
+#                                                    means card 0=B1, card 1=B2, card 2=B3
+#   cell <CELL_ID> <BASELINE> [DEVICE] [DEV_ID]    -- run single cell
+#   cell_loop <CELL_ID> [DEVICE] [DEV_ID]          -- run single cell on all baselines (one card)
+#   combo <NAME> [DEVICE] [DEV_ID]                 -- run named combo
 #   summary                                        -- print result CSV grouped by axis
 #   winners                                        -- auto-pick per-axis winner by mean F1
 #   status                                         -- pending vs completed counts
@@ -131,6 +139,203 @@ cmd_axis() {
   fi
 }
 
+cmd_cell_loop() {
+  # Run a single cell value across all its baselines sequentially on one card.
+  # Use this as the unit of work when fanning parameter VALUES (not pairs)
+  # across cards: e.g. card 0 runs B1 on pan+bt+stl, card 1 runs B2 on
+  # pan+bt+stl, etc.
+  local cell="${1:?cell ID required (e.g. B1)}"
+  local device="${2:-npu}"
+  local device_id="${3:-0}"
+  if [[ -z "${CELL_EXTRA[$cell]:-}" ]]; then
+    echo "[sweep] unknown cell: $cell" >&2
+    return 1
+  fi
+  IFS=',' read -r -a bls <<<"${CELL_BASELINES[$cell]}"
+  echo "[sweep] cell_loop cell=$cell baselines=(${bls[*]}) device=$device:$device_id"
+  for bl in "${bls[@]}"; do
+    run_one "$cell" "$bl" "$device" "$device_id" "${CELL_EXTRA[$cell]}"
+  done
+}
+
+cmd_axis_per_cell() {
+  # Each parameter VALUE (cell) in <axis> gets its own card. Baselines within
+  # a cell run sequentially on that card.
+  #
+  # Examples:
+  #   axis B has 3 cells (B1, B2, B3), each cell runs 3 baselines.
+  #   - 3 cards: B1->npu:0, B2->npu:1, B3->npu:2; each card sequential 3
+  #     baselines, ~9-18h per card, total wall-clock ~9-18h.
+  #   - 1 card:  queue: B1 then B2 then B3, ~27-54h.
+  #
+  # Requires parallel-safe (a) refactor.
+  local axis="${1:?axis prefix required}"
+  local num_cards="${2:-3}"
+  local start_device_id="${3:-0}"
+  local device="${DEVICE:-npu}"
+
+  local -a cells=()
+  for cid in $(echo "${!CELL_BASELINES[@]}" | tr ' ' '\n' | sort); do
+    if [[ "$cid" =~ ^${axis} ]]; then
+      cells+=( "$cid" )
+    fi
+  done
+
+  if [[ ${#cells[@]} -eq 0 ]]; then
+    echo "[sweep] no cells match axis prefix: $axis" >&2
+    return 1
+  fi
+
+  echo "[sweep] axis_per_cell axis=$axis num_cells=${#cells[@]} num_cards=$num_cards start=$start_device_id"
+
+  local -A pid_dev
+  local -a free_cards
+  local d
+  for (( d = 0; d < num_cards; d++ )); do
+    free_cards+=( "$(( start_device_id + d ))" )
+  done
+
+  for cid in "${cells[@]}"; do
+    while [[ ${#free_cards[@]} -eq 0 ]]; do
+      for pid in "${!pid_dev[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          wait "$pid" || echo "[sweep][WARN] child pid=$pid failed"
+          free_cards+=( "${pid_dev[$pid]}" )
+          unset 'pid_dev[$pid]'
+        fi
+      done
+      [[ ${#free_cards[@]} -eq 0 ]] && sleep 5
+    done
+    local dev_id="${free_cards[0]}"
+    free_cards=("${free_cards[@]:1}")
+    echo "[sweep] dispatch cell=$cid -> device=$device:$dev_id (all baselines sequential)"
+    cmd_cell_loop "$cid" "$device" "$dev_id" &
+    local pid=$!
+    pid_dev[$pid]="$dev_id"
+  done
+
+  for pid in "${!pid_dev[@]}"; do
+    wait "$pid" || echo "[sweep][WARN] child pid=$pid failed"
+  done
+  echo "[sweep] axis_per_cell axis=$axis done"
+}
+
+cmd_axis_fanout() {
+  # Fan out ALL (cell, baseline) pairs in <axis> across <num_cards> NPUs,
+  # one cell per card at a time. Each card pulls the next pair from queue
+  # when it finishes its current pair (no waiting for full batch).
+  #
+  # Examples:
+  #   axis B has 3 cells x 3 baselines = 9 pairs
+  #   - 9 cards: all 9 pairs run simultaneously, finish ~3-6h
+  #   - 3 cards: 3 batches of 3, finish ~9-18h
+  #   - 1 card:  sequential (= cmd_axis behavior)
+  #
+  # Requires parallel-safe (a) refactor (yaml copy isolation, per-cell
+  # output dirs). Each pair gets unique cell_id, zero race.
+  local axis="${1:?axis prefix required}"
+  local num_cards="${2:-3}"
+  local start_device_id="${3:-0}"
+  local device="${DEVICE:-npu}"
+
+  # Collect all (cell_id, baseline) pairs matching axis prefix.
+  local -a pairs=()
+  for cid in $(echo "${!CELL_BASELINES[@]}" | tr ' ' '\n' | sort); do
+    if [[ "$cid" =~ ^${axis} ]]; then
+      IFS=',' read -r -a bls <<<"${CELL_BASELINES[$cid]}"
+      for bl in "${bls[@]}"; do
+        pairs+=("$cid|$bl")
+      done
+    fi
+  done
+
+  if [[ ${#pairs[@]} -eq 0 ]]; then
+    echo "[sweep] no cells match axis prefix: $axis" >&2
+    return 1
+  fi
+
+  echo "[sweep] axis=$axis num_pairs=${#pairs[@]} num_cards=$num_cards start_device_id=$start_device_id"
+
+  # Track running pids and their dev_ids.
+  local -A pid_dev
+  local -a free_cards
+  local d
+  for (( d = 0; d < num_cards; d++ )); do
+    free_cards+=( "$(( start_device_id + d ))" )
+  done
+
+  for pair in "${pairs[@]}"; do
+    # Wait until at least one card is free.
+    while [[ ${#free_cards[@]} -eq 0 ]]; do
+      # Reap one finished child.
+      for pid in "${!pid_dev[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          wait "$pid" || echo "[sweep][WARN] child pid=$pid failed"
+          free_cards+=( "${pid_dev[$pid]}" )
+          unset 'pid_dev[$pid]'
+        fi
+      done
+      [[ ${#free_cards[@]} -eq 0 ]] && sleep 5
+    done
+
+    local cid="${pair%%|*}"
+    local bl="${pair#*|}"
+    local dev_id="${free_cards[0]}"
+    free_cards=("${free_cards[@]:1}")
+
+    echo "[sweep] dispatch cell=$cid baseline=$bl -> device=$device:$dev_id"
+    run_one "$cid" "$bl" "$device" "$dev_id" "${CELL_EXTRA[$cid]}" &
+    local pid=$!
+    pid_dev[$pid]="$dev_id"
+  done
+
+  # Wait for remaining children.
+  for pid in "${!pid_dev[@]}"; do
+    wait "$pid" || echo "[sweep][WARN] child pid=$pid failed"
+  done
+  echo "[sweep] axis=$axis fanout done"
+}
+
+cmd_axis_parallel() {
+  # Run all cells in <axis> sequentially, but within each cell fan out
+  # baselines across <num_cards> NPUs starting at <start_device_id>.
+  # Requires the parallel-safe (a) refactor: yaml copy isolation + per-cell
+  # output dirs (each child run_param_sweep.py uses a unique cell_id, so no
+  # yaml or output dir collisions).
+  local axis="${1:?axis prefix required}"
+  local num_cards="${2:-3}"
+  local start_device_id="${3:-0}"
+  local device="${DEVICE:-npu}"
+  local found=0
+  for cid in $(echo "${!CELL_BASELINES[@]}" | tr ' ' '\n' | sort); do
+    if [[ "$cid" =~ ^${axis} ]]; then
+      found=1
+      IFS=',' read -r -a bls <<<"${CELL_BASELINES[$cid]}"
+      echo ""
+      echo "[sweep] cell=$cid baselines=(${bls[*]}) fanout=${num_cards} cards start=$start_device_id"
+      local pids=()
+      local i=0
+      for bl in "${bls[@]}"; do
+        local dev_id=$(( (i + start_device_id) % num_cards + start_device_id ))
+        # dev_id wraps within [start_device_id, start_device_id + num_cards)
+        dev_id=$(( start_device_id + (i % num_cards) ))
+        run_one "$cid" "$bl" "$device" "$dev_id" "${CELL_EXTRA[$cid]}" &
+        pids+=($!)
+        i=$((i+1))
+      done
+      local rc=0
+      for pid in "${pids[@]}"; do
+        wait "$pid" || { echo "[sweep][WARN] child pid=$pid failed"; rc=1; }
+      done
+      echo "[sweep] cell=$cid done (rc summary=$rc)"
+    fi
+  done
+  if [[ $found -eq 0 ]]; then
+    echo "[sweep] no cells match axis prefix: $axis" >&2
+    return 1
+  fi
+}
+
 cmd_cell() {
   local cell="${1:?cell ID required (e.g. B1, A2)}"
   local baseline="${2:?baseline required (pan/beavertails/safety_tuned_llamas)}"
@@ -213,13 +418,17 @@ SUB="${1:-help}"
 shift || true
 
 case "$SUB" in
-  axis)     cmd_axis "$@" ;;
-  cell)     cmd_cell "$@" ;;
-  combo)    cmd_combo "$@" ;;
-  summary)  cmd_summary ;;
-  winners)  cmd_winners ;;
-  status)   cmd_status ;;
-  list)     cmd_list ;;
+  axis)           cmd_axis "$@" ;;
+  axis_fanout)    cmd_axis_fanout "$@" ;;
+  axis_parallel)  cmd_axis_parallel "$@" ;;
+  axis_per_cell)  cmd_axis_per_cell "$@" ;;
+  cell)           cmd_cell "$@" ;;
+  cell_loop)      cmd_cell_loop "$@" ;;
+  combo)          cmd_combo "$@" ;;
+  summary)        cmd_summary ;;
+  winners)        cmd_winners ;;
+  status)         cmd_status ;;
+  list)           cmd_list ;;
   help|*)
     head -n 25 "$0" | grep -E "^#( |$)" | sed 's/^# \?//'
     echo ""

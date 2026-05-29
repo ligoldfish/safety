@@ -15,3 +15,6 @@ sweep_results.csv
 configs/_sweep/
 outputs/sweep_runs/
 outputs/sweep/
+configs/_sweep/
+outputs/sweep_runs/
+outputs/sweep/
