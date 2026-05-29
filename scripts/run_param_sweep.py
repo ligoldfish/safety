@@ -51,6 +51,27 @@ def set_dotted(data: dict, dotted: str, value: Any) -> None:
     node[keys[-1]] = value
 
 
+def _absolutize_yaml_paths(data: Any, anchor: Path) -> None:
+    """Walk yaml dict in place and convert any "../" or "./" leading-string
+    values to absolute paths anchored at <anchor>. yaml relative paths are
+    resolved relative to the yaml FILE LOCATION, so when we move the yaml
+    to a sweep subdir, every relative path silently breaks. Absolutizing
+    against the ORIGINAL yaml's parent fixes that.
+    """
+    if isinstance(data, dict):
+        for k, v in list(data.items()):
+            if isinstance(v, str) and (v.startswith("../") or v.startswith("./")):
+                data[k] = str((anchor / v).resolve())
+            else:
+                _absolutize_yaml_paths(v, anchor)
+    elif isinstance(data, list):
+        for i, v in enumerate(data):
+            if isinstance(v, str) and (v.startswith("../") or v.startswith("./")):
+                data[i] = str((anchor / v).resolve())
+            else:
+                _absolutize_yaml_paths(v, anchor)
+
+
 def stage_isolated_yamls(
     cell_id: str,
     device: str,
@@ -64,6 +85,11 @@ def stage_isolated_yamls(
     Returns (phasef_copy_path, phase1_copy_path, cell_dir). Caller passes the
     two paths to the launcher via --phasef-config / --phase1-config so two
     concurrent sweep cells do not race on the shared base yaml.
+
+    All relative paths inside the base yamls (../external/..., ../models/...,
+    ../data/..., ../outputs/...) are absolutized against the ORIGINAL yaml's
+    parent dir before being written to the copy, so the copy at a different
+    location still resolves paths correctly.
     """
     uuid_str = uuid.uuid4().hex[:8]
     cell_dir = SWEEP_CONFIG_DIR / f"{cell_id}_{uuid_str}"
@@ -71,11 +97,18 @@ def stage_isolated_yamls(
 
     phasef_src = DEVICE_YAML[(device, "phasef")]
     phase1_src = DEVICE_YAML[(device, "phase1")]
+    phasef_anchor = phasef_src.parent.resolve()
+    phase1_anchor = phase1_src.parent.resolve()
     phasef_copy = cell_dir / "phaseF.yaml"
     phase1_copy = cell_dir / "phase1.yaml"
 
     phasef_data = yaml.safe_load(phasef_src.read_text(encoding="utf-8"))
     phase1_data = yaml.safe_load(phase1_src.read_text(encoding="utf-8"))
+
+    # Absolutize BEFORE applying user patches so user-supplied absolute paths
+    # (e.g. output_root override) are not double-resolved.
+    _absolutize_yaml_paths(phasef_data, phasef_anchor)
+    _absolutize_yaml_paths(phase1_data, phase1_anchor)
 
     for dotted, value in (phasef_updates or {}).items():
         set_dotted(phasef_data, dotted, value)
@@ -184,6 +217,17 @@ def find_summary(baseline: str, device: str, cell_id: str = "") -> Optional[Path
     return None
 
 
+def _scale_to_percent(value: Optional[float]) -> Optional[float]:
+    """summary.json may store HR/OR as fraction [0,1] OR percentage [0,100].
+    Heuristic: if value <= 1.0, treat as fraction and convert to percentage.
+    Edge case: a true 0.5% rate stored as percentage would be mis-doubled,
+    but safety eval HR/OR rarely fall below 1%, so this is acceptable.
+    """
+    if value is None:
+        return None
+    return value * 100.0 if value <= 1.0 else value
+
+
 def parse_hr_or(summary_path: Optional[Path]) -> tuple[Optional[float], Optional[float]]:
     if not summary_path or not summary_path.exists():
         return None, None
@@ -214,7 +258,9 @@ def parse_hr_or(summary_path: Optional[Path]) -> tuple[Optional[float], Optional
         return None
 
     hit = walk(data)
-    return hit if hit else (None, None)
+    if hit is None:
+        return None, None
+    return _scale_to_percent(hit[0]), _scale_to_percent(hit[1])
 
 
 def safety_f1(hr: Optional[float], or_: Optional[float]) -> Optional[float]:
