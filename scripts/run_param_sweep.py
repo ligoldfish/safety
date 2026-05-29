@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -103,6 +104,44 @@ def patch_launcher_phase1_args(
 def restore(path: Path, original_text: Optional[str]) -> None:
     if original_text is not None:
         path.write_text(original_text, encoding="utf-8")
+
+
+def archive_cell_outputs(
+    axis: str,
+    baseline: str,
+    device: str,
+    summary_path: Optional[Path],
+) -> Optional[Path]:
+    """Copy per-cell eval artifacts to outputs/sweep/<axis>_<baseline>/.
+
+    Preserves eval_suite/ (small, ~MB), manifest.json, and training.log per
+    ablation cell, so reruns of a different cell on the same baseline do not
+    overwrite prior results. Checkpoints are NOT copied (GB-sized; cell rerun
+    cost ~3-6h is acceptable if checkpoint inspection is needed later).
+    """
+    if not summary_path or not summary_path.exists():
+        return None
+    eval_suite_root = summary_path.parents[1]  # .../eval_suite/
+    training_root = eval_suite_root.parent  # .../training/
+
+    archive_dir = PROJECT_ROOT / "outputs" / "sweep" / f"{axis}_{baseline}_{device}"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    target_eval_suite = archive_dir / "eval_suite"
+    if target_eval_suite.exists():
+        shutil.rmtree(target_eval_suite)
+    shutil.copytree(eval_suite_root, target_eval_suite)
+
+    for fname in ("manifest.json",):
+        src = training_root / fname
+        if src.exists():
+            shutil.copy2(src, archive_dir / fname)
+
+    training_log = training_root / "logs" / "training.log"
+    if training_log.exists():
+        shutil.copy2(training_log, archive_dir / "training.log")
+
+    return archive_dir
 
 
 def find_summary(baseline: str, device: str) -> Optional[Path]:
@@ -272,6 +311,10 @@ def main() -> int:
     hr, or_ = parse_hr_or(summary_path)
     f1 = safety_f1(hr, or_)
 
+    # Archive eval_suite + manifest + training log to outputs/sweep/<axis>_<baseline>_<device>/
+    # so subsequent cells on the same baseline do not overwrite this cell's results.
+    archive_dir = archive_cell_outputs(args.axis, args.baseline, args.device, summary_path)
+
     row = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "axis": args.axis,
@@ -288,9 +331,12 @@ def main() -> int:
         "OR": or_,
         "F1": f1,
         "summary_path": str(summary_path) if summary_path else "",
+        "archive_dir": str(archive_dir) if archive_dir else "",
     }
     append_csv_row(row)
     print(f"[sweep] done axis={args.axis} baseline={args.baseline} HR={hr} OR={or_} F1={f1}")
+    if archive_dir:
+        print(f"[sweep] archived to {archive_dir}")
     return exit_code
 
 

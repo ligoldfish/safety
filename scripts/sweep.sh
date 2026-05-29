@@ -31,9 +31,9 @@ CSV="$PROJECT_ROOT/sweep_results.csv"
 # ---------------------------------------------------------------------------
 # Cell registry  (ID, BASELINES, EXTRA_ARGS for run_param_sweep.py)
 # ---------------------------------------------------------------------------
-ALL_BASELINES="pan,beavertails,safety_tuned_llamas"
-BT_STL="beavertails,safety_tuned_llamas"
-BT_ONLY="beavertails"
+ALL_BASELINES="pan,beavertails_category,safety_tuned_llamas"
+BT_STL="beavertails_category,safety_tuned_llamas"
+BT_ONLY="beavertails_category"
 
 declare -A CELL_BASELINES
 declare -A CELL_EXTRA
