@@ -165,10 +165,15 @@ class NosftBaselineRoutingTests(unittest.TestCase):
         self.assertTrue(any("hh_rlhf_npu.yaml" in j for j in joined_per_call))
         self.assertTrue(any("beavertails_category_npu.yaml" in j for j in joined_per_call))
 
-    def test_9b_with_baseline_other_than_pan_raises(self) -> None:
-        with self.assertRaises(ValueError) as ctx:
-            self._run(model_size="9b", baseline_name="beavertails")
-        self.assertIn("0.8b", str(ctx.exception).lower())
+    def test_9b_with_safety_baseline_uses_9b_yaml(self) -> None:
+        # 9B nosft on safety baselines is now supported via
+        # configs/baseline_eval_qwen35_9b_<baseline>_<device>.yaml (added by
+        # scripts/gen_9b_baseline_eval_yamls.py + SAFETY_EVAL_CONFIGS registry).
+        calls = self._run(model_size="9b", baseline_name="beavertails")
+        self.assertEqual(len(calls), 1)
+        _, args = calls[0]
+        joined = " ".join(args)
+        self.assertIn("baseline_eval_qwen35_9b_beavertails_npu.yaml", joined)
 
     def test_9b_pan_still_works(self) -> None:
         # Backwards-compat: nosft --model 9b --baseline pan

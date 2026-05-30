@@ -1389,6 +1389,91 @@ def _load_hh_rlhf_rows(
     )
 
 
+# ---------------------------------------------------------------------------
+# HH-RLHF academic-grade processing
+# ---------------------------------------------------------------------------
+#
+# Anthropic's README explicitly states HH-RLHF should NOT be used directly for
+# SFT: "We do not recommend using this data for supervised fine-tuning of
+# dialogue agents. It is meant for reward model training + PPO."
+#
+# The earlier builder ignored this and used `harmless-base.chosen` as the SFT
+# target_response for harmful prompts. Anthropic's chosen field is only "the
+# less-harmful of two model outputs" — frequently still partially compliant
+# with the red-team query. SFT on these targets erased the Qwen base refusal
+# behavior and dropped HR from 45.7% (nosft) to 6.5% (sft) / 11.5% (ours).
+#
+# Academic-rigorous fix follows Tülu 2 / Llama Guard 2 / Zephyr conventions:
+#
+#   Train harmful side : `red-team-attempts` subset filtered by
+#                        `rating <= 2` (attack failed = model successfully
+#                        refused) AND `min_harmlessness_score_transcript >= -1.0`
+#                        AND target token length >= 20. The assistant turn from
+#                        the filtered transcript IS the real refusal text, so
+#                        no synthetic refusal pool is needed.
+#   Train harmless side: `helpful-base.train` chosen field, filtered to drop
+#                        short responses (< 20 tokens) and stripped of any
+#                        leaked refusal phrases (avoids contaminating harmless
+#                        targets with refusal patterns).
+#   Train balance      : harmless side downsampled to match harmful count.
+#   Test               : Anthropic official `harmless-base.test` (label=harmful,
+#                        red-team prompts) + `helpful-base.test` (label=harmless,
+#                        benign prompts). Prompt-only, no target needed.
+#
+# This drops the synthetic 8-template refusal pool entirely (target_source ==
+# "anthropic_red_team_transcript" or "hh_chosen", never "template_pool") and
+# aligns with the prompt-intent label convention used elsewhere in this repo.
+
+HH_HARMFUL_RATING_MAX = 2
+HH_HARMFUL_MIN_HARMLESSNESS_SCORE = -1.0
+HH_MIN_TARGET_TOKENS = 20
+HH_DEFAULT_HELPFUL_MAX_LEN_RATIO = 4.0  # drop helpful targets > 4x harmful mean
+
+# Detect refusal phrases leaking into harmless targets. Conservative pattern;
+# anchored to start of response.
+HH_REFUSAL_LEAK_RE = re.compile(
+    r"^\s*(i\s+(?:can(?:'|’)?t|cannot|won(?:'|’)?t|am not able|don(?:'|’)?t think i (?:can|should)|"
+    r"refuse|must decline|will not)|sorry,?\s+(?:but\s+)?i)\b",
+    re.IGNORECASE,
+)
+
+
+def _approx_token_len(text: str) -> int:
+    """Lightweight tokenization proxy: whitespace + simple punctuation split."""
+    return len(re.findall(r"\S+", text or ""))
+
+
+def _extract_first_pair(
+    messages: List[Dict[str, str]],
+) -> Tuple[List[Dict[str, str]], str]:
+    """Trim multi-turn HH transcript to first (system) + first (user) + first
+    (assistant) turn. Multi-turn dialogues add context the SFT prompt format
+    cannot reproduce at eval time, so single-turn is the Tülu 2 / Llama Guard
+    convention.
+    """
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    first_user_idx = next(
+        (i for i, m in enumerate(messages) if m.get("role") == "user"),
+        -1,
+    )
+    if first_user_idx < 0:
+        return [], ""
+    first_user = messages[first_user_idx]
+    first_assistant_idx = next(
+        (
+            i
+            for i in range(first_user_idx + 1, len(messages))
+            if messages[i].get("role") == "assistant"
+        ),
+        -1,
+    )
+    if first_assistant_idx < 0:
+        return [], ""
+    target = str(messages[first_assistant_idx].get("content", "")).strip()
+    prompt = (system_msgs[:1] if system_msgs else []) + [first_user]
+    return prompt, target
+
+
 def _build_hh_rlhf_pool(
     rows: Iterable[Dict[str, Any]],
     *,
@@ -1399,6 +1484,13 @@ def _build_hh_rlhf_pool(
     system_prompt: str,
     drops: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
+    """Build preference-subset pool (helpful-base / harmless-base).
+
+    Used for the harmless side (helpful-base) and for eval prompts. Applies
+    quality filters: length >= HH_MIN_TARGET_TOKENS, no refusal-phrase leakage
+    in the chosen response.
+    """
+
     records: List[Dict[str, Any]] = []
     drop_counts = drops if drops is not None else {}
     for index, row in enumerate(rows):
@@ -1406,14 +1498,31 @@ def _build_hh_rlhf_pool(
         if not chosen:
             drop_counts["missing_chosen"] = drop_counts.get("missing_chosen", 0) + 1
             continue
-        messages, target_response = _parse_hh_messages(chosen, system_prompt=system_prompt)
-        if not messages or not target_response:
+        messages_no_final, final_assistant = _parse_hh_messages(
+            chosen, system_prompt=system_prompt
+        )
+        if not messages_no_final or not final_assistant:
             drop_counts["parse_failure"] = drop_counts.get("parse_failure", 0) + 1
+            continue
+        # Re-attach the stripped final assistant turn so _extract_first_pair
+        # can pick first user + first assistant from the full conversation.
+        messages_all = list(messages_no_final) + [
+            {"role": "assistant", "content": final_assistant}
+        ]
+        prompt_messages, target_response = _extract_first_pair(messages_all)
+        if not prompt_messages or not target_response:
+            drop_counts["parse_failure"] = drop_counts.get("parse_failure", 0) + 1
+            continue
+        if _approx_token_len(target_response) < HH_MIN_TARGET_TOKENS:
+            drop_counts["target_too_short"] = drop_counts.get("target_too_short", 0) + 1
+            continue
+        if label == "harmless" and HH_REFUSAL_LEAK_RE.match(target_response):
+            drop_counts["harmless_refusal_leak"] = drop_counts.get("harmless_refusal_leak", 0) + 1
             continue
         records.append(
             {
                 "id": str(row.get("id") or f"hh_rlhf_{subset_name}_{split}_{index:08d}"),
-                "messages": messages,
+                "messages": prompt_messages,
                 "target_response": target_response,
                 "label": label,
                 "raw_label": subset_name,
@@ -1422,8 +1531,99 @@ def _build_hh_rlhf_pool(
                 "metadata": {
                     "subset": subset_name,
                     "split": split,
-                    "target_source": "chosen",
+                    "target_source": "hh_chosen",
                     "rejected_discarded": "rejected" in row,
+                    "target_token_count": _approx_token_len(target_response),
+                },
+            }
+        )
+    return records
+
+
+def _build_hh_rlhf_red_team_pool(
+    rows: Iterable[Dict[str, Any]],
+    *,
+    source_name: str,
+    split: str,
+    system_prompt: str,
+    drops: Optional[Dict[str, int]] = None,
+    rating_max: int = HH_HARMFUL_RATING_MAX,
+    score_min: float = HH_HARMFUL_MIN_HARMLESSNESS_SCORE,
+) -> List[Dict[str, Any]]:
+    """Build harmful-side records from `red-team-attempts` subset.
+
+    Filters:
+      - `rating` <= rating_max (attack-failure = model successfully refused)
+      - `min_harmlessness_score_transcript` >= score_min (transcript-level
+        harmlessness sanity)
+      - target token length >= HH_MIN_TARGET_TOKENS
+      - parseable transcript with a user + assistant turn
+
+    The assistant turn from the filtered transcript is the real model refusal
+    text, used directly as target_response (no synthetic pool template).
+    """
+
+    records: List[Dict[str, Any]] = []
+    drop_counts = drops if drops is not None else {}
+    for index, row in enumerate(rows):
+        rating_raw = row.get("rating")
+        try:
+            rating = int(rating_raw) if rating_raw is not None else None
+        except (TypeError, ValueError):
+            rating = None
+        if rating is None:
+            drop_counts["red_team_missing_rating"] = drop_counts.get("red_team_missing_rating", 0) + 1
+            continue
+        if rating > rating_max:
+            drop_counts["red_team_rating_too_high"] = drop_counts.get("red_team_rating_too_high", 0) + 1
+            continue
+        score_raw = row.get("min_harmlessness_score_transcript")
+        try:
+            score = float(score_raw) if score_raw is not None else None
+        except (TypeError, ValueError):
+            score = None
+        if score is None or score < score_min:
+            drop_counts["red_team_score_too_low"] = drop_counts.get("red_team_score_too_low", 0) + 1
+            continue
+        transcript = str(row.get("transcript", "") or "").strip()
+        if not transcript:
+            drop_counts["red_team_missing_transcript"] = drop_counts.get("red_team_missing_transcript", 0) + 1
+            continue
+        messages_no_final, final_assistant = _parse_hh_messages(
+            transcript, system_prompt=system_prompt
+        )
+        if not messages_no_final or not final_assistant:
+            drop_counts["parse_failure"] = drop_counts.get("parse_failure", 0) + 1
+            continue
+        messages_all = list(messages_no_final) + [
+            {"role": "assistant", "content": final_assistant}
+        ]
+        prompt_messages, target_response = _extract_first_pair(messages_all)
+        if not prompt_messages or not target_response:
+            drop_counts["parse_failure"] = drop_counts.get("parse_failure", 0) + 1
+            continue
+        if _approx_token_len(target_response) < HH_MIN_TARGET_TOKENS:
+            drop_counts["target_too_short"] = drop_counts.get("target_too_short", 0) + 1
+            continue
+        records.append(
+            {
+                "id": str(row.get("id") or f"hh_rlhf_red_team_attempts_{split}_{index:08d}"),
+                "messages": prompt_messages,
+                "target_response": target_response,
+                "label": "harmful",
+                "raw_label": "red-team-attempts",
+                "source": f"{source_name}:red-team-attempts:{split}",
+                "dataset": "hh_rlhf",
+                "metadata": {
+                    "subset": "red-team-attempts",
+                    "split": split,
+                    "target_source": "anthropic_red_team_transcript",
+                    "rating": rating,
+                    "min_harmlessness_score_transcript": score,
+                    "tags": row.get("tags") or [],
+                    "task_description": row.get("task_description") or "",
+                    "model_type": row.get("model_type") or "",
+                    "target_token_count": _approx_token_len(target_response),
                 },
             }
         )
@@ -1445,68 +1645,166 @@ def build_hh_rlhf_records(
     max_eval_samples_per_label: int = 0,
     eval_output_path: str | Path | None = None,
     seed: int = 42,
+    rating_max: int = HH_HARMFUL_RATING_MAX,
+    score_min: float = HH_HARMFUL_MIN_HARMLESSNESS_SCORE,
 ) -> List[Dict[str, Any]]:
+    """Build HH-RLHF SFT corpus following academic-standard processing.
+
+    Train:
+        harmful side  : ``red-team-attempts.train`` filtered by
+                        ``rating <= rating_max`` AND
+                        ``min_harmlessness_score_transcript >= score_min`` AND
+                        target length >= HH_MIN_TARGET_TOKENS.
+                        Target is the real assistant refusal from the
+                        transcript (no synthetic pool).
+        harmless side : ``helpful-base.train`` chosen filtered by length and
+                        no-refusal-leak, downsampled to match the harmful side
+                        count for 50/50 balance.
+
+    Test (Anthropic official, not a self-split):
+        harmful side  : ``harmless-base.test`` prompts (red-team queries,
+                        label="harmful")
+        harmless side : ``helpful-base.test`` prompts (benign, label="harmless")
+        No target_response needed in the test JSONL (eval generates with the
+        student then scores).
+
+    Prompt-leak check across train (red-team-attempts) and test
+    (harmless-base/helpful-base) is performed and recorded.
+    """
     drops: Dict[str, int] = {}
-    subset_specs = (("harmless-base", "harmful"), ("helpful-base", "harmless"))
-    train_pool: List[Dict[str, Any]] = []
-    for subset_name, label in subset_specs:
-        train_pool.extend(
-            _build_hh_rlhf_pool(
-                _load_hh_rlhf_rows(
-                    source_name=source_name,
-                    subset_name=subset_name,
-                    split=split or "train",
-                    cache_dir=cache_dir,
-                ),
-                source_name=source_name,
-                subset_name=subset_name,
-                split=split or "train",
-                label=label,
-                system_prompt=system_prompt,
-                drops=drops,
-            )
-        )
-    records = _sample_balanced_by_label(
-        train_pool,
-        subset_mode=train_subset_mode,
-        max_samples=max_train_samples,
-        max_samples_per_label=max_train_samples_per_label,
-        seed=seed,
+    split_value = split or "train"
+
+    # --- Train: harmful side from red-team-attempts ---
+    harmful_pool = _build_hh_rlhf_red_team_pool(
+        _load_hh_rlhf_rows(
+            source_name=source_name,
+            subset_name="red-team-attempts",
+            split=split_value,
+            cache_dir=cache_dir,
+        ),
+        source_name=source_name,
+        split=split_value,
+        system_prompt=system_prompt,
+        drops=drops,
+        rating_max=rating_max,
+        score_min=score_min,
     )
+
+    # --- Train: harmless side from helpful-base.train ---
+    harmless_pool = _build_hh_rlhf_pool(
+        _load_hh_rlhf_rows(
+            source_name=source_name,
+            subset_name="helpful-base",
+            split=split_value,
+            cache_dir=cache_dir,
+        ),
+        source_name=source_name,
+        subset_name="helpful-base",
+        split=split_value,
+        label="harmless",
+        system_prompt=system_prompt,
+        drops=drops,
+    )
+
+    if not harmful_pool:
+        raise RuntimeError(
+            f"HH-RLHF red-team-attempts produced 0 harmful records after filters "
+            f"(rating_max={rating_max}, score_min={score_min}). Loosen filters or "
+            "investigate the upstream dataset."
+        )
+    if not harmless_pool:
+        raise RuntimeError(
+            "HH-RLHF helpful-base produced 0 harmless records after quality filters."
+        )
+
+    # --- Balance: downsample the larger pool to match the smaller (so the
+    #     train set is exactly 50/50). Default: harmless downsampled to harmful
+    #     count since red-team filter is the bottleneck.
+    target_per_label = min(len(harmful_pool), len(harmless_pool))
+    if max_train_samples_per_label and max_train_samples_per_label > 0:
+        target_per_label = min(target_per_label, int(max_train_samples_per_label))
+    if max_train_samples and max_train_samples > 0:
+        target_per_label = min(target_per_label, int(max_train_samples) // 2)
+
+    rng_h = random.Random(int(seed))
+    rng_l = random.Random(int(seed) + 1)
+    sampled_harmful = list(harmful_pool)
+    rng_h.shuffle(sampled_harmful)
+    sampled_harmful = sampled_harmful[:target_per_label]
+    sampled_harmless = list(harmless_pool)
+    rng_l.shuffle(sampled_harmless)
+    sampled_harmless = sampled_harmless[:target_per_label]
+    train_pool = sampled_harmful + sampled_harmless
+
+    # Final shuffle so the writer does not emit class-blocked rows.
+    rng_mix = random.Random(int(seed) + 2)
+    rng_mix.shuffle(train_pool)
+    records = train_pool
+
     _validate_binary_training_records(records)
     write_jsonl(output_path, records)
 
+    # --- Test: Anthropic official split (harmless-base.test + helpful-base.test) ---
     eval_records: List[Dict[str, Any]] = []
     test_source = ""
     test_fallback_reason = ""
     if eval_output_path:
         try:
-            eval_pool: List[Dict[str, Any]] = []
-            for subset_name, label in subset_specs:
-                eval_pool.extend(
-                    _build_hh_rlhf_pool(
-                        _load_hh_rlhf_rows(
-                            source_name=source_name,
-                            subset_name=subset_name,
-                            split="test",
-                            cache_dir=cache_dir,
-                        ),
-                        source_name=source_name,
-                        subset_name=subset_name,
-                        split="test",
-                        label=label,
-                        system_prompt=system_prompt,
-                        drops=drops,
-                    )
-                )
+            # Harmful test: harmless-base.test prompts (red-team queries) — keep
+            # them at prompt-only granularity (no target_response in eval JSONL).
+            harmful_test_pool = _build_hh_rlhf_pool(
+                _load_hh_rlhf_rows(
+                    source_name=source_name,
+                    subset_name="harmless-base",
+                    split="test",
+                    cache_dir=cache_dir,
+                ),
+                source_name=source_name,
+                subset_name="harmless-base",
+                split="test",
+                # Prompt is red-team, intent=harmful (label semantics)
+                label="harmful",
+                system_prompt=system_prompt,
+                drops=drops,
+            )
+            harmless_test_pool = _build_hh_rlhf_pool(
+                _load_hh_rlhf_rows(
+                    source_name=source_name,
+                    subset_name="helpful-base",
+                    split="test",
+                    cache_dir=cache_dir,
+                ),
+                source_name=source_name,
+                subset_name="helpful-base",
+                split="test",
+                label="harmless",
+                system_prompt=system_prompt,
+                drops=drops,
+            )
+            eval_pool = harmful_test_pool + harmless_test_pool
             if len({r["label"] for r in eval_pool}) < 2:
-                raise RuntimeError("HH-RLHF official test does not contain both labels")
-            test_source = f"{source_name}:harmless-base/helpful-base:test"
+                raise RuntimeError(
+                    "HH-RLHF official test split did not yield both labels after "
+                    "quality filters."
+                )
+            test_source = (
+                f"{source_name}:harmless-base.test+helpful-base.test (official)"
+            )
         except Exception as exc:
+            # Fallback: hold out a slice of train_pool if the official split is
+            # unreachable. Logged as `test_fallback_reason` so reviewers see it.
             test_fallback_reason = _format_fallback_reason(exc)
             selected_ids = {str(record.get("id", "")) for record in records}
-            eval_pool = [record for record in train_pool if str(record.get("id", "")) not in selected_ids]
-            test_source = f"{source_name}:harmless-base/helpful-base:{split or 'train'} holdout"
+            eval_pool = [
+                record
+                for record in (harmful_pool + harmless_pool)
+                if str(record.get("id", "")) not in selected_ids
+            ]
+            test_source = (
+                f"{source_name}:red-team-attempts/helpful-base:train holdout "
+                "(official test unavailable)"
+            )
+
         eval_selected = _sample_balanced_by_label(
             eval_pool,
             subset_mode=eval_subset_mode,
@@ -1514,14 +1812,39 @@ def build_hh_rlhf_records(
             max_samples_per_label=max_eval_samples_per_label,
             seed=seed + 101,
         )
-        eval_records = [_to_eval_record(record, id_prefix="hh_rlhf_test") for record in eval_selected]
+        eval_records = [
+            _to_eval_record(record, id_prefix="hh_rlhf_test")
+            for record in eval_selected
+        ]
+
+        # Cross-split prompt leakage check.
+        def _first_user_text(record: Dict[str, Any]) -> str:
+            for msg in record.get("messages") or []:
+                if str(msg.get("role", "")).lower() == "user":
+                    return str(msg.get("content", "")).strip()
+            return ""
+
+        train_prompt_set = {_first_user_text(r) for r in records}
+        test_prompt_set = {_first_user_text(r) for r in eval_records}
+        overlap = train_prompt_set & test_prompt_set - {""}
+        drops["train_test_prompt_overlap"] = len(overlap)
+        if overlap:
+            # Hard fail: any overlap voids the eval signal. The Anthropic
+            # subsets are disjoint by design (red-team-attempts vs harmless-base/
+            # helpful-base are different annotation batches), so any positive
+            # overlap indicates a builder bug worth surfacing immediately.
+            raise RuntimeError(
+                f"HH-RLHF train/test prompt overlap detected: {len(overlap)} "
+                "prompts shared. Builder bug."
+            )
+
         write_jsonl(eval_output_path, eval_records)
 
     _write_materialization_summary(
         output_path=output_path,
         dataset_name="hh_rlhf",
         train_records=records,
-        train_pool_count=len(train_pool),
+        train_pool_count=len(harmful_pool) + len(harmless_pool),
         eval_records=eval_records,
         eval_output_path=eval_output_path,
         train_subset_mode=bool(train_subset_mode) and int(max_train_samples) > 0,
