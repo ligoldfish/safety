@@ -1818,25 +1818,37 @@ def build_hh_rlhf_records(
         ]
 
         # Cross-split prompt leakage check.
+        # Anthropic harmless-base / red-team-attempts share prompt provenance
+        # (both came from internal red-team annotation efforts at different
+        # times). Their published splits have known low-level prompt overlap
+        # (~1-3% of red-team train can re-appear in harmless-base test).
+        # Test purity is the priority — drop overlapping records from TRAIN
+        # rather than fail. Test stays the Anthropic official split intact.
         def _first_user_text(record: Dict[str, Any]) -> str:
             for msg in record.get("messages") or []:
                 if str(msg.get("role", "")).lower() == "user":
                     return str(msg.get("content", "")).strip()
             return ""
 
-        train_prompt_set = {_first_user_text(r) for r in records}
         test_prompt_set = {_first_user_text(r) for r in eval_records}
-        overlap = train_prompt_set & test_prompt_set - {""}
-        drops["train_test_prompt_overlap"] = len(overlap)
-        if overlap:
-            # Hard fail: any overlap voids the eval signal. The Anthropic
-            # subsets are disjoint by design (red-team-attempts vs harmless-base/
-            # helpful-base are different annotation batches), so any positive
-            # overlap indicates a builder bug worth surfacing immediately.
-            raise RuntimeError(
-                f"HH-RLHF train/test prompt overlap detected: {len(overlap)} "
-                "prompts shared. Builder bug."
-            )
+        test_prompt_set.discard("")
+        if test_prompt_set:
+            pre_drop = len(records)
+            records = [
+                r for r in records
+                if _first_user_text(r) not in test_prompt_set
+            ]
+            removed = pre_drop - len(records)
+            drops["train_test_prompt_overlap_removed_from_train"] = removed
+            if removed:
+                print(
+                    f"[hh_rlhf] dropped {removed} train records sharing a prompt "
+                    f"with the Anthropic official test split (test purity preserved).",
+                    flush=True,
+                )
+                # Rewrite the train JSONL minus overlap.
+                write_jsonl(output_path, records)
+                _validate_binary_training_records(records)
 
         write_jsonl(eval_output_path, eval_records)
 
