@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import Counter
@@ -109,6 +110,63 @@ def _apply_per_label_limit(
         counts[label] += 1
         kept.append(record)
     return kept
+
+
+FINGERPRINT_FILENAME = ".extract_fingerprint.json"
+
+
+def _split_fingerprint(records: List[Dict[str, Any]], shard_size: int) -> Dict[str, Any]:
+    """Identity fingerprint of a split: ordered sample ids + count + shard size.
+
+    Used to detect when the prepared split was rebuilt (e.g. different ids after
+    a data refresh). The earlier skip logic only checked shard_path.exists(), so
+    a rebuilt split silently reused stale hidden-state shards, and the downstream
+    student-target join then dropped every record whose id had changed.
+    """
+    ids = [str(record["id"]) for record in records]
+    id_hash = hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()
+    return {"num_records": len(ids), "shard_size": int(shard_size), "id_hash": id_hash}
+
+
+def _fingerprint_path(shard_dir: Path) -> Path:
+    return shard_dir / FINGERPRINT_FILENAME
+
+
+def _write_fingerprint(shard_dir: Path, fingerprint: Dict[str, Any]) -> None:
+    _fingerprint_path(shard_dir).write_text(
+        json.dumps(fingerprint, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _shards_are_fresh(shard_dir: Path, fingerprint: Dict[str, Any]) -> bool:
+    """True only when a prior run recorded a fingerprint that matches the current
+    split exactly (same ids, same count, same shard size)."""
+    path = _fingerprint_path(shard_dir)
+    if not path.exists():
+        return False
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    return (
+        stored.get("id_hash") == fingerprint["id_hash"]
+        and stored.get("num_records") == fingerprint["num_records"]
+        and stored.get("shard_size") == fingerprint["shard_size"]
+    )
+
+
+def _clear_stale_shards(shard_dir: Path) -> int:
+    """Remove existing shard files and the fingerprint so a changed split is
+    rebuilt from scratch (also drops orphan shards when the split shrank).
+    Returns the number of shard files removed."""
+    removed = 0
+    for shard_path in sorted(shard_dir.glob("part_*.pt")):
+        shard_path.unlink()
+        removed += 1
+    fingerprint = _fingerprint_path(shard_dir)
+    if fingerprint.exists():
+        fingerprint.unlink()
+    return removed
 
 
 def _save_shard(
@@ -221,6 +279,24 @@ def main() -> None:
         / f"{args.model}_{args.split}"
     )
     storage_dtype = _storage_dtype(cfg.extraction.storage_dtype)
+
+    # Invalidate stale shards when the prepared split was rebuilt with different
+    # ids: skip_existing must not reuse hidden states that no longer match the
+    # current data (otherwise downstream id-keyed joins silently drop records).
+    fingerprint = _split_fingerprint(records, cfg.extraction.shard_size)
+    data_changed = not _shards_are_fresh(shard_dir, fingerprint)
+    if data_changed or args.overwrite:
+        removed = _clear_stale_shards(shard_dir)
+        log_kv(
+            logger,
+            "shards_invalidated",
+            reason="overwrite" if args.overwrite and not data_changed else "data_changed",
+            removed_shards=removed,
+            num_records=fingerprint["num_records"],
+            id_hash=fingerprint["id_hash"],
+        )
+    _write_fingerprint(shard_dir, fingerprint)
+
     for shard_idx, shard_records in enumerate(chunked(records, cfg.extraction.shard_size)):
         shard_path = shard_dir / f"part_{shard_idx:03d}.pt"
         if shard_path.exists() and cfg.extraction.skip_existing and not args.overwrite:
