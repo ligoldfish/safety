@@ -53,6 +53,7 @@ from src.data.safety_datasets import (
     DEFAULT_TULU3_SAFETY_SOURCES,
     build_beavertails_category_records,
     build_beavertails_records,
+    build_coconot_records,
     build_hh_rlhf_records,
     build_safety_tuned_llamas_records,
     build_wildguardmix_records,
@@ -76,6 +77,7 @@ SUPPORTED_BASELINES = (
     "wildguardmix",
     "hh_rlhf",
     "beavertails_category",
+    "coconot",
 )
 EVAL_DIR = PROJECT_ROOT / "data" / "processed" / "eval"
 
@@ -392,6 +394,14 @@ def _build_new_dataset_test(
                 max_train_samples_per_label=0,
                 **common,
             )
+        elif baseline == "coconot":
+            build_coconot_records(
+                output_path=tmp_jsonl,
+                train_subset_mode=True,
+                max_train_samples=20000,
+                max_train_samples_per_label=10000,
+                **common,
+            )
         else:  # pragma: no cover -- guarded by caller
             raise ValueError(f"Unsupported new dataset baseline: {baseline}")
     return out
@@ -433,6 +443,7 @@ def main() -> None:
             "wildguardmix",
             "hh_rlhf",
             "beavertails_category",
+            "coconot",
         }:
             written = _build_new_dataset_test(
                 baseline,

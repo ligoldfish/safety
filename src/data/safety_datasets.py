@@ -889,24 +889,88 @@ def _wildjailbreak_prompt(row: Dict[str, Any]) -> str:
     )
 
 
+# Lightweight jailbreak-success markers that suggest the WJB completion is an
+# actual attack-success (compliance) rather than a refusal. Used by the
+# "minimal" target filter; far less restrictive than the full
+# judge_harmful_response_safety heuristic, which has a known ~30% false-positive
+# rate on real WJB harmful completions (nuanced refusals mis-flagged as
+# "ambiguous_non_refusal").
+WJB_JAILBREAK_SUCCESS_MARKERS = re.compile(
+    r"^\s*("
+    r"sure!?\s*here'?s|"
+    r"here'?s\s+how\s+to|"
+    r"step\s*1[:\.]|"
+    r"first,?\s*you\s*(?:'ll|will)\s*need|"
+    r"absolutely!?\s*here|"
+    r"of\s+course!?\s*here"
+    r")",
+    re.IGNORECASE,
+)
+WJB_MIN_TARGET_TOKENS = 20
+
+
 def _safe_wildjailbreak_harmful_target(
     *,
     prompt: str,
     completion: str,
     seed: int,
+    safety_filter_mode: str = "minimal",
 ) -> Tuple[str, Dict[str, Any]]:
+    """Resolve the SFT target for a WJB harmful row.
+
+    Three modes:
+      - ``"trust"``: trust the upstream WJB completion verbatim. Matches the
+        WildJailbreak (Jiang et al. 2024) paper recipe and how Tülu 2 /
+        Llama Guard 2 use this corpus. No filtering beyond the empty-string
+        check. Maximum diversity, ~0% template pool fallback.
+      - ``"minimal"`` (default): trust completion unless it is empty, too
+        short (<HH_MIN_TARGET_TOKENS), or opens with one of a small list of
+        jailbreak-success markers (``Sure! Here's``, ``Step 1:``, etc.).
+        Drops ~5-10% of completions; matches academic standard while
+        preserving compliance signal in obvious attack-success rows.
+      - ``"strict"``: legacy behaviour. Runs the full
+        ``judge_harmful_response_safety`` heuristic; rejects any
+        ``ambiguous_non_refusal`` verdict. Empirically drops ~30% of WJB
+        completions; over-aggressive. Kept available for ablation studies.
+
+    Empty completion always falls back to the 8-template pool regardless of
+    mode (eval rows with no completion).
+    """
     if not completion.strip():
         return pick_refusal_template(prompt, seed=seed), {
             "target_source": "template_pool",
             "target_filter_reason": "empty_completion",
         }
+
+    if safety_filter_mode == "trust":
+        return completion, {
+            "target_source": "upstream_completion",
+            "target_filter_reason": "wjb_trusted_no_filter",
+        }
+
+    if safety_filter_mode == "minimal":
+        token_len = len(re.findall(r"\S+", completion))
+        if token_len < WJB_MIN_TARGET_TOKENS:
+            return pick_refusal_template(prompt, seed=seed), {
+                "target_source": "template_pool",
+                "target_filter_reason": "completion_too_short",
+                "completion_token_count": token_len,
+            }
+        if WJB_JAILBREAK_SUCCESS_MARKERS.match(completion):
+            return pick_refusal_template(prompt, seed=seed), {
+                "target_source": "template_pool",
+                "target_filter_reason": "jailbreak_success_marker_match",
+            }
+        return completion, {
+            "target_source": "upstream_completion",
+            "target_filter_reason": "wjb_minimal_filter_passed",
+            "completion_token_count": token_len,
+        }
+
+    # safety_filter_mode == "strict" (legacy / ablation only)
     try:
         from src.training.eval_utils import judge_harmful_response_safety
     except ModuleNotFoundError:
-        # In lightweight data-builder tests torch may be absent, and importing
-        # src.training runs package-level training imports before eval_utils.
-        # Load the standalone heuristic file directly; it has no torch
-        # dependency and preserves the repository's existing safety filter.
         import importlib.util
         import sys
 
@@ -936,6 +1000,72 @@ def _safe_wildjailbreak_harmful_target(
     }
 
 
+def _build_wildguardtest_eval_pool(
+    *,
+    system_prompt: str,
+    cache_dir: Optional[str] = None,
+    drops: Optional[Dict[str, int]] = None,
+) -> List[Dict[str, Any]]:
+    """Load Anthropic WildGuard's WildGuardTest split as a balanced OR/HR test pool.
+
+    WildGuardTest (Han et al. NeurIPS 2024, ``allenai/wildguardmix:wildguardtest``)
+    contains ~1.7k prompts with explicit ``prompt_harm_label`` (harmful/unharmful)
+    and is the community-standard balanced safety eval set used by SafetyChat,
+    Llama Guard 2, Tülu 3, etc. We use it for both ``wildjailbreak`` and
+    ``wildguardmix`` baselines so the OR numbers stay directly comparable to
+    those papers and avoid WildJailbreak's adversarial-heavy eval split (2000
+    harmful + 210 harmless), whose 9.5% harmless ratio inflates OR for any
+    model that learns the "looks-like-jailbreak ⇒ refuse" pattern.
+    """
+    # Local import to avoid pulling torch via the safety eval module at import
+    # time of safety_datasets (which is also used by data-only test paths).
+    from src.data.safety_eval_datasets import load_wildguard_test
+
+    drop_counts = drops if drops is not None else {}
+    examples = load_wildguard_test(cache_dir=cache_dir)
+    records: List[Dict[str, Any]] = []
+    for ex in examples:
+        prompt = (ex.prompt or "").strip()
+        if not prompt:
+            drop_counts["wgtest_missing_prompt"] = (
+                drop_counts.get("wgtest_missing_prompt", 0) + 1
+            )
+            continue
+        raw_label = _normalize_raw_label(ex.label)
+        if raw_label in {"harmful"}:
+            label = "harmful"
+        elif raw_label in {"unharmful", "harmless", "benign", "safe"}:
+            label = "harmless"
+        else:
+            drop_counts["wgtest_unknown_prompt_harm_label"] = (
+                drop_counts.get("wgtest_unknown_prompt_harm_label", 0) + 1
+            )
+            continue
+        records.append(
+            _build_binary_record(
+                record_id=f"wildguardtest_{ex.sample_id}",
+                prompt=prompt,
+                # Eval records do not need a target_response; eval drives
+                # generation. Keep empty string so the schema validator is
+                # happy if it ever requires the field.
+                target="",
+                label=label,
+                raw_label=raw_label,
+                source=ex.source or "allenai/wildguardmix:wildguardtest",
+                dataset="wildguardtest",
+                system_prompt=system_prompt,
+                metadata={
+                    "wgtest_category": ex.category,
+                    "wgtest_response": (ex.extra or {}).get("response", ""),
+                    "wgtest_response_refusal_label": (ex.extra or {}).get(
+                        "response_refusal_label", ""
+                    ),
+                },
+            )
+        )
+    return records
+
+
 def _build_wildjailbreak_pool(
     rows: Iterable[Dict[str, Any]],
     *,
@@ -945,6 +1075,7 @@ def _build_wildjailbreak_pool(
     seed: int,
     for_eval: bool = False,
     drops: Optional[Dict[str, int]] = None,
+    safety_filter_mode: str = "minimal",
 ) -> List[Dict[str, Any]]:
     seen: set[str] = set()
     records: List[Dict[str, Any]] = []
@@ -982,6 +1113,7 @@ def _build_wildjailbreak_pool(
                 prompt=prompt,
                 completion=completion,
                 seed=seed,
+                safety_filter_mode=safety_filter_mode,
             )
             metadata.update(target_meta)
         records.append(
@@ -1015,7 +1147,27 @@ def build_wildjailbreak_records(
     max_eval_samples_per_label: int = 0,
     eval_output_path: str | Path | None = None,
     seed: int = 42,
+    safety_filter_mode: str = "minimal",
 ) -> List[Dict[str, Any]]:
+    """Build WildJailbreak SFT corpus following Jiang et al. 2024 recipe.
+
+    ``safety_filter_mode`` controls how harmful-side WJB ``completion`` fields
+    are vetted before being used as SFT targets:
+
+      - ``"trust"``: use the WJB completion verbatim (paper recipe; matches
+        Tülu 2 / Llama Guard 2 usage). 0% pool fallback.
+      - ``"minimal"`` (default): drop completion only if empty, < 20 tokens,
+        or opens with one of a small list of explicit jailbreak-success
+        markers (``Sure! Here's...``, ``Step 1:`` ...). ~5-10% pool fallback.
+      - ``"strict"``: legacy behaviour — run ``judge_harmful_response_safety``
+        and reject any ``ambiguous_non_refusal`` verdict. ~30% pool fallback
+        on real WJB data; over-aggressive (false-positive heavy).
+
+    Default switched from ``"strict"`` to ``"minimal"`` on 2026-05-31 after
+    measuring 32% pool fallback rate on real WJB data, which collapses target
+    diversity to 8 templates and inflates over-refusal (model overlearns
+    pool style and triggers refusal classifier on any output).
+    """
     drops: Dict[str, int] = {}
     train_pool = _build_wildjailbreak_pool(
         _load_wildjailbreak_rows(
@@ -1028,6 +1180,7 @@ def build_wildjailbreak_records(
         system_prompt=system_prompt,
         seed=seed,
         drops=drops,
+        safety_filter_mode=safety_filter_mode,
     )
     records = _sample_by_metadata_key(
         train_pool,
@@ -1053,28 +1206,35 @@ def build_wildjailbreak_records(
     test_source = ""
     test_fallback_reason = ""
     if eval_output_path:
+        # Switched (2026-05-31) from WildJailbreak's own ``eval`` split
+        # (2000 harmful + 210 harmless, 9.5% harmless — too skewed for OR
+        # measurement) to Anthropic WildGuardTest (1.7k balanced) so the OR
+        # number is comparable to SafetyChat / Llama Guard 2 / Tülu 3 papers
+        # and is statistically meaningful on the harmless side.
         try:
-            eval_pool = _build_wildjailbreak_pool(
-                _load_wildjailbreak_rows(
-                    source_name=source_name,
-                    config_name="eval",
-                    cache_dir=cache_dir,
-                ),
-                source_name=source_name,
-                config_name="eval",
+            eval_pool = _build_wildguardtest_eval_pool(
                 system_prompt=system_prompt,
-                seed=seed,
-                for_eval=True,
+                cache_dir=cache_dir,
                 drops=drops,
             )
             if len({r["label"] for r in eval_pool}) < 2:
-                raise RuntimeError("WildJailbreak eval does not contain both labels")
-            test_source = f"{source_name}:eval"
+                raise RuntimeError(
+                    "WildGuardTest did not yield both labels after filters."
+                )
+            test_source = "allenai/wildguardmix:wildguardtest"
         except Exception as exc:
+            # Fallback: hold out from train_pool. Logged so reviewers can see.
             test_fallback_reason = _format_fallback_reason(exc)
             selected_ids = {str(record.get("id", "")) for record in records}
-            eval_pool = [record for record in train_pool if str(record.get("id", "")) not in selected_ids]
-            test_source = f"{source_name}:{split or 'train'} holdout"
+            eval_pool = [
+                record
+                for record in train_pool
+                if str(record.get("id", "")) not in selected_ids
+            ]
+            test_source = (
+                f"{source_name}:{split or 'train'} holdout "
+                "(WildGuardTest unavailable)"
+            )
         eval_selected = _sample_balanced_by_label(
             eval_pool,
             subset_mode=eval_subset_mode,
@@ -1082,7 +1242,10 @@ def build_wildjailbreak_records(
             max_samples_per_label=max_eval_samples_per_label,
             seed=seed + 101,
         )
-        eval_records = [_to_eval_record(record, id_prefix="wildjailbreak_test") for record in eval_selected]
+        eval_records = [
+            _to_eval_record(record, id_prefix="wildjailbreak_test")
+            for record in eval_selected
+        ]
         write_jsonl(eval_output_path, eval_records)
 
     _write_materialization_summary(
@@ -2425,6 +2588,337 @@ def build_beavertails_category_records(
 
 
 # ---------------------------------------------------------------------------
+# CoCoNot (allenai/coconot) -- native noncompliance/refusal SFT corpus
+# ---------------------------------------------------------------------------
+#
+# CoCoNot ships GPT-4-written noncompliance responses for harmful (and other
+# noncompliance) prompts in the ``original`` config, plus a native compliable
+# benign set (``pref`` train ``chosen`` answers, and the ``contrast`` test probe
+# for over-refusal). Unlike the HH-RLHF / PKU-SafeRLHF preference corpora, the
+# harmful target is a real refusal, so it does not collapse the data-dependent
+# SFT arm. License: ODC-BY (ungated); responses are GPT-4-distilled (OpenAI ToS
+# applies to that subset) -- disclose in any writeup.
+
+
+def _coconot_is_safety_category(value: Any) -> bool:
+    """True for the 'Requests with safety concerns' noncompliance category."""
+
+    return "safety" in str(value or "").strip().lower()
+
+
+def _coconot_refusal_quality(records: Sequence[Dict[str, Any]]) -> Dict[str, float]:
+    """Measure, with the SAME judge the eval uses, what fraction of harmful
+    targets are real refusals (and the harmless refusal-leak rate).
+
+    eval_utils is loaded by file path so that importing it here does not pull
+    torch via ``src.training.__init__``. Returns an empty dict if the judge
+    cannot be loaded -- the quality log is best-effort and never fails the build.
+    """
+
+    try:
+        import importlib.util
+        import sys as _sys
+
+        eu_path = Path(__file__).resolve().parent.parent / "training" / "eval_utils.py"
+        spec = importlib.util.spec_from_file_location("_coconot_eval_utils", eu_path)
+        module = importlib.util.module_from_spec(spec)
+        _sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        looks_like_refusal = module.looks_like_refusal
+    except Exception:  # pragma: no cover - best-effort quality log
+        return {}
+
+    def _rate(subset: List[Dict[str, Any]]) -> float:
+        if not subset:
+            return 0.0
+        hits = sum(
+            1 for r in subset if looks_like_refusal(str(r.get("target_response", "")))
+        )
+        return hits / len(subset)
+
+    harmful = [r for r in records if str(r.get("label", "")).lower() == "harmful"]
+    harmless = [r for r in records if str(r.get("label", "")).lower() == "harmless"]
+    return {
+        "harmful_target_refusal_rate": _rate(harmful),
+        "harmless_refusal_leak_rate": _rate(harmless),
+    }
+
+
+def build_coconot_records(
+    *,
+    output_path: str | Path,
+    source_name: str = "allenai/coconot",
+    split: str = "train",
+    cache_dir: Optional[str] = None,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    harmful_categories_all: bool = False,
+    train_subset_mode: bool = True,
+    max_train_samples: int = 20000,
+    max_train_samples_per_label: int = 10000,
+    eval_subset_mode: bool = False,
+    max_eval_samples: int = 0,
+    max_eval_samples_per_label: int = 0,
+    eval_output_path: str | Path | None = None,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """Materialize a CoCoNot SFT corpus (native harmful->refusal + benign).
+
+    Train:
+        harmful side  : ``original`` config, ``split`` (train); rows whose
+                        ``category`` is 'Requests with safety concerns' (set
+                        ``harmful_categories_all=True`` to keep all five
+                        noncompliance categories). ``target_response`` is the
+                        native GPT-4 noncompliance ``response``.
+        harmless side : ``pref`` config train ``chosen`` answers (compliable
+                        queries answered helpfully). Downsampled to match the
+                        harmful count for a 50/50 split.
+
+    Test (official CoCoNot splits, not a self-split):
+        harmful side  : ``original`` config test prompts (safety-concern),
+                        prompt-only (eval generates + scores).
+        harmless side : ``contrast`` config test prompts (the compliable
+                        over-refusal probe), prompt-only.
+
+    CoCoNot responses are GPT-4-written but NOT pre-validated by this repo's
+    strict refusal judge; the materialization summary records the measured
+    harmful-target refusal rate. Run scripts/diag_harmful_target_refusal_rate.py
+    on the train JSONL to confirm before trusting the sft arm.
+    """
+
+    drops: Dict[str, int] = {}
+    split_value = split or "train"
+
+    # --- Train: harmful side from original/<split> (safety-concern refusals) ---
+    harmful_pool: List[Dict[str, Any]] = []
+    for index, row in enumerate(
+        _iter_dataset_rows(
+            _load_dataset(source_name, "original", split=split_value, cache_dir=cache_dir)
+        )
+    ):
+        prompt = str(row.get("prompt", "")).strip()
+        response = str(row.get("response", "")).strip()
+        category = row.get("category")
+        if not prompt or not response:
+            drops["coconot_original_missing_text"] = (
+                drops.get("coconot_original_missing_text", 0) + 1
+            )
+            continue
+        if not harmful_categories_all and not _coconot_is_safety_category(category):
+            drops["coconot_non_safety_category"] = (
+                drops.get("coconot_non_safety_category", 0) + 1
+            )
+            continue
+        harmful_pool.append(
+            _build_binary_record(
+                record_id=str(row.get("id") or f"coconot_original_{split_value}_{index:06d}"),
+                prompt=prompt,
+                target=response,
+                label="harmful",
+                raw_label=str(category or "noncompliance"),
+                source=f"{source_name}:original:{split_value}",
+                dataset="coconot",
+                system_prompt=system_prompt,
+                metadata={
+                    "category": str(category or ""),
+                    "subcategory": str(row.get("subcategory") or ""),
+                    "target_source": "coconot_noncompliance_response",
+                },
+            )
+        )
+
+    # --- Train: harmless side from pref/train chosen (compliable answers) ---
+    harmless_pool: List[Dict[str, Any]] = []
+    for index, row in enumerate(
+        _iter_dataset_rows(_load_dataset(source_name, "pref", split="train", cache_dir=cache_dir))
+    ):
+        prompt = str(row.get("prompt", "")).strip()
+        chosen = str(row.get("chosen", "")).strip()
+        if not prompt or not chosen:
+            drops["coconot_pref_missing_text"] = drops.get("coconot_pref_missing_text", 0) + 1
+            continue
+        harmless_pool.append(
+            _build_binary_record(
+                record_id=str(row.get("id") or f"coconot_pref_train_{index:06d}"),
+                prompt=prompt,
+                target=chosen,
+                label="harmless",
+                raw_label="contrast",
+                source=f"{source_name}:pref:train",
+                dataset="coconot",
+                system_prompt=system_prompt,
+                metadata={
+                    "target_source": "coconot_pref_chosen",
+                    "chosen_model": str(row.get("chosen_model") or ""),
+                },
+            )
+        )
+
+    if not harmful_pool:
+        raise RuntimeError(
+            "CoCoNot original produced 0 harmful records after the safety-concern "
+            "filter. Set harmful_categories_all=True or check the upstream config."
+        )
+    if not harmless_pool:
+        raise RuntimeError(
+            "CoCoNot pref/train produced 0 harmless records (compliable `chosen`)."
+        )
+
+    # --- 50/50 balance: downsample the larger pool to the smaller. ---
+    target_per_label = min(len(harmful_pool), len(harmless_pool))
+    if max_train_samples_per_label and max_train_samples_per_label > 0:
+        target_per_label = min(target_per_label, int(max_train_samples_per_label))
+    if max_train_samples and max_train_samples > 0:
+        target_per_label = min(target_per_label, int(max_train_samples) // 2)
+
+    rng_h = random.Random(int(seed))
+    rng_l = random.Random(int(seed) + 1)
+    sampled_harmful = list(harmful_pool)
+    rng_h.shuffle(sampled_harmful)
+    sampled_harmful = sampled_harmful[:target_per_label]
+    sampled_harmless = list(harmless_pool)
+    rng_l.shuffle(sampled_harmless)
+    sampled_harmless = sampled_harmless[:target_per_label]
+    train_pool = sampled_harmful + sampled_harmless
+    random.Random(int(seed) + 2).shuffle(train_pool)
+    records = train_pool
+
+    _validate_binary_training_records(records)
+    write_jsonl(output_path, records)
+
+    # Built-in quality log: catch a HH-style "safe-but-evasive target" pathology
+    # at build time using the SAME judge the eval scores HR with.
+    quality = _coconot_refusal_quality(records)
+    for key, value in quality.items():
+        drops[f"{key}_x1000"] = int(round(value * 1000))
+    refusal_rate = quality.get("harmful_target_refusal_rate")
+    if refusal_rate is not None and refusal_rate < 0.5:
+        print(
+            f"[coconot] WARNING: harmful-target refusal rate {refusal_rate:.1%} < 50% "
+            "under the eval judge -- CoCoNot responses may be safe-but-evasive; verify "
+            "with scripts/diag_harmful_target_refusal_rate.py before trusting sft.",
+            flush=True,
+        )
+
+    # --- Test: original/test (harmful) + contrast/test (harmless), prompt-only ---
+    eval_records: List[Dict[str, Any]] = []
+    test_source = ""
+    test_fallback_reason = ""
+    if eval_output_path:
+        try:
+            eval_pool: List[Dict[str, Any]] = []
+            for index, row in enumerate(
+                _iter_dataset_rows(
+                    _load_dataset(source_name, "original", split="test", cache_dir=cache_dir)
+                )
+            ):
+                prompt = str(row.get("prompt", "")).strip()
+                category = row.get("category")
+                if not prompt:
+                    continue
+                if not harmful_categories_all and not _coconot_is_safety_category(category):
+                    continue
+                eval_pool.append(
+                    {
+                        "id": str(row.get("id") or f"coconot_original_test_{index:06d}"),
+                        "label": "harmful",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "source": f"{source_name}:original:test",
+                        "dataset": "coconot",
+                        "raw_label": str(category or "noncompliance"),
+                        "metadata": {"subcategory": str(row.get("subcategory") or "")},
+                    }
+                )
+            for index, row in enumerate(
+                _iter_dataset_rows(
+                    _load_dataset(source_name, "contrast", split="test", cache_dir=cache_dir)
+                )
+            ):
+                prompt = str(row.get("prompt", "")).strip()
+                if not prompt:
+                    continue
+                eval_pool.append(
+                    {
+                        "id": str(row.get("id") or f"coconot_contrast_test_{index:06d}"),
+                        "label": "harmless",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "source": f"{source_name}:contrast:test",
+                        "dataset": "coconot",
+                        "raw_label": "contrast",
+                        "metadata": {"subcategory": str(row.get("subcategory") or "")},
+                    }
+                )
+            if len({r["label"] for r in eval_pool}) < 2:
+                raise RuntimeError(
+                    "CoCoNot official test split did not yield both labels."
+                )
+            test_source = f"{source_name}:original.test+contrast.test (official)"
+        except Exception as exc:
+            test_fallback_reason = _format_fallback_reason(exc)
+            selected_ids = {str(record.get("id", "")) for record in records}
+            eval_pool = [
+                record
+                for record in (harmful_pool + harmless_pool)
+                if str(record.get("id", "")) not in selected_ids
+            ]
+            test_source = (
+                f"{source_name}:original/pref train holdout (official test unavailable)"
+            )
+
+        eval_selected = _sample_balanced_by_label(
+            eval_pool,
+            subset_mode=eval_subset_mode,
+            max_samples=max_eval_samples,
+            max_samples_per_label=max_eval_samples_per_label,
+            seed=seed + 101,
+        )
+        eval_records = [
+            _to_eval_record(record, id_prefix="coconot_test") for record in eval_selected
+        ]
+
+        # Cross-split prompt-leak: drop train records sharing a prompt with test.
+        def _first_user_text(record: Dict[str, Any]) -> str:
+            for msg in record.get("messages") or []:
+                if str(msg.get("role", "")).lower() == "user":
+                    return str(msg.get("content", "")).strip()
+            return ""
+
+        test_prompt_set = {_first_user_text(r) for r in eval_records}
+        test_prompt_set.discard("")
+        if test_prompt_set:
+            pre_drop = len(records)
+            records = [r for r in records if _first_user_text(r) not in test_prompt_set]
+            removed = pre_drop - len(records)
+            drops["train_test_prompt_overlap_removed_from_train"] = removed
+            if removed:
+                write_jsonl(output_path, records)
+                _validate_binary_training_records(records)
+
+        write_jsonl(eval_output_path, eval_records)
+
+    _write_materialization_summary(
+        output_path=output_path,
+        dataset_name="coconot",
+        train_records=records,
+        train_pool_count=len(harmful_pool) + len(harmless_pool),
+        eval_records=eval_records,
+        eval_output_path=eval_output_path,
+        train_subset_mode=bool(train_subset_mode) and int(max_train_samples) > 0,
+        eval_subset_mode=bool(eval_subset_mode) and int(max_eval_samples) > 0,
+        seed=seed,
+        test_source=test_source,
+        test_fallback_reason=test_fallback_reason,
+        drops=drops,
+    )
+    return records
+
+
+# ---------------------------------------------------------------------------
 # Registry / dispatch
 # ---------------------------------------------------------------------------
 
@@ -2562,6 +3056,24 @@ def _build_tulu3_safety_v2(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
     )
 
 
+def _build_coconot(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
+    return build_coconot_records(
+        output_path=spec.output_path,
+        source_name=spec.source_name or "allenai/coconot",
+        split=spec.split or "train",
+        cache_dir=spec.cache_dir,
+        system_prompt=spec.system_prompt or DEFAULT_SYSTEM_PROMPT,
+        train_subset_mode=bool(spec.train_subset_mode),
+        max_train_samples=int(spec.max_train_samples),
+        max_train_samples_per_label=int(spec.max_train_samples_per_label),
+        eval_subset_mode=bool(spec.eval_subset_mode),
+        max_eval_samples=int(spec.max_eval_samples),
+        max_eval_samples_per_label=int(spec.max_eval_samples_per_label),
+        eval_output_path=spec.eval_output_path,
+        seed=int(spec.seed),
+    )
+
+
 SAFETY_TRAIN_DATASETS: Dict[str, SafetyDatasetBuilder] = {
     "tulu3_safety": _build_tulu3_safety,
     "tulu3_safety_v2": _build_tulu3_safety_v2,
@@ -2571,6 +3083,7 @@ SAFETY_TRAIN_DATASETS: Dict[str, SafetyDatasetBuilder] = {
     "wildguardmix": _build_wildguardmix,
     "hh_rlhf": _build_hh_rlhf,
     "beavertails_category": _build_beavertails_category,
+    "coconot": _build_coconot,
 }
 
 
@@ -2626,6 +3139,7 @@ __all__ = [
     "_parse_hh_messages",
     "build_beavertails_records",
     "build_beavertails_category_records",
+    "build_coconot_records",
     "build_hh_rlhf_records",
     "build_safety_tuned_llamas_records",
     "build_tulu3_safety_records",

@@ -95,6 +95,7 @@ def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSp
         "wildguardmix",
         "hh_rlhf",
         "beavertails_category",
+        "coconot",
     }:
         eval_output_path = data.test_split
     spec = SafetyDatasetSpec(
