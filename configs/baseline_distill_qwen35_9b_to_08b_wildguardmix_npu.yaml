@@ -57,7 +57,7 @@ optim:
   max_length: 2048
   max_new_tokens: 512
   log_every_steps: 20
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   save_optimizer_state: false
 distill:
   temperature: 2.0

@@ -46,7 +46,7 @@ optim:
   max_length: 2048
   max_new_tokens: 256
   log_every_steps: 10
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   save_optimizer_state: false
 output:
   output_root: ../outputs/baselines/sft_qwen35_08b_wildguardmix_npu
