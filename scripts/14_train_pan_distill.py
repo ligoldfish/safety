@@ -254,6 +254,58 @@ def main() -> None:
     best_val_loss = float("inf")
     best_epoch = 0
     epochs_since_improve = 0
+
+    def _sub_epoch_eval_and_maybe_save(epoch: int, global_step: int) -> None:
+        """iso-HR support: eval student val HR at a sub-epoch step and persist a
+        step checkpoint only when val HR is within match_band of match_target_hr."""
+        gen_metrics = evaluate_generation_refusal_metrics(
+            student_model,
+            tokenizer,
+            val_dataset.records,
+            device=student_device,
+            max_length=cfg.optim.max_length,
+            max_new_tokens=cfg.optim.max_new_tokens,
+            batch_size=micro_batch_size,
+        )
+        key = f"step_{global_step:06d}"
+        step_metrics = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "harmful_refusal_rate": gen_metrics["harmful_refusal_rate"],
+            "harmless_over_refusal_rate": gen_metrics["harmless_over_refusal_rate"],
+            "harmful_unsafe_output_rate": gen_metrics["harmful_unsafe_output_rate"],
+            "harmful_strict_unsafe_rate": gen_metrics["harmful_strict_unsafe_rate"],
+            "num_harmful": gen_metrics["num_harmful"],
+            "num_harmless": gen_metrics["num_harmless"],
+        }
+        val_metrics[key] = step_metrics
+        write_val_metrics(val_metrics_path, val_metrics)
+        log_kv(logger, "sub_epoch_eval", **step_metrics)
+        target = float(cfg.optim.match_target_hr)
+        if target < 0.0 or abs(
+            float(gen_metrics["harmful_refusal_rate"]) - target
+        ) <= float(cfg.optim.match_band):
+            save_checkpoint(
+                checkpoints_dir / f"{key}.pt",
+                model=student_model,
+                optimizer=optimizer,
+                epoch=epoch,
+                step=global_step,
+                extra={
+                    "config_path": str(Path(args.config).resolve()),
+                    "epoch_metrics": step_metrics,
+                },
+                save_mode="full" if training_mode == "full_finetune" else "trainable",
+                save_optimizer=bool(cfg.optim.save_optimizer_state),
+            )
+            log_kv(
+                logger,
+                "sub_epoch_checkpoint_saved",
+                key=key,
+                harmful_refusal_rate=gen_metrics["harmful_refusal_rate"],
+            )
+        student_model.train()
+
     for epoch in range(1, cfg.optim.epochs + 1):
         log_kv(logger, "epoch_start", epoch=epoch, total_epochs=int(cfg.optim.epochs))
         student_model.train()
@@ -326,6 +378,12 @@ def main() -> None:
                             "gradient_accumulation_steps": gradient_accumulation_steps,
                         },
                     )
+
+                if (
+                    int(cfg.optim.checkpoint_every_steps) > 0
+                    and global_step % int(cfg.optim.checkpoint_every_steps) == 0
+                ):
+                    _sub_epoch_eval_and_maybe_save(epoch, global_step)
 
         val_loss_metrics = _evaluate_val_distill_loss(
             student_model,

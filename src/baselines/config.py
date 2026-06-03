@@ -147,6 +147,13 @@ class BaselineOptimConfig:
     log_every_steps: int = 1
     gradient_checkpointing: bool = False
     save_optimizer_state: bool = True
+    # iso-HR matching: enable sub-epoch val-HR eval every N optimizer steps. A
+    # step checkpoint (step_NNNNNN.pt) is persisted only when the val HR is within
+    # match_band of match_target_hr (or match_target_hr < 0 = save every probe),
+    # which bounds disk for full-finetune checkpoints.
+    checkpoint_every_steps: int = 0
+    match_target_hr: float = -1.0
+    match_band: float = 0.02
 
 
 @dataclass
