@@ -399,6 +399,10 @@ def prepare_phase1_datasets(
     prompts_all = alignment_records + analysis_val_records + test_records + sanity_test_records
     write_jsonl(processed_path / "prompts_all.jsonl", prompts_all)
     write_jsonl(processed_path / "pan_train_set.jsonl", train_records)
+    # Phase F SFT reads train_set.jsonl; Phase 1 reads alignment_set.jsonl.
+    # For the PAN flow the two are identical (PAN is already Pan-curated, so
+    # default curation_mode=off — see src/data/curation.py).
+    write_jsonl(processed_path / "train_set.jsonl", alignment_records)
     write_jsonl(processed_path / "alignment_set.jsonl", alignment_records)
     write_jsonl(processed_path / "analysis_val_set.jsonl", analysis_val_records)
     write_jsonl(processed_path / "pan_test_set.jsonl", test_records)
@@ -426,6 +430,7 @@ def prepare_phase1_datasets(
     return {
         "prompts_all_path": str(processed_path / "prompts_all.jsonl"),
         "pan_train_path": str(processed_path / "pan_train_set.jsonl"),
+        "train_path": str(processed_path / "train_set.jsonl"),
         "alignment_path": str(processed_path / "alignment_set.jsonl"),
         "analysis_val_path": str(processed_path / "analysis_val_set.jsonl"),
         "pan_test_path": str(processed_path / "pan_test_set.jsonl"),

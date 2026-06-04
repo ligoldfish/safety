@@ -148,6 +148,7 @@ def _normalize_record(
         "accept_response": accept_response,
         "rejected_response": rejected_response,
         "source_dataset": str(raw.get("dataset") or raw.get("source") or ""),
+        "metadata": dict(raw.get("metadata") or {}),
     }
 
 
@@ -282,7 +283,15 @@ def main() -> None:
         sanity_fraction=float(args.sanity_fraction),
     )
 
-    write_jsonl(output_dir / "alignment_set.jsonl", train_split)
+    # Phase F SFT training reads train_set.jsonl (full data). Phase 1 reads
+    # alignment_set.jsonl, which is the SOLE responsibility of
+    # scripts/19b_curate_phase1_subset.py (even in mode=off, where 19b copies
+    # train_set.jsonl byte-for-byte). We deliberately do NOT write
+    # alignment_set.jsonl here: doing so created a race where a previous 19b
+    # crash left the full train set in place, and the next 19b run (without
+    # --force-rebuild) saw the existing file and silently treated it as
+    # already-curated.
+    write_jsonl(output_dir / "train_set.jsonl", train_split)
     write_jsonl(output_dir / "analysis_val_set.jsonl", val_split)
     write_jsonl(output_dir / "sanity_test_set.jsonl", sanity_split)
     # pan_train_set is the hidden-state extraction source; SemAlign uses the
@@ -303,6 +312,20 @@ def main() -> None:
     for record in train_split:
         label_counts[record["label"]] = label_counts.get(record["label"], 0) + 1
 
+    # Sanity check: 19b strict mode for wildjailbreak/wildguardmix keys off
+    # metadata.data_type (WJB) and metadata.prompt_harm_label (WGM). If
+    # _normalize_record drops the upstream metadata, every record in those
+    # baselines is silently filtered out. Count non-empty metadata and the
+    # two strict-mode fields so the upstream issue is loud.
+    metadata_nonempty = sum(1 for r in train_split if r.get("metadata"))
+    wjb_data_type_present = sum(
+        1 for r in train_split if (r.get("metadata") or {}).get("data_type")
+    )
+    wgm_prompt_harm_label_present = sum(
+        1 for r in train_split
+        if (r.get("metadata") or {}).get("prompt_harm_label")
+    )
+
     summary = {
         "safety_jsonl": str(safety_path),
         "output_dir": str(output_dir),
@@ -313,6 +336,9 @@ def main() -> None:
         "val_size": len(val_split),
         "sanity_size": len(sanity_split),
         "train_label_counts": label_counts,
+        "train_metadata_nonempty": metadata_nonempty,
+        "train_wjb_data_type_present": wjb_data_type_present,
+        "train_wgm_prompt_harm_label_present": wgm_prompt_harm_label_present,
         "harmless_injected_from_pan": not has_harmless,
         "seed": int(args.seed),
     }

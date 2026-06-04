@@ -134,6 +134,17 @@ def build_random_target_map(
 
 
 class SemAlignDataset(Dataset):
+    """Joins training records with student layer targets.
+
+    Direction A (decoupled train_set vs alignment_set): records whose
+    ``id`` is missing from ``target_map`` are still KEPT for SFT (L_out)
+    supervision; they receive a zero placeholder target and a
+    ``has_layer_target=False`` flag so the layer-alignment loss
+    (L_layer) contributes zero weight for those rows. This implements
+    the spec "L_layer driven by curated subspace (~5k), L_out trained
+    on full data (~20k)" without silently dropping rows.
+    """
+
     def __init__(
         self,
         records: Sequence[Dict[str, Any]],
@@ -145,11 +156,12 @@ class SemAlignDataset(Dataset):
         self.anchor_map = anchor_map or {}
         self.filtered_harmful_target_count = 0
         self.missing_harmless_anchor_count = 0
+        self.missing_layer_target_count = 0
         kept_records: List[Dict[str, Any]] = []
+        has_layer_target_flags: List[bool] = []
         for record in records:
             sample_id = str(record["id"])
-            if sample_id not in target_map:
-                continue
+            has_target = sample_id in target_map
             if anchor_map is not None and str(record.get("label", "")) == "harmless" and sample_id not in anchor_map:
                 self.missing_harmless_anchor_count += 1
                 continue
@@ -162,8 +174,12 @@ class SemAlignDataset(Dataset):
                 if not looks_like_refusal(target_text) and not judgment.is_safe:
                     self.filtered_harmful_target_count += 1
                     continue
+            if not has_target:
+                self.missing_layer_target_count += 1
             kept_records.append(record)
+            has_layer_target_flags.append(has_target)
         self.records = kept_records
+        self.has_layer_target_flags = has_layer_target_flags
         self.target_map = target_map
         if not self.records:
             raise ValueError("No records remain after joining against student targets.")
@@ -172,6 +188,20 @@ class SemAlignDataset(Dataset):
                 "Missing harmless base anchors for "
                 f"{self.missing_harmless_anchor_count} records after joining targets."
             )
+        # Build a zero-tensor placeholder that matches any real target's
+        # per-pair shape. Direction A: records without a target_map entry
+        # still need a tensor of the right shape so the collator can stack;
+        # the zero weight in _layer_sample_weights makes L_layer ignore them.
+        self._placeholder_targets: Dict[int, torch.Tensor] = {}
+        any_target = next(iter(target_map.values())) if target_map else None
+        if any_target is not None:
+            for pair_idx, tensor in any_target.items():
+                self._placeholder_targets[int(pair_idx)] = torch.zeros_like(tensor)
+        if self.missing_layer_target_count > 0 and not self._placeholder_targets:
+            raise ValueError(
+                "target_map is empty but records are missing targets; cannot "
+                "construct placeholder tensors for SFT-only rows."
+            )
 
     def __len__(self) -> int:
         return len(self.records)
@@ -179,10 +209,13 @@ class SemAlignDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         record = self.records[idx]
         sample_id = str(record["id"])
+        has_target = self.has_layer_target_flags[idx]
+        targets = self.target_map[sample_id] if has_target else self._placeholder_targets
         return {
             "record": record,
-            "targets": self.target_map[sample_id],
+            "targets": targets,
             "anchors": self.anchor_map.get(sample_id),
+            "has_layer_target": has_target,
         }
 
 
@@ -197,6 +230,10 @@ class BatchPayload:
     sample_ids: List[str]
     labels_text: List[str]
     messages: List[Sequence[Dict[str, str]]]
+    # Direction A: bool tensor [B], False = SFT-only row (no L_layer
+    # contribution because the record's id is not in the alignment-set
+    # target map). True = full L_layer + L_out supervision.
+    has_layer_target: torch.Tensor
 
 
 class SemAlignCollator:
@@ -295,6 +332,10 @@ class SemAlignCollator:
                     ],
                     dim=0,
                 )
+        has_layer_target = torch.tensor(
+            [bool(item.get("has_layer_target", True)) for item in batch],
+            dtype=torch.bool,
+        )
         return BatchPayload(
             input_ids=encoded_full["input_ids"],
             attention_mask=encoded_full["attention_mask"],
@@ -305,6 +346,7 @@ class SemAlignCollator:
             sample_ids=[str(record["id"]) for record in records],
             labels_text=[str(record["label"]) for record in records],
             messages=[record["messages"] for record in records],
+            has_layer_target=has_layer_target,
         )
 
 
@@ -438,6 +480,7 @@ def forward_semalign_batch(
         layer_loss_policy=layer_loss_policy,
         harmful_layer_weight=harmful_layer_weight,
         harmless_layer_weight=harmless_layer_weight,
+        has_layer_target=batch.has_layer_target,
     )
     loss_layer, cosine_by_layer = cosine_layer_alignment_loss(
         predicted_by_layer,
@@ -468,18 +511,40 @@ def _layer_sample_weights(
     layer_loss_policy: str,
     harmful_layer_weight: float,
     harmless_layer_weight: float,
+    has_layer_target: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
+    """Compute per-row L_layer weights.
+
+    Direction A: rows with ``has_layer_target=False`` are forced to
+    weight 0.0 in BOTH harmful and harmless branches, so SFT-only rows
+    do not contribute to the layer alignment loss. When the policy is
+    ``'all'`` but at least one row lacks a target, we still return an
+    explicit weight tensor (rather than ``None``) so the loss masks
+    those rows out.
+    """
+
     policy = str(layer_loss_policy).strip().lower()
-    if policy == "all":
-        return None
-    if policy not in {"harmful_only", "label_weighted", "harmless_anchor"}:
+    if policy not in {"all", "harmful_only", "label_weighted", "harmless_anchor"}:
         raise ValueError(
             f"Unsupported layer_loss_policy: {layer_loss_policy}. "
             "Expected 'all', 'harmful_only', 'label_weighted', or 'harmless_anchor'."
         )
+    has_target_list = (
+        [bool(flag) for flag in has_layer_target.detach().cpu().tolist()]
+        if has_layer_target is not None
+        else [True] * len(labels_text)
+    )
+    any_missing = not all(has_target_list)
+    if policy == "all" and not any_missing:
+        return None
     weights = []
-    for label in labels_text:
-        if str(label) == "harmful":
+    for label, has_target in zip(labels_text, has_target_list):
+        if not has_target:
+            weights.append(0.0)
+            continue
+        if policy == "all":
+            weights.append(1.0)
+        elif str(label) == "harmful":
             weights.append(float(harmful_layer_weight))
         elif str(label) == "harmless":
             weights.append(0.0 if policy == "harmful_only" else float(harmless_layer_weight))
@@ -534,6 +599,7 @@ def evaluate_layer_alignment(
             layer_loss_policy=layer_loss_policy,
             harmful_layer_weight=harmful_layer_weight,
             harmless_layer_weight=harmless_layer_weight,
+            has_layer_target=batch.has_layer_target,
         )
         for layer_idx in layer_ids:
             predicted = cache[int(layer_idx)]

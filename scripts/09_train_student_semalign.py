@@ -107,6 +107,16 @@ def main() -> None:
             match_l2_norm=bool(cfg.target.match_l2_norm),
         )
 
+    train_split_path = Path(cfg.inputs.train_split)
+    if not train_split_path.exists():
+        raise FileNotFoundError(
+            f"train_set.jsonl missing at {cfg.inputs.train_split}. "
+            "Likely a stale data/processed dir from before the train_set/alignment_set decoupling. "
+            "Re-run scripts/00_prepare_data.py (PAN) or scripts/15_run_oneclick.py safety-full "
+            "(safety baselines) with --force-rebuild to materialize train_set.jsonl. "
+            "If you want to skip materialization for a quick test, you can: "
+            "cp <dir>/alignment_set.jsonl <dir>/train_set.jsonl (not recommended for real runs)."
+        )
     train_records = load_records(cfg.inputs.train_split)
     val_records = load_records(cfg.inputs.val_split)
     train_dataset = SemAlignDataset(
@@ -238,6 +248,8 @@ def main() -> None:
         harmless_layer_weight=float(cfg.target.harmless_layer_weight),
         filter_harmful_targets=bool(cfg.target.filter_harmful_targets),
         train_filtered_harmful_targets=int(train_dataset.filtered_harmful_target_count),
+        train_missing_layer_target_count=int(train_dataset.missing_layer_target_count),
+        val_missing_layer_target_count=int(val_dataset.missing_layer_target_count),
         train_anchor_summary=None if train_anchor_map is None else summarize_target_map(train_anchor_map),
         val_anchor_summary=None if val_anchor_map is None else summarize_target_map(val_anchor_map),
         layer_ids=layer_ids,
@@ -484,6 +496,8 @@ def main() -> None:
             "target_harmless_layer_weight": float(cfg.target.harmless_layer_weight),
             "target_filter_harmful_targets": bool(cfg.target.filter_harmful_targets),
             "train_filtered_harmful_targets": int(train_dataset.filtered_harmful_target_count),
+            "train_missing_layer_target_count": int(train_dataset.missing_layer_target_count),
+            "val_missing_layer_target_count": int(val_dataset.missing_layer_target_count),
             "train_target_summary": summarize_target_map(train_target_map),
             "val_target_summary": summarize_target_map(val_target_map),
             "train_anchor_summary": None if train_anchor_map is None else summarize_target_map(train_anchor_map),

@@ -12,7 +12,7 @@ model:
   attn_implementation: ""
 
 inputs:
-  train_split: ../data/processed/alignment_set.jsonl
+  train_split: ../data/processed/train_set.jsonl
   val_split: ../data/processed/analysis_val_set.jsonl
   train_targets_dir: ../outputs/qwen35_9b_to_08b_phase1_ppu/student_targets/student_safe_targets_alignment
   val_targets_dir: ../outputs/qwen35_9b_to_08b_phase1_ppu/student_targets/student_safe_targets_val

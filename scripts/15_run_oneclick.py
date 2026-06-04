@@ -1023,6 +1023,71 @@ def _run_baseline_nosft(
         )
 
 
+def _invoke_phase1_curation(
+    *,
+    baseline_name: str,
+    processed_dir: Path,
+    phase1_yaml: Path,
+    dry_run: bool,
+    env_overrides: dict[str, str] | None,
+) -> None:
+    """Run scripts/19b_curate_phase1_subset.py with teacher info from phase1 yaml.
+
+    For ``mode=off`` baselines this is a no-op copy that 19b handles
+    internally (no teacher load). For ``minimal`` / ``strict`` baselines 19b
+    loads the teacher and runs a forward pass on every prompt — so we pass
+    it the same teacher path + runtime that Phase 1 uses.
+    """
+
+    teacher_path, teacher_runtime = _read_phase1_teacher(phase1_yaml)
+    curate_args = [
+        "--baseline",
+        baseline_name,
+        "--processed-dir",
+        str(processed_dir),
+        "--mode",
+        "auto",
+        "--force-rebuild",
+    ]
+    if teacher_path:
+        curate_args.extend(["--teacher-path", str(teacher_path)])
+    if teacher_runtime.get("backend"):
+        curate_args.extend(["--runtime-backend", teacher_runtime["backend"]])
+    if teacher_runtime.get("device"):
+        curate_args.extend(["--runtime-device", teacher_runtime["device"]])
+    if teacher_runtime.get("attn"):
+        curate_args.extend(["--attn-implementation", teacher_runtime["attn"]])
+    _run_script(
+        "19b_curate_phase1_subset.py",
+        curate_args,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+
+
+def _read_phase1_teacher(phase1_yaml_path: Path) -> tuple[str, dict]:
+    """Pull (teacher_path, runtime_dict) out of a generated Phase 1 override.
+
+    runtime_dict is {backend, device, attn} — empty strings when unset. Used
+    by ``_run_safety_full`` to forward the teacher model + runtime knobs to
+    ``scripts/19b_curate_phase1_subset.py`` so its forward pass runs on the
+    same accelerator as Phase 1.
+    """
+
+    try:
+        raw = yaml.safe_load(Path(phase1_yaml_path).read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        return "", {"backend": "", "device": "", "attn": ""}
+    teacher = ((raw.get("models") or {}).get("teacher") or {}) if isinstance(raw, dict) else {}
+    path = str(teacher.get("path") or "")
+    if path and not Path(path).is_absolute():
+        path = str((Path(phase1_yaml_path).resolve().parent / path).resolve())
+    backend = str(teacher.get("runtime_backend") or "")
+    device = str(teacher.get("runtime_device") or "")
+    attn = str(teacher.get("attn_implementation") or "")
+    return path, {"backend": backend, "device": device, "attn": attn}
+
+
 def _make_safety_full_overrides(
     *,
     device: str,
@@ -1083,7 +1148,10 @@ def _make_safety_full_overrides(
     if not isinstance(phasef_raw, dict):
         raise ValueError(f"PhaseF config must be a mapping: {base_phasef}")
     phasef_inputs = phasef_raw.setdefault("inputs", {})
-    phasef_inputs["train_split"] = str(safety_processed_dir / "alignment_set.jsonl")
+    # Phase F trains on the full SFT data (train_set.jsonl). The curated
+    # contrast subset lives in alignment_set.jsonl and is consumed only by
+    # Phase 1 SVD via scripts 01-08. See src/data/curation.py.
+    phasef_inputs["train_split"] = str(safety_processed_dir / "train_set.jsonl")
     phasef_inputs["val_split"] = str(safety_processed_dir / "analysis_val_set.jsonl")
     phasef_inputs["train_targets_dir"] = str(
         safety_phase1_output_root / "student_targets" / "student_safe_targets_alignment"
@@ -1221,6 +1289,18 @@ def _run_safety_full(
         safety_phasef_output_root=safety_phasef_output_root,
         phasef_base_override=phasef_config_path,
         phase1_base_override=phase1_config_path,
+    )
+
+    # 3b) Curate the Phase 1 contrast subset (alignment_set.jsonl) from
+    # train_set.jsonl. For clean baselines (PAN/STL/coconot/HH-RLHF) this is
+    # a byte-identical copy via mode=off. For WJB/WGM it applies a strict
+    # per-baseline pre-filter plus a universal teacher-confidence filter.
+    _invoke_phase1_curation(
+        baseline_name=baseline_name,
+        processed_dir=safety_processed_dir,
+        phase1_yaml=phase1_override,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
     )
 
     # 4) Run Phase 1-E (skip 00 — safety splits are already on disk).
@@ -1730,7 +1810,10 @@ def _make_safety_sft1_overrides(
     if not isinstance(phasef_raw, dict):
         raise ValueError(f"PhaseF config must be a mapping: {base_phasef}")
     phasef_inputs = phasef_raw.setdefault("inputs", {})
-    phasef_inputs["train_split"] = str(safety_processed_dir / "alignment_set.jsonl")
+    # Phase F trains on the full SFT data (train_set.jsonl). The curated
+    # contrast subset lives in alignment_set.jsonl and is consumed only by
+    # Phase 1 SVD via scripts 01-08. See src/data/curation.py.
+    phasef_inputs["train_split"] = str(safety_processed_dir / "train_set.jsonl")
     phasef_inputs["val_split"] = str(safety_processed_dir / "analysis_val_set.jsonl")
     phasef_inputs["train_targets_dir"] = str(
         safety_phase1_output_root / "student_targets" / "student_safe_targets_alignment"
@@ -1800,7 +1883,10 @@ def _make_safety_random_overrides(
     if not isinstance(phasef_raw, dict):
         raise ValueError(f"PhaseF config must be a mapping: {base_phasef}")
     phasef_inputs = phasef_raw.setdefault("inputs", {})
-    phasef_inputs["train_split"] = str(safety_processed_dir / "alignment_set.jsonl")
+    # Phase F trains on the full SFT data (train_set.jsonl). The curated
+    # contrast subset lives in alignment_set.jsonl and is consumed only by
+    # Phase 1 SVD via scripts 01-08. See src/data/curation.py.
+    phasef_inputs["train_split"] = str(safety_processed_dir / "train_set.jsonl")
     phasef_inputs["val_split"] = str(safety_processed_dir / "analysis_val_set.jsonl")
     phasef_inputs["train_targets_dir"] = str(
         safety_phase1_output_root / "student_targets" / "student_safe_targets_alignment"
@@ -1912,6 +1998,14 @@ def _run_safety_random(
         safety_processed_dir=safety_processed_dir,
         safety_phase1_output_root=safety_phase1_output_root,
         safety_phasef_output_root=safety_phasef_output_root,
+    )
+
+    _invoke_phase1_curation(
+        baseline_name=baseline_name,
+        processed_dir=safety_processed_dir,
+        phase1_yaml=phase1_override,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
     )
 
     _run_phase1_precompute(
@@ -2070,6 +2164,14 @@ def _run_safety_sft1(
         safety_processed_dir=safety_processed_dir,
         safety_phase1_output_root=safety_phase1_output_root,
         safety_phasef_output_root=safety_phasef_output_root,
+    )
+
+    _invoke_phase1_curation(
+        baseline_name=baseline_name,
+        processed_dir=safety_processed_dir,
+        phase1_yaml=phase1_override,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
     )
 
     _run_phase1_precompute(

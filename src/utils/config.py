@@ -36,6 +36,11 @@ class Phase1DataConfig:
     max_prompt_chars: int = 2048
     system_prompt: str = "You are a helpful assistant."
     include_system_prompt: bool = True
+    # Phase 1 contrast-set curation knob. ``off`` (default) keeps
+    # alignment_set.jsonl identical to the full train_set.jsonl (legacy PAN
+    # behavior). ``minimal`` and ``strict`` apply length + teacher-confidence
+    # + per-baseline filters via src/data/curation.py.
+    curation_mode: str = "off"
 
 
 @dataclass
