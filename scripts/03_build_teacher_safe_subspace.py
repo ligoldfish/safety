@@ -52,10 +52,28 @@ def parse_args() -> argparse.Namespace:
         "--rank",
         type=int,
         default=16,
-        help="Subspace rank k for the SVD on Δ_l. Default 16 (raised from "
-        "the design doc's initial k=8 placeholder; PAN paper Section 4 "
-        "shows effective rank can reach ~50 at peak layers, so 16 is a "
-        "more representative mid-range choice).",
+        help="Fixed subspace rank k for the SVD on Δ_l, used only when "
+        "--no-effective-rank is set. Default 16.",
+    )
+    parser.add_argument(
+        "--energy-threshold",
+        type=float,
+        default=0.9,
+        help="Per-layer effective-rank energy threshold tau (PAN-inspired, "
+        "default 0.9). Rank = min{r : cumsum(sigma^2)[:r]/sum(sigma^2) >= tau}, "
+        "clamped to [1, --rank-cap]. Applied to the contrast matrix Δ_l "
+        "(PAN-inspired, not PAN §4 verbatim which uses SVD(W-I)).",
+    )
+    parser.add_argument(
+        "--rank-cap",
+        type=int,
+        default=64,
+        help="Upper cap on the per-layer effective rank when --energy-threshold is used. Default 64.",
+    )
+    parser.add_argument(
+        "--no-effective-rank",
+        action="store_true",
+        help="Disable the energy-threshold effective rank and use the fixed --rank instead.",
     )
     parser.add_argument(
         "--no-balance-labels",
@@ -134,6 +152,9 @@ def main() -> None:
         train_label_counts=train_split.label_counts(),
         key_layers=key_layers,
         requested_rank=int(args.rank),
+        effective_rank=not args.no_effective_rank,
+        energy_threshold=float(args.energy_threshold),
+        rank_cap=int(args.rank_cap),
         balance_labels=not args.no_balance_labels,
         normalize_hidden=not args.no_normalize_hidden,
         raw_harmful_count=raw_harmful_count,
@@ -168,6 +189,8 @@ def main() -> None:
             harmful_hidden=train_split.layer_tensors[layer_idx][harmful_mask],
             harmless_hidden=train_split.layer_tensors[layer_idx][harmless_mask],
             k=args.rank,
+            energy_threshold=(None if args.no_effective_rank else float(args.energy_threshold)),
+            rank_cap=int(args.rank_cap),
             normalize_hidden=not args.no_normalize_hidden,
         )
         layer_path = output_root / f"teacher_safe_subspace_layer_{layer_idx:02d}.pt"

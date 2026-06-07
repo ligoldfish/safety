@@ -30,8 +30,8 @@ DEFAULT_MODE: Dict[str, CurationMode] = {
     "safety_tuned_llamas": "off",
     "coconot": "off",
     "hh_rlhf": "off",
-    "beavertails_category": "minimal",
-    "beavertails": "minimal",
+    "beavertails_category": "strict",
+    "beavertails": "strict",
     "tulu3_safety": "off",
     "wildjailbreak": "strict",
     "wildguardmix": "strict",
@@ -62,9 +62,56 @@ def _wgm_pre_filter(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _bt_pre_filter(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """BeaverTails Phase1 consensus filter (Q7), using per-prompt response counts.
+
+    The BT builder labels a prompt harmful via ``category_any`` (any category
+    flag True) and forces missing/empty category -> harmful. That contaminates
+    the harmful pole with benign/borderline prompts and pushes the SVD axis
+    toward "sensitive topic" rather than "harmful intent".
+
+    Here we keep only consensus rows, using the per-prompt-group response
+    safety counts the BT builder writes into ``metadata`` (these survive
+    20_split's metadata passthrough; the top-level ``category`` does not):
+
+    - ``harmful`` kept iff ``prompt_group_unsafe_count > 0`` (at least one
+      response was actually unsafe -> consensus-harmful). This also discards
+      the ``missing-category -> forced harmful`` rows that have no unsafe
+      response.
+    - ``harmless`` kept iff ``prompt_group_safe_count > 0`` (the prompt has a
+      genuine safe response, i.e. it is compliable -> keep, including the
+      over-refusal-bait benigns PAN wants in the harmless pole).
+    - rows lacking the group counts (not from the BT category builder) are
+      dropped from the SVD pool since intent cannot be verified.
+
+    Phase1-only: this runs on the curated alignment subset; ``train_set.jsonl``
+    (Phase F L_out) and the eval test set are untouched.
+    """
+    out: List[Dict[str, Any]] = []
+    for record in records:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        label = str(record.get("label") or "").strip().lower()
+        safe_count = metadata.get("prompt_group_safe_count")
+        unsafe_count = metadata.get("prompt_group_unsafe_count")
+        if safe_count is None or unsafe_count is None:
+            continue
+        try:
+            safe_count = int(safe_count)
+            unsafe_count = int(unsafe_count)
+        except (TypeError, ValueError):
+            continue
+        if label == "harmful" and unsafe_count > 0:
+            out.append(record)
+        elif label == "harmless" and safe_count > 0:
+            out.append(record)
+    return out
+
+
 PRE_FILTERS: Dict[str, Callable[[Sequence[Dict[str, Any]]], List[Dict[str, Any]]]] = {
     "wildjailbreak": _wjb_pre_filter,
     "wildguardmix": _wgm_pre_filter,
+    "beavertails_category": _bt_pre_filter,
+    "beavertails": _bt_pre_filter,
 }
 
 

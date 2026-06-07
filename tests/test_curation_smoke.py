@@ -164,7 +164,7 @@ def test_strict_mode_combines_pre_filter_with_universal():
 def test_resolve_curation_mode_auto_and_explicit():
     assert resolve_curation_mode("wildjailbreak") == "strict"
     assert resolve_curation_mode("pan") == "off"
-    assert resolve_curation_mode("beavertails_category") == "minimal"
+    assert resolve_curation_mode("beavertails_category") == "strict"
     assert resolve_curation_mode("tulu3_safety") == "off"
     assert resolve_curation_mode("hh_rlhf") == "off"
     assert resolve_curation_mode("wildjailbreak", "auto") == "strict"
@@ -179,7 +179,7 @@ def test_default_mode_table_matches_user_decisions():
     assert DEFAULT_MODE["coconot"] == "off"
     assert DEFAULT_MODE["hh_rlhf"] == "off"
     assert DEFAULT_MODE["tulu3_safety"] == "off"
-    assert DEFAULT_MODE["beavertails_category"] == "minimal"
+    assert DEFAULT_MODE["beavertails_category"] == "strict"
     assert DEFAULT_MODE["wildjailbreak"] == "strict"
     assert DEFAULT_MODE["wildguardmix"] == "strict"
 

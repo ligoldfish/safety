@@ -151,12 +151,22 @@ def main() -> None:
 
     injection = inject_lora_modules(
         model,
-        layer_indices=layer_ids,
+        layer_indices=unique_student_layers,  # paired student layers (e.g. [16,18,19]); NOT pair indices
         target_suffixes=cfg.lora.target_modules,
         rank=cfg.lora.rank,
         alpha=cfg.lora.alpha,
         dropout=cfg.lora.dropout,
     )
+    # Guard: LoRA must be injected on the physical student layers that L_layer supervises.
+    # pair indices (layer_ids) are NOT physical layers; reusing them here was a real bug.
+    _supervised_layers = {int(v) for v in pair_to_student_layer.values()}
+    _injected_layers = {int(x) for x in injection.layer_indices}
+    if not _injected_layers >= _supervised_layers:
+        raise ValueError(
+            f"LoRA injected on layers {sorted(_injected_layers)} but L_layer supervises student "
+            f"layers {sorted(_supervised_layers)}; injection must cover the supervised layers. "
+            f"(pair indices are NOT physical layers - use unique_student_layers.)"
+        )
     freeze_non_lora_parameters(model)
     trainable_params, total_params = count_trainable_parameters(model)
 

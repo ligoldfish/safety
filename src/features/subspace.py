@@ -25,6 +25,8 @@ def build_teacher_safe_subspace(
     harmful_hidden: torch.Tensor,
     harmless_hidden: torch.Tensor,
     k: int = 16,
+    energy_threshold: float | None = None,
+    rank_cap: int = 64,
     normalize_hidden: bool = False,
     eps: float = 1e-12,
 ) -> SafeSubspaceResult:
@@ -41,6 +43,19 @@ def build_teacher_safe_subspace(
       of ``V``), so ``basis.T @ basis = I_k`` (orthonormal). It defines the
       *delta safety subspace*, i.e., the subspace of harmful-vs-harmless
       differences — it is NOT "the pure mean_diff direction".
+
+    Rank selection:
+
+    - If ``energy_threshold`` (tau) is ``None``, the rank is the fixed ``k``
+      (clamped to the available rank).
+    - If ``energy_threshold`` is set, the rank is a per-layer *effective rank*:
+      the smallest ``r`` whose cumulative singular-value energy reaches ``tau``
+      (``min{ r : cumsum(sigma^2)[:r] / sum(sigma^2) >= tau }``), clamped to
+      ``[1, rank_cap]``. This is a PAN-inspired energy-threshold criterion;
+      note PAN defines effective rank on ``SVD(W - I)`` (the fitted residual
+      map), whereas here it is applied to the contrast matrix ``Delta_l`` — so
+      it is "PAN-inspired", not PAN §4 verbatim. Early/low-rank layers shrink
+      to 1-2 dims automatically; mid-late layers grow toward ``rank_cap``.
 
     We additionally persist ``harmful_mean`` and ``harmless_mean`` so that
     downstream scripts (``06`` projection, ``07`` semantic decomposition) can
@@ -64,10 +79,18 @@ def build_teacher_safe_subspace(
     delta = harmful_hidden - harmless_mean
 
     _, singular_values, vh = torch.linalg.svd(delta, full_matrices=False)
-    rank = max(1, min(int(k), int(vh.size(0))))
-    basis = vh[:rank].T.contiguous()
+    max_rank = int(vh.size(0))
     energy = singular_values.pow(2)
     total_energy = energy.sum().clamp_min(1e-12)
+    if energy_threshold is not None:
+        # Per-layer effective rank: smallest r whose cumulative energy reaches tau.
+        cum_ratio = torch.cumsum(energy, dim=0) / total_energy
+        reached = int((cum_ratio < float(energy_threshold)).sum().item()) + 1
+        cap = max(1, min(int(rank_cap), max_rank))
+        rank = max(1, min(reached, cap))
+    else:
+        rank = max(1, min(int(k), max_rank))
+    basis = vh[:rank].T.contiguous()
     explained_ratio_topk = energy[:rank] / total_energy
 
     return SafeSubspaceResult(
