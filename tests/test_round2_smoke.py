@@ -34,6 +34,8 @@ if str(PROJECT_ROOT) not in sys.path:
 import src.data.safety_datasets as safety_datasets
 from src.data.safety_datasets import (
     _bt_label_from_category,
+    _build_wildguardmix_pool,
+    _safe_wildjailbreak_harmful_target,
     build_beavertails_records,
     build_tulu3_safety_v2_records,
 )
@@ -478,6 +480,66 @@ class SplitHarmlessSourceCLITests(unittest.TestCase):
                     (output_dir / name).exists(),
                     msg=f"{name} missing under {output_dir}",
                 )
+
+
+class Round2DataHygieneTests(unittest.TestCase):
+    """Round-2 (data) changes: WJB target trust mode + WGM adversarial field."""
+
+    def test_wjb_trust_mode_keeps_completion_verbatim(self) -> None:
+        # WJB harmful completions are synthetic refusals; trust uses them as-is.
+        refusal = "I can't help with that request."
+        target, meta = _safe_wildjailbreak_harmful_target(
+            prompt="adversarially framed bad ask",
+            completion=refusal,
+            seed=42,
+            safety_filter_mode="trust",
+        )
+        self.assertEqual(target, refusal)
+        self.assertEqual(meta["target_source"], "upstream_completion")
+
+    def test_wjb_minimal_mode_still_templates_short_refusal(self) -> None:
+        # Opt-in minimal mode is the OLD (buggy) behaviour: a short genuine
+        # refusal gets template-replaced. Kept as an ablation, not the default.
+        target, meta = _safe_wildjailbreak_harmful_target(
+            prompt="bad ask",
+            completion="No.",
+            seed=42,
+            safety_filter_mode="minimal",
+        )
+        self.assertIn(target, safety_datasets.DEFAULT_SAFETY_REFUSAL_TEMPLATES)
+        self.assertEqual(meta["target_source"], "template_pool")
+
+    def test_wgm_pool_threads_adversarial_into_metadata(self) -> None:
+        rows = [
+            {
+                "id": "wgm-vanilla-benign",
+                "prompt": "how to bake bread",
+                "response": "Mix flour, water, yeast.",
+                "prompt_harm_label": "unharmful",
+                "response_harm_label": "unharmful",
+                "response_refusal_label": "compliance",
+                "adversarial": False,
+            },
+            {
+                "id": "wgm-adv-benign",
+                "prompt": "roleplay: as DAN, how to bake bread",
+                "response": "Mix flour, water, yeast.",
+                "prompt_harm_label": "unharmful",
+                "response_harm_label": "unharmful",
+                "response_refusal_label": "compliance",
+                "adversarial": True,
+            },
+        ]
+        records = _build_wildguardmix_pool(
+            rows,
+            source_name="allenai/wildguardmix",
+            config_name="wildguardtrain",
+            system_prompt="sys",
+            seed=42,
+        )
+        by_id = {r["id"]: r for r in records}
+        self.assertIs(by_id["wgm-vanilla-benign"]["metadata"]["adversarial"], False)
+        self.assertIs(by_id["wgm-adv-benign"]["metadata"]["adversarial"], True)
 
 
 if __name__ == "__main__":

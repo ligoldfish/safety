@@ -368,6 +368,9 @@ def _build_new_dataset_test(
                 train_subset_mode=True,
                 max_train_samples=20000,
                 max_train_samples_per_label=10000,
+                # Round-2: WJB evaluates on its OWN native eval split, not the
+                # shared WildGuardTest. WGM (below) keeps WildGuardTest.
+                use_native_eval=True,
                 **common,
             )
         elif baseline == "wildguardmix":

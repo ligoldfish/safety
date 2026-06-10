@@ -1066,6 +1066,59 @@ def _build_wildguardtest_eval_pool(
     return records
 
 
+def _build_wildjailbreak_native_eval_pool(
+    *,
+    system_prompt: str,
+    cache_dir: Optional[str] = None,
+    drops: Optional[Dict[str, int]] = None,
+) -> List[Dict[str, Any]]:
+    """Load WildJailbreak's OWN native ``eval`` split as the OR/HR test pool.
+
+    Native WJB eval is ~2000 adversarial-harmful + 210 harmless (9.5% harmless),
+    so OR here is measured on only ~210 prompts and is noisier / runs higher
+    than on the balanced WildGuardTest. Opt-in via
+    ``build_wildjailbreak_records(use_native_eval=True)``; the default eval pool
+    stays WildGuardTest (see ``_build_wildguardtest_eval_pool``) so WGM and every
+    other caller keep the balanced-OR behaviour.
+    """
+    from src.data.safety_eval_datasets import load_wildjailbreak_eval
+
+    drop_counts = drops if drops is not None else {}
+    examples = load_wildjailbreak_eval(cache_dir=cache_dir)
+    records: List[Dict[str, Any]] = []
+    for ex in examples:
+        prompt = (ex.prompt or "").strip()
+        if not prompt:
+            drop_counts["wjbeval_missing_prompt"] = (
+                drop_counts.get("wjbeval_missing_prompt", 0) + 1
+            )
+            continue
+        raw_label = _normalize_raw_label(ex.label)
+        label = _classify_wildjailbreak_data_type(raw_label)
+        if label not in {"harmful", "harmless"}:
+            drop_counts["wjbeval_unknown_data_type"] = (
+                drop_counts.get("wjbeval_unknown_data_type", 0) + 1
+            )
+            continue
+        records.append(
+            _build_binary_record(
+                record_id=f"wildjailbreak_eval_{ex.sample_id}",
+                prompt=prompt,
+                target="",
+                label=label,
+                raw_label=raw_label,
+                source=ex.source or "allenai/wildjailbreak:eval",
+                dataset="wildjailbreak_eval",
+                system_prompt=system_prompt,
+                metadata={
+                    "wjbeval_tactic": ex.category,
+                    "wjbeval_data_type": raw_label,
+                },
+            )
+        )
+    return records
+
+
 def _build_wildjailbreak_pool(
     rows: Iterable[Dict[str, Any]],
     *,
@@ -1075,7 +1128,7 @@ def _build_wildjailbreak_pool(
     seed: int,
     for_eval: bool = False,
     drops: Optional[Dict[str, int]] = None,
-    safety_filter_mode: str = "minimal",
+    safety_filter_mode: str = "trust",
 ) -> List[Dict[str, Any]]:
     seen: set[str] = set()
     records: List[Dict[str, Any]] = []
@@ -1147,26 +1200,35 @@ def build_wildjailbreak_records(
     max_eval_samples_per_label: int = 0,
     eval_output_path: str | Path | None = None,
     seed: int = 42,
-    safety_filter_mode: str = "minimal",
+    safety_filter_mode: str = "trust",
+    use_native_eval: bool = False,
 ) -> List[Dict[str, Any]]:
     """Build WildJailbreak SFT corpus following Jiang et al. 2024 recipe.
 
     ``safety_filter_mode`` controls how harmful-side WJB ``completion`` fields
     are vetted before being used as SFT targets:
 
-      - ``"trust"``: use the WJB completion verbatim (paper recipe; matches
-        Tülu 2 / Llama Guard 2 usage). 0% pool fallback.
-      - ``"minimal"`` (default): drop completion only if empty, < 20 tokens,
-        or opens with one of a small list of explicit jailbreak-success
-        markers (``Sure! Here's...``, ``Step 1:`` ...). ~5-10% pool fallback.
+      - ``"trust"`` (default): use the WJB completion verbatim (paper recipe;
+        matches Tülu 2 / Llama Guard 2 usage). 0% pool fallback. WJB harmful
+        completions are *synthetic refusals*, so trusting them is correct.
+      - ``"minimal"``: drop completion only if empty, < 20 tokens, or opens
+        with one of a small list of explicit jailbreak-success markers
+        (``Sure! Here's...``, ``Step 1:`` ...). ~5-10% pool fallback. OPT-IN
+        only — wrongly template-replaces short genuine refusals.
       - ``"strict"``: legacy behaviour — run ``judge_harmful_response_safety``
         and reject any ``ambiguous_non_refusal`` verdict. ~30% pool fallback
         on real WJB data; over-aggressive (false-positive heavy).
 
-    Default switched from ``"strict"`` to ``"minimal"`` on 2026-05-31 after
-    measuring 32% pool fallback rate on real WJB data, which collapses target
-    diversity to 8 templates and inflates over-refusal (model overlearns
-    pool style and triggers refusal classifier on any output).
+    Default switched ``"strict"`` -> ``"minimal"`` (2026-05-31) -> ``"trust"``
+    (round-2): WJB completions are synthetic refusals, so the minimal-mode
+    <20-token / jailbreak-marker fallbacks were template-replacing real
+    refusals, collapsing target diversity to 8 templates and inflating
+    over-refusal. Trust uses the upstream refusal verbatim.
+
+    ``use_native_eval``: when ``True`` and ``eval_output_path`` is set, the
+    eval split is WJB's OWN native ``allenai/wildjailbreak:eval`` split rather
+    than the balanced WildGuardTest. Default ``False`` keeps WildGuardTest
+    (the 2026-05-31 balanced-OR behaviour) for every other caller.
     """
     drops: Dict[str, int] = {}
     train_pool = _build_wildjailbreak_pool(
@@ -1206,22 +1268,35 @@ def build_wildjailbreak_records(
     test_source = ""
     test_fallback_reason = ""
     if eval_output_path:
-        # Switched (2026-05-31) from WildJailbreak's own ``eval`` split
-        # (2000 harmful + 210 harmless, 9.5% harmless — too skewed for OR
-        # measurement) to Anthropic WildGuardTest (1.7k balanced) so the OR
-        # number is comparable to SafetyChat / Llama Guard 2 / Tülu 3 papers
-        # and is statistically meaningful on the harmless side.
+        # Default eval pool = Anthropic WildGuardTest (1.7k balanced), switched
+        # in 2026-05-31 from WJB's own skewed eval split so OR is comparable to
+        # SafetyChat / Llama Guard 2 / Tülu 3. ``use_native_eval=True`` opts back
+        # into WJB's native ``eval`` split (2000 harmful + 210 harmless, 9.5%
+        # harmless) — faithful to WJB's distribution but OR is noisier (measured
+        # on ~210 harmless). WGM and other callers keep the default.
         try:
-            eval_pool = _build_wildguardtest_eval_pool(
-                system_prompt=system_prompt,
-                cache_dir=cache_dir,
-                drops=drops,
-            )
-            if len({r["label"] for r in eval_pool}) < 2:
-                raise RuntimeError(
-                    "WildGuardTest did not yield both labels after filters."
+            if use_native_eval:
+                eval_pool = _build_wildjailbreak_native_eval_pool(
+                    system_prompt=system_prompt,
+                    cache_dir=cache_dir,
+                    drops=drops,
                 )
-            test_source = "allenai/wildguardmix:wildguardtest"
+                if len({r["label"] for r in eval_pool}) < 2:
+                    raise RuntimeError(
+                        "WildJailbreak native eval did not yield both labels."
+                    )
+                test_source = "allenai/wildjailbreak:eval"
+            else:
+                eval_pool = _build_wildguardtest_eval_pool(
+                    system_prompt=system_prompt,
+                    cache_dir=cache_dir,
+                    drops=drops,
+                )
+                if len({r["label"] for r in eval_pool}) < 2:
+                    raise RuntimeError(
+                        "WildGuardTest did not yield both labels after filters."
+                    )
+                test_source = "allenai/wildguardmix:wildguardtest"
         except Exception as exc:
             # Fallback: hold out from train_pool. Logged so reviewers can see.
             test_fallback_reason = _format_fallback_reason(exc)
@@ -1345,10 +1420,16 @@ def _build_wildguardmix_pool(
         response = str(row.get("response", "") or row.get("completion", "") or "").strip()
         response_harm = _normalize_raw_label(row.get("response_harm_label"))
         response_refusal = _normalize_raw_label(row.get("response_refusal_label"))
+        # Upstream wildguardtrain ships a native ``adversarial`` bool (vanilla vs
+        # jailbreak-styled). Thread it into metadata so Phase1 curation can build
+        # a vanilla-only SVD contrast (see curation._wgm_pre_filter). Default
+        # False so a missing field reads as vanilla rather than silently empties.
+        adversarial = bool(row.get("adversarial", False))
         metadata = {
             "prompt_harm_label": raw_label,
             "response_harm_label": response_harm,
             "response_refusal_label": response_refusal,
+            "adversarial": adversarial,
             "source_config": config_name,
         }
         if not response and not for_eval:

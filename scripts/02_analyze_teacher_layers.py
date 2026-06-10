@@ -46,9 +46,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--top-k",
         type=int,
-        default=7,
-        help="How many teacher key layers to keep (raised 3->7 per sweep axis G; "
-        "flows through to 7 pairs -> up to 7 unique student layers -> LoRA on them).",
+        default=5,
+        help="How many teacher key layers to keep (5 per round-2 retune; sweep "
+        "axis G tested {1,5,7}; flows through to <=5 pairs -> up to 5 unique "
+        "student layers -> LoRA on them).",
     )
     parser.add_argument(
         "--train-max-samples-per-label",

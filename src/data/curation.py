@@ -50,6 +50,21 @@ def _wjb_pre_filter(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _wgm_pre_filter(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """WildGuardMix Phase1 prefilter: clean labels + vanilla-only contrast.
+
+    Keeps only rows with a usable ``prompt_harm_label`` and
+    ``response_refusal_label``, AND restricts to ``adversarial == False``
+    (vanilla) on BOTH poles. Holding the jailbreak style constant across the
+    harmful and harmless poles makes the SVD contrast an *intent* axis rather
+    than a *style* axis (mirrors ``_wjb_pre_filter`` vanilla-only). The upstream
+    ``adversarial`` bool is threaded into metadata by the WGM builder. A missing
+    field reads as vanilla (kept) so a threading regression fails open rather
+    than silently emptying the alignment set; 19b logs ``pre_filter_dropped`` so
+    an unexpectedly large drop is visible.
+
+    Phase1-only: runs on the curated alignment subset; ``train_set.jsonl``
+    (Phase F L_out) and the eval test set are untouched.
+    """
     keep_prompt_labels = {"harmful", "unharmful"}
     keep_refusal_labels = {"refusal", "compliance"}
     out: List[Dict[str, Any]] = []
@@ -57,7 +72,12 @@ def _wgm_pre_filter(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         prompt_label = str(metadata.get("prompt_harm_label") or "").strip().lower()
         refusal_label = str(metadata.get("response_refusal_label") or "").strip().lower()
-        if prompt_label in keep_prompt_labels and refusal_label in keep_refusal_labels:
+        adversarial = bool(metadata.get("adversarial", False))
+        if (
+            prompt_label in keep_prompt_labels
+            and refusal_label in keep_refusal_labels
+            and not adversarial
+        ):
             out.append(record)
     return out
 
@@ -172,48 +192,23 @@ def _length_filter(
     return kept, dropped
 
 
-def _confidence_filter(
-    records: Sequence[Dict[str, Any]],
-    *,
-    confidence_min: float,
-    confidence_key: str = "teacher_first_gen_top1_prob",
-) -> Tuple[List[Dict[str, Any]], int, int]:
-    """Filter on the teacher confidence metadata field.
-
-    Returns: (kept, dropped_low_conf, missing_conf). Records missing the
-    field are kept (treated as 1.0 fallback) so callers that opt out of
-    the teacher forward pass still get a working pipeline; missing count
-    is surfaced in the summary.
-    """
-
-    kept: List[Dict[str, Any]] = []
-    dropped = 0
-    missing = 0
-    for record in records:
-        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-        if confidence_key not in metadata:
-            missing += 1
-            kept.append(record)
-            continue
-        try:
-            conf = float(metadata[confidence_key])
-        except (TypeError, ValueError):
-            missing += 1
-            kept.append(record)
-            continue
-        if conf >= confidence_min:
-            kept.append(record)
-        else:
-            dropped += 1
-    return kept, dropped, missing
-
-
 def _stratified_sample(
     records: Sequence[Dict[str, Any]],
     *,
     n_per_side: int,
     seed: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Balance + cap the curated pool to <= ``n_per_side`` records per polarity.
+
+    This is the *balance* step of curation: it stratifies by binary ``label``
+    (harmful / harmless) and independently samples up to ``n_per_side`` from
+    each side, so the alignment set feeding the SVD contrast is class-balanced
+    (default cap 2500/side -> <=5000 total). Deterministic: each polarity is
+    shuffled with ``random.Random(seed + offset)`` and the merged set with
+    ``random.Random(seed + 17)``, so the same input + seed always yields the
+    same subset. ``n_per_side`` is a balance cap, not a quality filter — sides
+    with fewer than ``n_per_side`` rows are taken whole.
+    """
     by_label: Dict[str, List[Dict[str, Any]]] = {"harmful": [], "harmless": []}
     for record in records:
         label = str(record.get("label", "")).strip().lower()
@@ -239,7 +234,6 @@ def curate_phase1_subset(
     mode: CurationMode,
     tokenizer: Any = None,
     n_per_side: int = 2500,
-    confidence_min: float = 0.7,
     length_min: int = 5,
     length_max: int = 500,
     seed: int = 2042,
@@ -248,14 +242,15 @@ def curate_phase1_subset(
 
     Pipeline by mode:
       * off    — identity. alignment_set == train_set.
-      * minimal — length filter + teacher-confidence filter + stratified sample.
-      * strict — per-baseline pre-filter, then minimal pipeline.
+      * minimal — length-filter hygiene + stratified-sample balance.
+      * strict — per-baseline native pre-filter, then minimal pipeline.
 
-    The teacher confidence field is consumed from ``record.metadata
-    [teacher_first_gen_top1_prob]``; populating that field is the job of
-    ``src/data/teacher_confidence.py`` and is opt-out (no teacher forward
-    in ``off`` mode). Records missing the field are kept (treated as
-    full confidence) so unit tests do not require a real teacher model.
+    Round-2: the teacher-confidence filter (>=0.7 on
+    ``teacher_first_gen_top1_prob``) was removed — its magic threshold plus
+    "missing field -> keep" behaviour was inconsistent with the length
+    filter's "uncomputable -> drop", and it added a teacher-forward dependency
+    for marginal benefit. Curation now keeps only the native per-baseline
+    pre-filter (intent hygiene) + length-bound hygiene + the balance step.
     """
 
     mode = str(mode or "off").strip().lower()
@@ -269,12 +264,9 @@ def curate_phase1_subset(
         "input_label_counts": _label_counts(records),
         "pre_filter_dropped": 0,
         "length_dropped": 0,
-        "confidence_dropped": 0,
-        "confidence_missing": 0,
         "stratified_final_counts": {},
         "params": {
             "n_per_side": int(n_per_side),
-            "confidence_min": float(confidence_min),
             "length_min": int(length_min),
             "length_max": int(length_max),
             "seed": int(seed),
@@ -302,13 +294,6 @@ def curate_phase1_subset(
         max_tokens=int(length_max),
     )
     summary["length_dropped"] = len_dropped
-
-    pipeline, conf_dropped, conf_missing = _confidence_filter(
-        pipeline,
-        confidence_min=float(confidence_min),
-    )
-    summary["confidence_dropped"] = conf_dropped
-    summary["confidence_missing"] = conf_missing
 
     sampled, final_counts = _stratified_sample(
         pipeline,

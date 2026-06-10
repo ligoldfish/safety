@@ -4,13 +4,15 @@ Reads ``<processed_dir>/train_set.jsonl`` (full safety SFT data) and
 writes ``<processed_dir>/alignment_set.jsonl`` (curated harmful/harmless
 subset, ≤ 5k rows) along with ``curation_summary.json``.
 
-Pipeline:
-    1. Pre-filter (mode=strict, per-baseline; e.g. WJB drops adversarial_*).
+Pipeline (round-2: teacher-confidence annotation + filter removed):
+    1. Pre-filter (mode=strict, per-baseline; e.g. WJB/WGM keep vanilla only).
     2. Universal length filter (prompt token count ∈ [length_min, length_max]).
-    3. Teacher confidence annotation (Qwen3.5-9B first-gen-token top-1 prob)
-       — opt-out via ``--skip-teacher-confidence`` for offline / smoke runs.
-    4. Confidence filter (≥ confidence_min).
-    5. Stratified sample to n_per_side per label.
+    3. Stratified sample to n_per_side per label (the balance step).
+
+The teacher-confidence filter (>=0.7) was dropped: its magic threshold +
+"missing -> keep" behaviour was inconsistent with the length filter, and the
+annotation forward pass it required is no longer run. Curation is now native
+pre-filter + length hygiene + balance only.
 
 For ``mode=off``, the script copies ``train_set.jsonl`` → ``alignment_set.jsonl``
 byte-identically and skips the teacher forward entirely.
@@ -71,7 +73,6 @@ def parse_args() -> argparse.Namespace:
         help="Curation mode. 'auto' (default) looks up DEFAULT_MODE per baseline.",
     )
     parser.add_argument("--n-per-side", type=int, default=2500)
-    parser.add_argument("--confidence-min", type=float, default=0.7)
     parser.add_argument("--length-min", type=int, default=5)
     parser.add_argument("--length-max", type=int, default=500)
     parser.add_argument("--seed", type=int, default=2042)
@@ -111,59 +112,6 @@ def parse_args() -> argparse.Namespace:
         help="Filename to write the curated subset to.",
     )
     return parser.parse_args()
-
-
-def _maybe_annotate_confidence(
-    records: List[Dict[str, Any]],
-    args: argparse.Namespace,
-) -> None:
-    if args.skip_teacher_confidence:
-        print("[19b] Skipping teacher confidence annotation (--skip-teacher-confidence).")
-        return
-    if not args.teacher_path:
-        raise ValueError(
-            "Teacher confidence annotation requires --teacher-path (or set "
-            "--skip-teacher-confidence to opt out)."
-        )
-    from src.data.teacher_confidence import (
-        annotate_teacher_confidence,
-        load_teacher_for_confidence,
-    )
-
-    print(f"[19b] Loading teacher: {args.teacher_path}")
-    tokenizer, model = load_teacher_for_confidence(
-        args.teacher_path,
-        device_map=args.device_map,
-        torch_dtype=args.torch_dtype,
-        runtime_backend=args.runtime_backend,
-        runtime_device=args.runtime_device,
-        attn_implementation=args.attn_implementation,
-    )
-
-    def _progress(done: int, total: int) -> None:
-        print(f"[19b] teacher-confidence: {done}/{total}")
-
-    annotate_teacher_confidence(
-        records,
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=int(args.batch_size),
-        max_length=int(args.max_length),
-        progress_callback=_progress,
-    )
-    # Best-effort cleanup; non-fatal if backend doesn't expose empty_cache.
-    try:
-        del model
-    except Exception:
-        pass
-    try:
-        import torch
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if hasattr(torch, "npu") and torch.npu.is_available():
-            torch.npu.empty_cache()
-    except Exception:
-        pass
 
 
 def main() -> None:
@@ -240,7 +188,8 @@ def main() -> None:
 
     tokenizer_for_length: Any = None
     if mode != "off":
-        _maybe_annotate_confidence(records, args)
+        # Round-2: teacher-confidence annotation removed with the conf filter.
+        # The tokenizer is still loaded for the length filter only.
         if args.teacher_path and not args.skip_teacher_confidence:
             from transformers import AutoTokenizer
 
@@ -261,7 +210,6 @@ def main() -> None:
         mode=mode,
         tokenizer=tokenizer_for_length,
         n_per_side=int(args.n_per_side),
-        confidence_min=float(args.confidence_min),
         length_min=int(args.length_min),
         length_max=int(args.length_max),
         seed=int(args.seed),
@@ -294,12 +242,6 @@ def main() -> None:
             f"harmful={harmful_n}, harmless={harmless_n}); "
             f"Phase 1 SVD may be unstable below {warn_threshold} samples.",
             file=sys.stderr,
-        )
-
-    if mode != "off" and not args.skip_teacher_confidence and summary["confidence_missing"] > 0:
-        raise RuntimeError(
-            f"Teacher confidence missing for {summary['confidence_missing']} records "
-            f"in mode={mode} — annotation pass failed. Re-run with --force-rebuild."
         )
 
     write_jsonl(alignment_path, curated)

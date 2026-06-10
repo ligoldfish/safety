@@ -1,8 +1,9 @@
 """Smoke tests for src/data/curation.py.
 
-No teacher model is loaded — tests pre-populate
-``metadata.teacher_first_gen_top1_prob`` directly so the curation
-pipeline is exercised end-to-end without depending on transformers.
+No teacher model is loaded. Round-2: the teacher-confidence filter was
+removed, so curation is now native pre-filter + length hygiene + balance.
+The ``teacher_conf`` field on test records is ignored by the pipeline and
+kept only to avoid churning every call site.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ def _record(
     data_type: str = "",
     prompt_harm_label: str = "",
     response_refusal_label: str = "",
+    adversarial: bool | None = None,
     teacher_conf: float | None = None,
 ) -> dict:
     metadata: dict = {}
@@ -40,6 +42,8 @@ def _record(
         metadata["prompt_harm_label"] = prompt_harm_label
     if response_refusal_label:
         metadata["response_refusal_label"] = response_refusal_label
+    if adversarial is not None:
+        metadata["adversarial"] = bool(adversarial)
     if teacher_conf is not None:
         metadata["teacher_first_gen_top1_prob"] = float(teacher_conf)
     return {
@@ -79,7 +83,20 @@ def test_wgm_pre_filter_drops_ambiguous():
         _record("d", "harmless", "x", prompt_harm_label="unharmful", response_refusal_label="other", teacher_conf=0.9),
     ]
     kept = PRE_FILTERS["wildguardmix"](records)
+    # Missing ``adversarial`` field reads as vanilla -> kept (fail-open).
     assert {r["id"] for r in kept} == {"a", "b"}
+
+
+def test_wgm_pre_filter_keeps_vanilla_drops_adversarial():
+    records = [
+        _record("vh", "harmful", "x", prompt_harm_label="harmful", response_refusal_label="refusal", adversarial=False),
+        _record("vb", "harmless", "x", prompt_harm_label="unharmful", response_refusal_label="compliance", adversarial=False),
+        _record("ah", "harmful", "x", prompt_harm_label="harmful", response_refusal_label="refusal", adversarial=True),
+        _record("ab", "harmless", "x", prompt_harm_label="unharmful", response_refusal_label="compliance", adversarial=True),
+    ]
+    kept = PRE_FILTERS["wildguardmix"](records)
+    # Vanilla-only contrast: adversarial-styled rows dropped on BOTH poles.
+    assert {r["id"] for r in kept} == {"vh", "vb"}
 
 
 def test_length_filter_excludes_too_short_and_too_long():
@@ -103,25 +120,6 @@ def test_length_filter_excludes_too_short_and_too_long():
     assert summary["length_dropped"] == 2
 
 
-def test_confidence_filter_drops_below_threshold():
-    records = [
-        _record("hi_conf_h", "harmful", "decent prompt length here ok for tests", teacher_conf=0.95),
-        _record("lo_conf_h", "harmful", "decent prompt length here ok for tests", teacher_conf=0.3),
-        _record("hi_conf_b", "harmless", "decent prompt length here ok for tests", teacher_conf=0.85),
-        _record("lo_conf_b", "harmless", "decent prompt length here ok for tests", teacher_conf=0.4),
-    ]
-    curated, summary = curate_phase1_subset(
-        records,
-        baseline_name="beavertails_category",
-        mode="minimal",
-        confidence_min=0.7,
-        n_per_side=10,
-    )
-    ids = {r["id"] for r in curated}
-    assert ids == {"hi_conf_h", "hi_conf_b"}
-    assert summary["confidence_dropped"] == 2
-
-
 def test_stratified_sample_caps_per_side():
     records = []
     for i in range(50):
@@ -143,22 +141,22 @@ def test_stratified_sample_caps_per_side():
 
 def test_strict_mode_combines_pre_filter_with_universal():
     records = [
-        _record("v1", "harmful", "decent prompt content here for tests", data_type="vanilla_harmful", teacher_conf=0.9),
-        _record("v2", "harmless", "decent prompt content here for tests", data_type="vanilla_benign", teacher_conf=0.9),
-        _record("a1", "harmful", "decent prompt content here for tests", data_type="adversarial_harmful", teacher_conf=0.99),
-        _record("lc", "harmful", "decent prompt content here for tests", data_type="vanilla_harmful", teacher_conf=0.3),
+        _record("v1", "harmful", "decent prompt content here for tests", data_type="vanilla_harmful"),
+        _record("v2", "harmless", "decent prompt content here for tests", data_type="vanilla_benign"),
+        _record("a1", "harmful", "decent prompt content here for tests", data_type="adversarial_harmful"),
+        _record("tooshort", "harmful", "hi", data_type="vanilla_harmful"),
     ]
     curated, summary = curate_phase1_subset(
         records,
         baseline_name="wildjailbreak",
         mode="strict",
         n_per_side=10,
-        confidence_min=0.7,
     )
     ids = {r["id"] for r in curated}
+    # strict = native pre-filter (drops adversarial a1) + length (drops tooshort).
     assert ids == {"v1", "v2"}
     assert summary["pre_filter_dropped"] == 1
-    assert summary["confidence_dropped"] == 1
+    assert summary["length_dropped"] == 1
 
 
 def test_resolve_curation_mode_auto_and_explicit():
@@ -193,20 +191,3 @@ def test_unknown_mode_raises():
 
 def test_valid_modes_constant_complete():
     assert set(VALID_MODES) == {"off", "minimal", "strict"}
-
-
-def test_records_missing_confidence_are_kept_with_missing_count():
-    records = [
-        _record("a", "harmful", "decent prompt content here for tests", teacher_conf=0.9),
-        _record("b", "harmless", "decent prompt content here for tests"),  # no teacher_conf
-    ]
-    curated, summary = curate_phase1_subset(
-        records,
-        baseline_name="beavertails_category",
-        mode="minimal",
-        n_per_side=10,
-    )
-    ids = {r["id"] for r in curated}
-    assert ids == {"a", "b"}
-    assert summary["confidence_missing"] == 1
-    assert summary["confidence_dropped"] == 0

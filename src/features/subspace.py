@@ -26,7 +26,7 @@ def build_teacher_safe_subspace(
     harmless_hidden: torch.Tensor,
     k: int = 16,
     energy_threshold: float | None = None,
-    rank_cap: int = 64,
+    rank_cap: int = 32,
     normalize_hidden: bool = False,
     eps: float = 1e-12,
 ) -> SafeSubspaceResult:

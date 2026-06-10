@@ -62,7 +62,7 @@ optim:
 distill:
   temperature: 2.0
   hard_loss_weight: 0.5
-  soft_loss_weight: 0.5
+  soft_loss_weight: 0.35
 output:
   output_root: ../outputs/baselines/distill_qwen35_9b_to_08b_coconot_npu
 training:

@@ -58,17 +58,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--energy-threshold",
         type=float,
-        default=0.9,
+        default=0.8,
         help="Per-layer effective-rank energy threshold tau (PAN-inspired, "
-        "default 0.9). Rank = min{r : cumsum(sigma^2)[:r]/sum(sigma^2) >= tau}, "
+        "default 0.8 per round-2 retune). Rank = min{r : cumsum(sigma^2)[:r]/sum(sigma^2) >= tau}, "
         "clamped to [1, --rank-cap]. Applied to the contrast matrix Δ_l "
         "(PAN-inspired, not PAN §4 verbatim which uses SVD(W-I)).",
     )
     parser.add_argument(
         "--rank-cap",
         type=int,
-        default=64,
-        help="Upper cap on the per-layer effective rank when --energy-threshold is used. Default 64.",
+        default=32,
+        help="Upper cap on the per-layer effective rank when --energy-threshold is used. Default 32.",
     )
     parser.add_argument(
         "--no-effective-rank",
