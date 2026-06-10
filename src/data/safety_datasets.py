@@ -1201,7 +1201,7 @@ def build_wildjailbreak_records(
     eval_output_path: str | Path | None = None,
     seed: int = 42,
     safety_filter_mode: str = "trust",
-    use_native_eval: bool = False,
+    use_native_eval: bool = True,
 ) -> List[Dict[str, Any]]:
     """Build WildJailbreak SFT corpus following Jiang et al. 2024 recipe.
 
@@ -1225,10 +1225,12 @@ def build_wildjailbreak_records(
     refusals, collapsing target diversity to 8 templates and inflating
     over-refusal. Trust uses the upstream refusal verbatim.
 
-    ``use_native_eval``: when ``True`` and ``eval_output_path`` is set, the
-    eval split is WJB's OWN native ``allenai/wildjailbreak:eval`` split rather
-    than the balanced WildGuardTest. Default ``False`` keeps WildGuardTest
-    (the 2026-05-31 balanced-OR behaviour) for every other caller.
+    ``use_native_eval``: when ``True`` (round-2 default) and ``eval_output_path``
+    is set, the eval split is WJB's OWN native ``allenai/wildjailbreak:eval``
+    split rather than the balanced WildGuardTest. Default is ``True`` so EVERY
+    rebuild (script 21 AND 19_prepare_safety_data's --force-rebuild) produces the
+    native test — otherwise a force-rebuild would clobber 21's native jsonl back
+    to WildGuardTest. Pass ``False`` only to deliberately restore WildGuardTest.
     """
     drops: Dict[str, int] = {}
     train_pool = _build_wildjailbreak_pool(
@@ -1268,12 +1270,11 @@ def build_wildjailbreak_records(
     test_source = ""
     test_fallback_reason = ""
     if eval_output_path:
-        # Default eval pool = Anthropic WildGuardTest (1.7k balanced), switched
-        # in 2026-05-31 from WJB's own skewed eval split so OR is comparable to
-        # SafetyChat / Llama Guard 2 / Tülu 3. ``use_native_eval=True`` opts back
-        # into WJB's native ``eval`` split (2000 harmful + 210 harmless, 9.5%
-        # harmless) — faithful to WJB's distribution but OR is noisier (measured
-        # on ~210 harmless). WGM and other callers keep the default.
+        # Round-2 default: WJB's native ``eval`` split (2000 harmful + 210
+        # harmless, 9.5% harmless) — faithful to WJB's distribution; OR noisier
+        # (~210 harmless). Default True so a --force-rebuild does not clobber the
+        # native test back to WildGuardTest. Pass use_native_eval=False to
+        # restore the balanced WildGuardTest (1.7k) explicitly.
         try:
             if use_native_eval:
                 eval_pool = _build_wildjailbreak_native_eval_pool(
