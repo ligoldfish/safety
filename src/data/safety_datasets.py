@@ -3156,6 +3156,47 @@ def _build_coconot(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
     )
 
 
+def _build_c5(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
+    """C5 dual-pole: HarmfulQA (native blue refusals) + No Robots (native helpful).
+
+    Harmful prompts/refusals come from ``source_name`` (default
+    ``declare-lab/HarmfulQA``): the bare ``question`` is the prompt and the refusal
+    target is mined from that row's ``blue_conversations``. Benign prompt+response
+    pairs come from ``repo_or_data_path`` (default ``HuggingFaceH4/no_robots``).
+    The balanced train split is written to ``output_path`` and the held-out test
+    split to ``eval_output_path`` (PAN-format). See ``src/data/c5_dataset.py``.
+    """
+    from datasets import load_dataset  # type: ignore[import-not-found]
+
+    from src.data.c5_dataset import build_c5_dataset
+
+    cache = spec.cache_dir or None
+    harmful = list(
+        load_dataset(spec.source_name or "declare-lab/HarmfulQA", split="train", cache_dir=cache)
+    )
+    # Benign HF id is fixed (NOT read from repo_or_data_path, which the config
+    # loader resolves to a local file path); spec.split selects the benign split.
+    benign_id = "HuggingFaceH4/no_robots"
+    benign_split = spec.split or "train_sft"
+    try:
+        benign = list(load_dataset(benign_id, split=benign_split, cache_dir=cache))
+    except (ValueError, KeyError):
+        benign = list(load_dataset(benign_id, split="train", cache_dir=cache))
+
+    result = build_c5_dataset(
+        harmful,
+        benign,
+        n_per_pole=int(spec.max_train_samples_per_label or 0),
+        refusal_fallback="drop",
+        seed=int(spec.seed),
+        system_prompt=spec.system_prompt or DEFAULT_SYSTEM_PROMPT,
+    )
+    write_jsonl(spec.output_path, result["train"])
+    if spec.eval_output_path:
+        write_jsonl(spec.eval_output_path, result["test"])
+    return result["train"]
+
+
 SAFETY_TRAIN_DATASETS: Dict[str, SafetyDatasetBuilder] = {
     "tulu3_safety": _build_tulu3_safety,
     "tulu3_safety_v2": _build_tulu3_safety_v2,
@@ -3166,6 +3207,7 @@ SAFETY_TRAIN_DATASETS: Dict[str, SafetyDatasetBuilder] = {
     "hh_rlhf": _build_hh_rlhf,
     "beavertails_category": _build_beavertails_category,
     "coconot": _build_coconot,
+    "c5": _build_c5,
 }
 
 

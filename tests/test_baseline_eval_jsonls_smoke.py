@@ -77,6 +77,22 @@ class LauncherSafetyEvalRoutingTests(unittest.TestCase):
         }
         self.assertTrue(expected.issubset(set(module.SAFETY_EVAL_CONFIGS.keys())))
 
+    def test_c5_baseline_registered_end_to_end(self) -> None:
+        # C5 is a first-class safety baseline -> sft/distill/eval + materialize dispatch.
+        module = _load_module("oneclick_launcher", self.LAUNCHER)
+        self.assertIn("c5", module.SAFETY_SFT_BASELINES)
+        self.assertIn(("npu", "0.8b", "c5"), module.SAFETY_SFT_CONFIGS)
+        self.assertIn(("npu", "0.8b", "c5"), module.SAFETY_EVAL_CONFIGS)
+        self.assertIn(("npu", "c5"), module.SAFETY_DISTILL_CONFIGS)
+        for key in (
+            ("npu", "0.8b", "c5"),
+        ):
+            cfg_path = PROJECT_ROOT / module.SAFETY_SFT_CONFIGS[key]
+            self.assertTrue(cfg_path.exists(), msg=str(cfg_path))
+        from src.data.safety_datasets import SAFETY_TRAIN_DATASETS
+
+        self.assertIn("c5", SAFETY_TRAIN_DATASETS)
+
     def test_safety_eval_datasets_by_baseline_tulu3_has_coconot(self) -> None:
         module = _load_module("oneclick_launcher", self.LAUNCHER)
         self.assertEqual(module.SAFETY_EVAL_DATASETS_BY_BASELINE["tulu3_safety"], ("coconot_contrast",))
