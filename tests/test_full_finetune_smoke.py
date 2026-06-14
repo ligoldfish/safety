@@ -136,20 +136,31 @@ output:
     def test_full_finetune_yaml_picks_up_mode(self) -> None:
         cfg = load_sft_config(PROJECT_ROOT / "configs" / "baseline_sft_qwen35_08b_npu.yaml")
         self.assertEqual(cfg.training.mode, "full_finetune")
-        self.assertEqual(cfg.optim.learning_rate, 1e-4)
+        # Deliberate post-round-2 SFT lr policy (catastrophic-forgetting fix):
+        # clean datasets 5e-6, WGM/WJB 1e-6. pan (this config) is clean -> 5e-6.
+        self.assertEqual(cfg.optim.learning_rate, 5e-6)
         self.assertTrue(cfg.optim.gradient_checkpointing)
         self.assertFalse(cfg.optim.save_optimizer_state)
 
 
+# SFT lr policy: full FT for all; WGM/WJB use a lower 1e-6 (they over-refuse at
+# 5e-6), every other (clean) baseline uses 5e-6. Distill: full FT @ 5e-6.
+SFT_LR_OVERRIDES = {
+    "baseline_sft_qwen35_08b_wildguardmix_npu.yaml": 1e-6,
+    "baseline_sft_qwen35_08b_wildjailbreak_npu.yaml": 1e-6,
+}
+
+
 class SFTYamlSweepTests(unittest.TestCase):
-    """Every SFT + distill YAML on disk must be configured for full FT @ lr=1e-4."""
+    """Every SFT + distill YAML on disk must be full FT at the policy lr."""
 
     def test_sft_configs_full_finetune(self) -> None:
         for yaml_path in sorted((PROJECT_ROOT / "configs").glob("baseline_sft_qwen35_*.yaml")):
             with self.subTest(yaml=yaml_path.name):
                 cfg = load_sft_config(yaml_path)
                 self.assertEqual(cfg.training.mode, "full_finetune", msg=str(yaml_path))
-                self.assertEqual(cfg.optim.learning_rate, 1e-4, msg=str(yaml_path))
+                expected_lr = SFT_LR_OVERRIDES.get(yaml_path.name, 5e-6)
+                self.assertEqual(cfg.optim.learning_rate, expected_lr, msg=str(yaml_path))
                 self.assertTrue(cfg.optim.gradient_checkpointing, msg=str(yaml_path))
 
     def test_distill_configs_full_finetune(self) -> None:
@@ -157,7 +168,7 @@ class SFTYamlSweepTests(unittest.TestCase):
             with self.subTest(yaml=yaml_path.name):
                 cfg = load_distill_config(yaml_path)
                 self.assertEqual(cfg.training.mode, "full_finetune", msg=str(yaml_path))
-                self.assertEqual(cfg.optim.learning_rate, 1e-4, msg=str(yaml_path))
+                self.assertEqual(cfg.optim.learning_rate, 5e-6, msg=str(yaml_path))
 
 
 class LoadModelForEvaluationDispatchTests(unittest.TestCase):

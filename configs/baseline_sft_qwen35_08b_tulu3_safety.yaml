@@ -35,7 +35,7 @@ optim:
   epochs: 3
   batch_size: 128
   micro_batch_size: 1
-  learning_rate: 2.0e-06
+  learning_rate: 5.0e-06
   weight_decay: 0.05
   warmup_ratio: 0.05
   max_grad_norm: 0.5
