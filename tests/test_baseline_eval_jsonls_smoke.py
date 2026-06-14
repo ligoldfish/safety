@@ -83,6 +83,105 @@ class LauncherSafetyEvalRoutingTests(unittest.TestCase):
         self.assertEqual(module.SAFETY_EVAL_DATASETS_BY_BASELINE["safety_tuned_llamas"], ())
         self.assertEqual(module.SAFETY_EVAL_DATASETS_BY_BASELINE["beavertails"], ())
 
+    def test_safety_phase_overrides_wildjailbreak(self) -> None:
+        module = _load_module("oneclick_launcher", self.LAUNCHER)
+        ov = module.SAFETY_PHASE_OVERRIDES_BY_BASELINE["wildjailbreak"]
+        self.assertEqual(ov["phasef_epochs"], 5)
+        self.assertEqual(tuple(ov["analyze_extra"]), ("--top-k", "3"))
+        self.assertEqual(tuple(ov["subspace_extra"]), ("--energy-threshold", "0.7", "--rank-cap", "8"))
+
+    def test_bothpole_pipeline_config_and_policy(self) -> None:
+        module = _load_module("oneclick_launcher", self.LAUNCHER)
+        self.assertIn("npu", module.BOTHPOLE_PIPELINE_CONFIGS)
+        phasef = PROJECT_ROOT / module.BOTHPOLE_PIPELINE_CONFIGS["npu"]["phasef"]
+        # Same phase1 as the main ours run (reuse, no rebuild of subspace/targets).
+        self.assertEqual(
+            module.BOTHPOLE_PIPELINE_CONFIGS["npu"]["phase1"],
+            module.FULL_PIPELINE_CONFIGS["npu"]["phase1"],
+        )
+        import yaml
+
+        raw = yaml.safe_load(phasef.read_text(encoding="utf-8"))
+        # Both poles supervised (vs harmful_only), and a separate output dir.
+        self.assertEqual(raw["target"]["layer_loss_policy"], "label_weighted")
+        self.assertTrue(str(raw["output"]["output_root"]).endswith("training_bothpole"))
+
+    def test_safety_phase_overrides_wildguardmix(self) -> None:
+        module = _load_module("oneclick_launcher", self.LAUNCHER)
+        ov = module.SAFETY_PHASE_OVERRIDES_BY_BASELINE["wildguardmix"]
+        # Clean contrast -> richer subspace + stronger L_layer; NO epoch override.
+        self.assertNotIn("phasef_epochs", ov)
+        self.assertEqual(ov["phasef_layer_loss_weight"], 0.5)
+        self.assertEqual(tuple(ov["analyze_extra"]), ("--top-k", "7"))
+        self.assertEqual(tuple(ov["subspace_extra"]), ("--energy-threshold", "0.9"))
+        # A baseline with no override entry stays on global defaults.
+        self.assertNotIn("beavertails", module.SAFETY_PHASE_OVERRIDES_BY_BASELINE)
+
+    def test_make_safety_full_overrides_injects_wjb_epochs(self) -> None:
+        import tempfile
+        import yaml
+
+        module = _load_module("oneclick_launcher", self.LAUNCHER)
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            phase1_base = tdp / "phase1.yaml"
+            phasef_base = tdp / "phasef.yaml"
+            phase1_base.write_text("extraction: {}\ndataset: {}\n", encoding="utf-8")
+            phasef_base.write_text(
+                "optim:\n  epochs: 3\ninputs: {}\noutput: {}\n", encoding="utf-8"
+            )
+
+            def epochs_for(baseline: str) -> int:
+                _, phasef_path = module._make_safety_full_overrides(
+                    device="npu",
+                    device_id=0,
+                    baseline_name=baseline,
+                    safety_processed_dir=tdp / "proc",
+                    safety_phase1_output_root=tdp / "p1",
+                    safety_phasef_output_root=tdp / "pf",
+                    phasef_base_override=str(phasef_base),
+                    phase1_base_override=str(phase1_base),
+                )
+                raw = yaml.safe_load(Path(phasef_path).read_text(encoding="utf-8"))
+                return int(raw["optim"]["epochs"])
+
+            self.assertEqual(epochs_for("wildjailbreak"), 5)
+            self.assertEqual(epochs_for("wildguardmix"), 3)  # untouched -> base value
+
+    def test_make_safety_full_overrides_injects_wgm_layer_loss_weight(self) -> None:
+        import tempfile
+        import yaml
+
+        module = _load_module("oneclick_launcher", self.LAUNCHER)
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            phase1_base = tdp / "phase1.yaml"
+            phase1_base.write_text("extraction: {}\ndataset: {}\n", encoding="utf-8")
+
+            def llw_for(baseline: str, base_llw: float) -> float:
+                phasef_base = tdp / f"phasef_{baseline}_{base_llw}.yaml"
+                phasef_base.write_text(
+                    f"optim:\n  epochs: 3\n  layer_loss_weight: {base_llw}\ninputs: {{}}\noutput: {{}}\n",
+                    encoding="utf-8",
+                )
+                _, phasef_path = module._make_safety_full_overrides(
+                    device="npu", device_id=0, baseline_name=baseline,
+                    safety_processed_dir=tdp / "proc",
+                    safety_phase1_output_root=tdp / "p1",
+                    safety_phasef_output_root=tdp / "pf",
+                    phasef_base_override=str(phasef_base),
+                    phase1_base_override=str(phase1_base),
+                )
+                raw = yaml.safe_load(Path(phasef_path).read_text(encoding="utf-8"))
+                return float(raw["optim"]["layer_loss_weight"])
+
+            # WGM (override 0.5) applied when the base L_layer weight is non-zero (ours/random)...
+            self.assertEqual(llw_for("wildguardmix", 0.25), 0.5)
+            # ...but the gate skips it when base is 0.0 (the sft1 ablation must stay 0).
+            self.assertEqual(llw_for("wildguardmix", 0.0), 0.0)
+            # A baseline without an override entry is untouched.
+            self.assertEqual(llw_for("beavertails", 0.25), 0.25)
+
     def test_safety_eval_config_helper_falls_back(self) -> None:
         module = _load_module("oneclick_launcher", self.LAUNCHER)
         # Known key returns the safety eval YAML.

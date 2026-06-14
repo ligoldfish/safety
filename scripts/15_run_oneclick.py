@@ -119,6 +119,41 @@ SAFETY_EVAL_DATASETS_BY_BASELINE: dict[str, tuple[str, ...]] = {
     "coconot": (),
 }
 
+# Per-baseline Phase-1 subspace + PhaseF overrides for safety-full / ours.
+# WildJailbreak is heavily adversarial: its harmful/harmless contrast Δ_l is
+# noisy, so a cleaner, more compact safety subspace + more PhaseF epochs help
+# the intent alignment (L_layer) converge instead of chasing adversarial-style
+# noise (which conflates "looks-like-jailbreak" with "harmful intent" and
+# inflates over-refusal on adversarial-benign prompts):
+#   * --top-k 3            : fewer, most safety-discriminative key layers.
+#   * --energy-threshold 0.7: lower tau -> keep only the dominant singular
+#                             directions per layer, drop the noisy low-energy tail.
+#   * --rank-cap 8         : hard cap on per-layer effective rank (vs global 32).
+#   * phasef_epochs 5      : more epochs (vs global 3) to converge on the harder
+#                             distribution.
+# Caller-supplied --phase1-analyze-extra / --phase1-subspace-extra are appended
+# AFTER these, so an explicit CLI override still wins (argparse last-wins).
+# Other baselines keep the global argparse / yaml defaults.
+SAFETY_PHASE_OVERRIDES_BY_BASELINE: dict[str, dict[str, object]] = {
+    "wildjailbreak": {
+        # Dirty/adversarial contrast -> compact, denoised subspace + more epochs.
+        "phasef_epochs": 5,
+        "analyze_extra": ("--top-k", "3"),
+        "subspace_extra": ("--energy-threshold", "0.7", "--rank-cap", "8"),
+    },
+    "wildguardmix": {
+        # WGM is vanilla-only after round-2 -> a CLEAN contrast, the opposite of
+        # WJB. A richer subspace (more key layers + higher energy threshold keeps
+        # more genuine intent directions) plus a stronger L_layer weight sharpens
+        # intent discrimination -> lower OR at a given HR and helps ours beat the
+        # sft1 (L_layer=0) ablation. Epochs left at the default 3 (more epochs
+        # lowers ours' HR further, away from the baseline HR band).
+        "phasef_layer_loss_weight": 0.5,
+        "analyze_extra": ("--top-k", "7"),
+        "subspace_extra": ("--energy-threshold", "0.9"),
+    },
+}
+
 
 def _safety_eval_config(device: str, model_size: str, baseline: str) -> str:
     """Return baseline-specific eval YAML or fall back to the PAN eval YAML."""
@@ -178,6 +213,17 @@ SFT1_PIPELINE_CONFIGS = {
     "ppu": {
         "phase1": "configs/qwen35_9b_to_08b_phase1_ppu.yaml",
         "phasef": "configs/qwen35_9b_to_08b_phaseF_ppu_sft1.yaml",
+    },
+}
+
+# bothpole ours variant: same Phase 1 precompute as the main ours run; the
+# phaseF step swaps in the both-pole yaml (layer_loss_policy=label_weighted)
+# whose output_root ends in "<phase1>/training_bothpole", so it never collides
+# with the main "<phase1>/training" (harmful_only) run and can train in parallel.
+BOTHPOLE_PIPELINE_CONFIGS = {
+    "npu": {
+        "phase1": "configs/qwen35_9b_to_08b_phase1_npu.yaml",
+        "phasef": "configs/qwen35_9b_to_08b_phaseF_npu_bothpole.yaml",
     },
 }
 
@@ -408,6 +454,18 @@ def parse_args() -> argparse.Namespace:
         help="Re-materialize the safety JSONL even when it exists (safety baselines only).",
     )
     add_common_flags(sft1_parser)
+
+    bothpole_parser = subparsers.add_parser(
+        "bothpole",
+        help=(
+            "Run the both-pole ours variant on the PAN corpus (L_layer supervises "
+            "harmful AND harmless via layer_loss_policy=label_weighted, vs the main "
+            "harmful_only run). Reuses ../outputs/qwen35_9b_to_08b_phase1_<device>/ "
+            "and writes under phase1/training_bothpole/ so the main ours result is "
+            "untouched; safe to run in parallel on another device."
+        ),
+    )
+    add_common_flags(bothpole_parser)
 
     full_parser = subparsers.add_parser("full", help="Run the original 00->11 full-stage pipeline.")
     full_parser.add_argument(
@@ -1169,6 +1227,19 @@ def _make_safety_full_overrides(
         safety_phase1_output_root / "hidden_states" / "student_analysis_val"
     )
     phasef_raw.setdefault("output", {})["output_root"] = str(safety_phasef_output_root)
+    _ov = SAFETY_PHASE_OVERRIDES_BY_BASELINE.get(baseline_name, {})
+    # Per-baseline PhaseF epoch override (e.g. WildJailbreak -> 5 epochs).
+    # Applied to ours + sft1 + random alike so they share the same epoch budget
+    # (fair ablation comparison on the harder distribution).
+    if _ov.get("phasef_epochs") is not None:
+        phasef_raw.setdefault("optim", {})["epochs"] = int(_ov["phasef_epochs"])
+    # Per-baseline L_layer weight override (e.g. WildGuardMix -> 0.5). Gated on a
+    # non-zero base weight so the sft1 ablation (layer_loss_weight=0.0) stays 0;
+    # applies to ours + random (both carry the real L_layer term).
+    if _ov.get("phasef_layer_loss_weight") is not None:
+        _opt = phasef_raw.setdefault("optim", {})
+        if float(_opt.get("layer_loss_weight", 0.0)) != 0.0:
+            _opt["layer_loss_weight"] = float(_ov["phasef_layer_loss_weight"])
     if isinstance(phasef_raw.get("model"), dict):
         _override_model_runtime(phasef_raw["model"], device, device_id)
 
@@ -1304,14 +1375,26 @@ def _run_safety_full(
     )
 
     # 4) Run Phase 1-E (skip 00 — safety splits are already on disk).
+    # Per-baseline cleaner-subspace knobs (e.g. WJB: --top-k 3 / --energy-threshold
+    # 0.7 / --rank-cap 8) go first; caller-supplied extras append after so an
+    # explicit CLI --phase1-analyze-extra / --phase1-subspace-extra still wins.
+    phase_overrides = SAFETY_PHASE_OVERRIDES_BY_BASELINE.get(baseline_name, {})
+    merged_analyze_extras = [
+        *phase_overrides.get("analyze_extra", ()),
+        *(analyze_extras or ()),
+    ]
+    merged_subspace_extras = [
+        *phase_overrides.get("subspace_extra", ()),
+        *(subspace_extras or ()),
+    ]
     _run_phase1_precompute(
         phase1_override,
         smoke=False,
         dry_run=dry_run,
         env_overrides=env_overrides,
         skip_prepare=True,
-        analyze_extras=analyze_extras,
-        subspace_extras=subspace_extras,
+        analyze_extras=merged_analyze_extras,
+        subspace_extras=merged_subspace_extras,
     )
 
     # 5) PhaseF training.
@@ -1768,6 +1851,91 @@ def _run_pan_sft1_ablation(
     )
 
 
+def _run_pan_bothpole(
+    device: str,
+    *,
+    device_id: int,
+    num_devices: int,
+    dry_run: bool,
+    opencompass_dir: str,
+    opencompass_datasets: Sequence[str],
+    skip_opencompass: bool,
+    enable_opencompass: bool,
+    opencompass_config: str = "",
+) -> None:
+    """Both-pole ours variant on the PAN corpus.
+
+    Same Phase 1 precompute (00->08) as the main ours run -- the scripts skip
+    existing shards, so this is a no-op when Phase 1 is already on disk and the
+    same subspace / student targets are reused. Only the PhaseF training stage
+    swaps in the both-pole yaml (layer_loss_policy=label_weighted) whose
+    output_root ends in ``/training_bothpole``, keeping the main harmful_only
+    ours result intact and allowing parallel execution on a separate device.
+    """
+
+    _validate_device_request(num_devices)
+    if device not in BOTHPOLE_PIPELINE_CONFIGS:
+        raise ValueError(
+            f"bothpole is only wired for {sorted(BOTHPOLE_PIPELINE_CONFIGS)}; got device={device!r}."
+        )
+    phase1_config = _make_runtime_override_config(
+        _resolve(BOTHPOLE_PIPELINE_CONFIGS[device]["phase1"]),
+        device=device,
+        device_id=device_id,
+    )
+    phasef_config = _make_runtime_override_config(
+        _resolve(BOTHPOLE_PIPELINE_CONFIGS[device]["phasef"]),
+        device=device,
+        device_id=device_id,
+    )
+    phasef_cfg = load_phasef_config(phasef_config)
+
+    env_overrides = _build_env_overrides(device, device_id)
+    _run_phase1_precompute(phase1_config, smoke=False, dry_run=dry_run, env_overrides=env_overrides)
+    _run_script("09_train_student_semalign.py", ["--config", str(phasef_config)], dry_run=dry_run, env_overrides=env_overrides)
+    _run_script(
+        "10_sanity_eval.py",
+        [
+            "--config",
+            str(phase1_config),
+            "--training-dir",
+            str(Path(phasef_cfg.output.output_root)),
+            "--output-dir-name",
+            "sanity_eval_bothpole",
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    _run_script(
+        "11_make_tables.py",
+        [
+            "--config",
+            str(phase1_config),
+            "--training-dir-name",
+            Path(phasef_cfg.output.output_root).name,
+            "--sanity-dir-name",
+            "sanity_eval_bothpole",
+            "--tables-dir-name",
+            "tables_bothpole",
+        ],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    _run_adapter_eval(
+        device=device,
+        model_size="0.8b",
+        training_output_root=Path(phasef_cfg.output.output_root),
+        epochs=int(phasef_cfg.optim.epochs),
+        device_id=device_id,
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+        opencompass_dir=opencompass_dir,
+        opencompass_datasets=opencompass_datasets,
+        skip_opencompass=skip_opencompass,
+        enable_opencompass=enable_opencompass,
+    )
+
+
 def _make_safety_sft1_overrides(
     *,
     device: str,
@@ -1831,6 +1999,19 @@ def _make_safety_sft1_overrides(
         safety_phase1_output_root / "hidden_states" / "student_analysis_val"
     )
     phasef_raw.setdefault("output", {})["output_root"] = str(safety_phasef_output_root)
+    _ov = SAFETY_PHASE_OVERRIDES_BY_BASELINE.get(baseline_name, {})
+    # Per-baseline PhaseF epoch override (e.g. WildJailbreak -> 5 epochs).
+    # Applied to ours + sft1 + random alike so they share the same epoch budget
+    # (fair ablation comparison on the harder distribution).
+    if _ov.get("phasef_epochs") is not None:
+        phasef_raw.setdefault("optim", {})["epochs"] = int(_ov["phasef_epochs"])
+    # Per-baseline L_layer weight override (e.g. WildGuardMix -> 0.5). Gated on a
+    # non-zero base weight so the sft1 ablation (layer_loss_weight=0.0) stays 0;
+    # applies to ours + random (both carry the real L_layer term).
+    if _ov.get("phasef_layer_loss_weight") is not None:
+        _opt = phasef_raw.setdefault("optim", {})
+        if float(_opt.get("layer_loss_weight", 0.0)) != 0.0:
+            _opt["layer_loss_weight"] = float(_ov["phasef_layer_loss_weight"])
     if isinstance(phasef_raw.get("model"), dict):
         _override_model_runtime(phasef_raw["model"], device, device_id)
 
@@ -1904,6 +2085,19 @@ def _make_safety_random_overrides(
         safety_phase1_output_root / "hidden_states" / "student_analysis_val"
     )
     phasef_raw.setdefault("output", {})["output_root"] = str(safety_phasef_output_root)
+    _ov = SAFETY_PHASE_OVERRIDES_BY_BASELINE.get(baseline_name, {})
+    # Per-baseline PhaseF epoch override (e.g. WildJailbreak -> 5 epochs).
+    # Applied to ours + sft1 + random alike so they share the same epoch budget
+    # (fair ablation comparison on the harder distribution).
+    if _ov.get("phasef_epochs") is not None:
+        phasef_raw.setdefault("optim", {})["epochs"] = int(_ov["phasef_epochs"])
+    # Per-baseline L_layer weight override (e.g. WildGuardMix -> 0.5). Gated on a
+    # non-zero base weight so the sft1 ablation (layer_loss_weight=0.0) stays 0;
+    # applies to ours + random (both carry the real L_layer term).
+    if _ov.get("phasef_layer_loss_weight") is not None:
+        _opt = phasef_raw.setdefault("optim", {})
+        if float(_opt.get("layer_loss_weight", 0.0)) != 0.0:
+            _opt["layer_loss_weight"] = float(_ov["phasef_layer_loss_weight"])
     if isinstance(phasef_raw.get("model"), dict):
         _override_model_runtime(phasef_raw["model"], device, device_id)
 
@@ -2495,6 +2689,15 @@ def main() -> None:
                 force_rebuild=bool(args.force_rebuild),
                 **oc_kwargs,
             )
+        return
+    if args.command == "bothpole":
+        _run_pan_bothpole(
+            args.device,
+            device_id=args.device_id,
+            num_devices=args.num_devices,
+            dry_run=args.dry_run,
+            **oc_kwargs,
+        )
         return
     if args.command == "full":
         try:

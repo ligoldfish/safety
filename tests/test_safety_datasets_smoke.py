@@ -586,6 +586,11 @@ class StandaloneSafetyDatasetTests(unittest.TestCase):
                     # phrase and gets replaced by a pool template; harmful
                     # "vh" is a clean refusal that passes the strict judge.
                     safety_filter_mode="strict",
+                    # This case exercises the WildGuardTest eval-pool builder
+                    # (the round-2 default is native WJB eval; pin it off here so
+                    # the mocked wgtest_rows / dataset=="wildguardtest" asserts
+                    # below still apply).
+                    use_native_eval=False,
                 )
             eval_rows = [json.loads(line) for line in eval_path.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(records), 4)

@@ -1,0 +1,69 @@
+seed: 42
+
+# Both-pole ours variant on the PAN corpus. Identical to
+# qwen35_9b_to_08b_phaseF_npu.yaml EXCEPT the L_layer supervises BOTH poles
+# (layer_loss_policy: label_weighted) instead of harmful_only. Reuses the same
+# Phase-1 precompute (subspace + student targets cover both poles already) and
+# writes to a separate output_root (training_bothpole) so it never overwrites
+# the main harmful_only ours run and can train in parallel on another device.
+model:
+  name: Qwen3.5-0.8B
+  path: ../models/Qwen3.5-0.8B
+  device_map: ""
+  torch_dtype: float32
+  runtime_backend: npu
+  runtime_device: npu:0
+  trust_remote_code: true
+  local_files_only: true
+  attn_implementation: ""
+
+inputs:
+  train_split: ../data/processed/train_set.jsonl
+  val_split: ../data/processed/analysis_val_set.jsonl
+  train_targets_dir: ../outputs/qwen35_9b_to_08b_phase1_npu/student_targets/student_safe_targets_alignment
+  val_targets_dir: ../outputs/qwen35_9b_to_08b_phase1_npu/student_targets/student_safe_targets_val
+  pairing_path: ../outputs/qwen35_9b_to_08b_phase1_npu/layer_pairing/teacher_student_layer_pairs.json
+  train_anchor_dir: ""
+  val_anchor_dir: ""
+
+lora:
+  rank: 16
+  alpha: 32.0
+  dropout: 0.05
+  target_modules:
+    - self_attn.v_proj
+    - self_attn.o_proj
+    - mlp.gate_proj
+    - mlp.up_proj
+    - mlp.down_proj
+
+optim:
+  epochs: 3
+  batch_size: 16
+  micro_batch_size: 2
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  sft_loss_weight: 1.0
+  layer_loss_weight: 0.25
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  early_stopping_patience: 0
+  max_length: 2048
+  max_new_tokens: 256
+  log_every_steps: 1
+
+target:
+  mode: semantic
+  random_seed: 2042
+  match_l2_norm: true
+  # Both poles supervised by L_layer (vs harmful_only). harmful 1.0 / harmless
+  # 0.5 -> harmless considered at half weight; bump harmless_layer_weight to 1.0
+  # (or set layer_loss_policy: all) for fully equal treatment.
+  layer_loss_policy: label_weighted
+  harmful_layer_weight: 1.0
+  harmless_layer_weight: 0.5
+  filter_harmful_targets: true
+
+output:
+  output_root: ../outputs/qwen35_9b_to_08b_phase1_npu/training_bothpole
