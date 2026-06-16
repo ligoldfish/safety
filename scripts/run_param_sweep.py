@@ -79,6 +79,7 @@ def stage_isolated_yamls(
     phase1_updates: dict,
     phasef_output_root_override: Optional[Path] = None,
     phase1_output_root_override: Optional[Path] = None,
+    phasef_targets_phase1_root: Optional[Path] = None,
 ) -> tuple[Path, Path, Path]:
     """Copy phaseF + phase1 base yamls to a cell-unique dir, apply patches.
 
@@ -119,6 +120,26 @@ def stage_isolated_yamls(
         set_dotted(phasef_data, "output.output_root", str(phasef_output_root_override))
     if phase1_output_root_override is not None:
         set_dotted(phase1_data, "extraction.output_root", str(phase1_output_root_override))
+
+    # PAN correctness fix: the legacy `full` flow (_run_full_pipeline in
+    # 15_run_oneclick.py) recomputes Phase 1 into the per-cell
+    # extraction.output_root but NEVER rewrites the PhaseF target/pairing inputs,
+    # so PhaseF silently reads the SHARED default phase1 dir
+    # (outputs/qwen35_9b_to_08b_phase1_npu/...). Result: a PAN cell's swept
+    # PHASE-1 params -- top-k (--analyze-extra) and energy-threshold/rank-cap
+    # (--subspace-extra) -- are computed but THROWN AWAY; PhaseF trains on the
+    # default/stale subspace targets. (Confirmed via an old sweep manifest whose
+    # train_targets_dir pointed at the shared dir.) Re-root the PhaseF
+    # target+pairing inputs at THIS cell's phase1 output, exactly as
+    # _make_safety_full_overrides does for safety baselines. Safety baselines go
+    # through the launcher's own override (which re-derives these from a cell-id
+    # suffixed dir and ignores this yaml), so the caller passes this only for PAN.
+    if phasef_targets_phase1_root is not None:
+        p1 = phasef_targets_phase1_root
+        st = phasef_data.setdefault("inputs", {})
+        st["train_targets_dir"] = str(p1 / "student_targets" / "student_safe_targets_alignment")
+        st["val_targets_dir"] = str(p1 / "student_targets" / "student_safe_targets_val")
+        st["pairing_path"] = str(p1 / "layer_pairing" / "teacher_student_layer_pairs.json")
 
     phasef_copy.write_text(
         yaml.safe_dump(phasef_data, sort_keys=False, allow_unicode=True),
@@ -271,10 +292,172 @@ def safety_f1(hr: Optional[float], or_: Optional[float]) -> Optional[float]:
     return 0.0 if denom == 0 else 2.0 * hr * helpful / denom
 
 
+def resolve_eval_test_jsonl(baseline: str, device: str) -> Optional[Path]:
+    """Find the eval test JSONL (the id->prompt join source the judge needs).
+
+    Mirrors the launcher's eval-config selection (15_run_oneclick.py
+    BASELINE_EVAL_CONFIGS / SAFETY_EVAL_CONFIGS) for the 0.8B student, then reads
+    ``datasets.pan.path`` out of that YAML. The path is yaml-relative (``../data/...``)
+    so it is resolved against the config's own dir. pan uses the canonical eval YAML
+    (pan_test_set.jsonl); every safety baseline uses
+    baseline_eval_qwen35_08b_<baseline>_<device>.yaml (-> <baseline>_test.jsonl).
+    """
+    cfgdir = PROJECT_ROOT / "configs"
+    if baseline == "pan":
+        candidates = [cfgdir / f"baseline_eval_qwen35_08b_{device}.yaml"]
+    else:
+        candidates = [
+            cfgdir / f"baseline_eval_qwen35_08b_{baseline}_{device}.yaml",
+            cfgdir / f"baseline_eval_qwen35_08b_{baseline}_npu.yaml",
+        ]
+    cfg = next((c for c in candidates if c.exists()), None)
+    if cfg is None:
+        return None
+    data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+    rel = (((data or {}).get("datasets") or {}).get("pan") or {}).get("path")
+    if not rel:
+        return None
+    return (cfg.parent / rel).resolve()
+
+
+def run_judge(
+    eval_suite_dir: Path,
+    test_jsonl: Optional[Path],
+    judge_model: Path,
+    device: str,
+    judge_device_id: int,
+) -> bool:
+    """Judge every epoch under eval_suite_dir and merge llm_judge_* into summary.json."""
+    if test_jsonl is None or not test_jsonl.exists():
+        print(f"[sweep][judge] test jsonl missing ({test_jsonl}); skipping judge", flush=True)
+        return False
+    if not judge_model.exists():
+        print(f"[sweep][judge] judge model missing ({judge_model}); skipping judge", flush=True)
+        return False
+    cmd = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "22_judge_generations.py"),
+        "--eval-suite-dir",
+        str(eval_suite_dir),
+        "--test-jsonl",
+        str(test_jsonl),
+        "--judge-model",
+        str(judge_model),
+        "--runtime-backend",
+        device,
+        "--runtime-device",
+        f"{device}:{judge_device_id}",
+        "--merge-summary",
+    ]
+    print(f"[sweep][judge] launch: {' '.join(cmd)}", flush=True)
+    rc = subprocess.run(cmd, cwd=str(PROJECT_ROOT)).returncode
+    if rc != 0:
+        print(f"[sweep][judge] judge exited rc={rc}", flush=True)
+    return rc == 0
+
+
+def best_net_epoch(
+    eval_suite_dir: Path,
+) -> tuple[Optional[int], Optional[float], Optional[float], Optional[float]]:
+    """Return (epoch, judge_HR%, judge_OR%, net%) for the epoch maximizing judge HR-OR.
+
+    Reads merged llm_judge_* out of each epoch's summary.json. This mirrors
+    D:/output/_table.py's "ours" epoch pick (max judge_HR - judge_OR) so the cell's
+    recorded score is exactly how the final table would score this config.
+    """
+    best: tuple[Optional[int], Optional[float], Optional[float], Optional[float]] = (
+        None,
+        None,
+        None,
+        None,
+    )
+    for sj in sorted(eval_suite_dir.glob("epoch_*/summary.json")):
+        try:
+            pan = json.loads(sj.read_text(encoding="utf-8"))["results"]["pan"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            continue
+        hr_raw = pan.get("llm_judge_refusal_rate")
+        or_raw = pan.get("llm_judge_over_refusal")
+        if hr_raw is None or or_raw is None:
+            continue
+        hr_p = _scale_to_percent(float(hr_raw))
+        or_p = _scale_to_percent(float(or_raw))
+        if hr_p is None or or_p is None:
+            continue
+        net = hr_p - or_p
+        m = re.search(r"epoch_(\d+)", str(sj))
+        ep = int(m.group(1)) if m else -1
+        if best[3] is None or net > best[3]:
+            best = (ep, hr_p, or_p, net)
+    return best
+
+
+def verify_cell_applied(
+    summary_path: Optional[Path], analyze_extras: Sequence[str]
+) -> tuple[Optional[bool], str]:
+    """Guard that the cell's swept params actually reached training.
+
+    Reads the per-cell manifest.json next to the run's training dir and checks:
+      1) train_targets_dir / pairing_path live under THIS cell's phase1 output
+         (not the shared default dir -> would mean PhaseF ate stale/default
+         subspace targets and the swept phase-1 params were ignored);
+      2) when --top-k was swept, the manifest's #layer-pairs equals the requested
+         K (catches the historical "top-k didn't propagate" staleness).
+    Returns (ok, note). ok=None when the manifest is missing/unreadable.
+    """
+    if summary_path is None:
+        return None, "no summary path"
+    training_root = summary_path.parents[2]  # .../phase1/training/
+    cell_phase1_root = training_root.parent  # .../phase1/
+    manifest_path = training_root / "manifest.json"
+    if not manifest_path.exists():
+        return None, f"no manifest at {manifest_path}"
+    try:
+        man = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"manifest unreadable: {exc}"
+
+    problems: list[str] = []
+    for key in ("train_targets_dir", "pairing_path"):
+        val = str(man.get(key, ""))
+        try:
+            under = Path(val).resolve().is_relative_to(cell_phase1_root.resolve())
+        except (ValueError, OSError):
+            under = False
+        if not under:
+            problems.append(f"{key} not under cell phase1 ({val})")
+
+    if "--top-k" in analyze_extras:
+        idx = list(analyze_extras).index("--top-k")
+        try:
+            want_k = int(analyze_extras[idx + 1])
+        except (ValueError, IndexError):
+            want_k = None
+        if want_k is not None:
+            got = len(man.get("pair_to_student_layer", {}) or {})
+            if got != want_k:
+                problems.append(f"requested top-k={want_k} but manifest has {got} pairs")
+
+    return (len(problems) == 0), ("OK" if not problems else "; ".join(problems))
+
+
 def append_csv_row(row: dict) -> None:
+    fieldnames = list(row.keys())
+    # Schema guard: if an existing CSV has a different header (e.g. the pre-judge
+    # pilot's 11-col schema), appending judge columns would silently mis-align
+    # every row. Rotate the stale CSV to <name>.bak.<ts> and start a fresh header.
+    if SWEEP_CSV.exists():
+        with SWEEP_CSV.open("r", newline="", encoding="utf-8") as f:
+            existing_header = next(csv.reader(f), [])
+        if existing_header != fieldnames:
+            backup = SWEEP_CSV.with_suffix(
+                SWEEP_CSV.suffix + f".bak.{time.strftime('%Y%m%d_%H%M%S')}"
+            )
+            SWEEP_CSV.rename(backup)
+            print(f"[sweep] CSV schema changed; rotated old results to {backup}", flush=True)
     new_file = not SWEEP_CSV.exists()
     with SWEEP_CSV.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if new_file:
             writer.writeheader()
         writer.writerow(row)
@@ -311,6 +494,26 @@ def main() -> int:
         "--subspace-extra",
         default="[]",
         help='JSON list of extra CLI tokens for 03_build_teacher_safe_subspace, e.g. \'["--rank","8"]\' or \'["--no-balance-labels"]\'',
+    )
+    p.add_argument(
+        "--judge",
+        action="store_true",
+        help="After training+eval, run the WildGuard judge (22_judge_generations.py) over "
+        "every epoch's pan_results.json, merge llm_judge_* into summary.json, and record the "
+        "best-net (max judge_HR - judge_OR) epoch in the CSV. Mirrors D:/output/_table.py's "
+        "ours-epoch pick so the sweep winner == the final-table winner.",
+    )
+    p.add_argument(
+        "--judge-model",
+        default="",
+        help="Path to the WildGuard judge model. Default: <repo>/models/wildguard.",
+    )
+    p.add_argument(
+        "--judge-device-id",
+        type=int,
+        default=None,
+        help="NPU/PPU die for the judge. Default: same as --device-id (judge runs after "
+        "training frees the die, so reusing it avoids contending for a second card).",
     )
     p.add_argument("--enable-opencompass", action="store_true")
     p.add_argument("--opencompass-dir", default="")
@@ -359,6 +562,10 @@ def main() -> int:
         # PAN flow uses these paths directly. Safety flow overrides them anyway.
         phasef_output_root_override=pan_phasef_output_root,
         phase1_output_root_override=pan_phase1_output_root,
+        # PAN only: re-root PhaseF target/pairing inputs at this cell's phase1 so
+        # swept phase-1 params (top-k, energy/rank-cap) actually reach PhaseF.
+        # Safety baselines re-derive these in the launcher, so leave None there.
+        phasef_targets_phase1_root=(pan_phase1_output_root if args.baseline == "pan" else None),
     )
 
     exit_code = -1
@@ -406,6 +613,35 @@ def main() -> int:
     hr, or_ = parse_hr_or(summary_path)
     f1 = safety_f1(hr, or_)
 
+    # Optional WildGuard judging: judge every epoch on the LIVE eval_suite (before
+    # archiving) so the merged llm_judge_* summaries get archived too, then pick the
+    # best-net (max judge_HR - judge_OR) epoch to record as the cell's score.
+    judge_hr = judge_or = judge_net = None
+    judge_ep = None
+    if args.judge and summary_path is not None:
+        eval_suite_dir = summary_path.parents[1]  # .../eval_suite/
+        test_jsonl = resolve_eval_test_jsonl(args.baseline, args.device)
+        judge_model = (
+            Path(args.judge_model)
+            if args.judge_model
+            else (PROJECT_ROOT / "models" / "wildguard")
+        )
+        judge_dev = args.judge_device_id if args.judge_device_id is not None else args.device_id
+        if run_judge(eval_suite_dir, test_jsonl, judge_model, args.device, judge_dev):
+            judge_ep, judge_hr, judge_or, judge_net = best_net_epoch(eval_suite_dir)
+
+    # Guard: confirm the swept params actually reached training (not silently
+    # replaced by the shared/default phase1 outputs). Loud WARN on failure so a
+    # no-op cell never masquerades as a real data point in the CSV.
+    applied_ok, applied_note = verify_cell_applied(summary_path, analyze_extras)
+    if applied_ok is False:
+        print(
+            f"[sweep][WARN] cell {cell_id} swept params may NOT have applied: {applied_note}",
+            flush=True,
+        )
+    elif applied_ok:
+        print(f"[sweep] cell {cell_id} applied-check OK", flush=True)
+
     # Archive eval_suite + manifest + training log to outputs/sweep/<axis>_<baseline>_<device>/
     # for stable per-cell browsability (safe to delete the live training/ dir after).
     archive_dir = archive_cell_outputs(args.axis, args.baseline, args.device, summary_path)
@@ -425,11 +661,21 @@ def main() -> int:
         "HR": hr,
         "OR": or_,
         "F1": f1,
+        "judge_HR": judge_hr,
+        "judge_OR": judge_or,
+        "judge_net": judge_net,
+        "judge_best_epoch": judge_ep,
+        "applied_ok": applied_ok,
+        "applied_note": applied_note,
         "summary_path": str(summary_path) if summary_path else "",
         "archive_dir": str(archive_dir) if archive_dir else "",
     }
     append_csv_row(row)
-    print(f"[sweep] done axis={args.axis} baseline={args.baseline} HR={hr} OR={or_} F1={f1}")
+    print(
+        f"[sweep] done axis={args.axis} baseline={args.baseline} "
+        f"kw(HR={hr} OR={or_} F1={f1}) "
+        f"judge(HR={judge_hr} OR={judge_or} net={judge_net} ep={judge_ep})"
+    )
     if archive_dir:
         print(f"[sweep] archived to {archive_dir}")
     return exit_code

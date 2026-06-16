@@ -18,11 +18,10 @@
 #   status                                         -- pending vs completed counts
 #   list                                           -- list all known cells / combos
 #
-# Examples:
-#   bash scripts/sweep.sh axis B               # B1+B2+B3 × 3 baselines = 9 runs
-#   bash scripts/sweep.sh axis G ppu 1
-#   bash scripts/sweep.sh cell A2 beavertails
-#   bash scripts/sweep.sh combo R2_C1          # Round-2 stack combo
+# Examples (set JUDGE=1 to score by WildGuard judge net = best-net epoch):
+#   JUDGE=1 bash scripts/sweep.sh axis TK              # all top_k cells x $SWEEP4
+#   JUDGE=1 bash scripts/sweep.sh axis_fanout TK npu 16  # fan TK pairs over 16 dies
+#   JUDGE=1 bash scripts/sweep.sh cell DEF pan         # single anchor cell
 #   bash scripts/sweep.sh summary
 #   bash scripts/sweep.sh winners
 #
@@ -42,31 +41,70 @@ CSV="$PROJECT_ROOT/sweep_results.csv"
 ALL_BASELINES="pan,beavertails_category,safety_tuned_llamas"
 BT_STL="beavertails_category,safety_tuned_llamas"
 BT_ONLY="beavertails_category"
+# Per-dataset override search (judged re-baseline, post placement-fix a84bec0).
+# These are the four datasets we now sweep to derive each one's
+# SAFETY_PHASE_OVERRIDES_BY_BASELINE entry (like wjb/wgm already have).
+SWEEP4="pan,safety_tuned_llamas,coconot,c5"
 
 declare -A CELL_BASELINES
 declare -A CELL_EXTRA
 
-CELL_BASELINES[B1]="$ALL_BASELINES"; CELL_EXTRA[B1]='--phasef-set={"optim.layer_loss_weight":0.1}'
-CELL_BASELINES[B2]="$ALL_BASELINES"; CELL_EXTRA[B2]='--phasef-set={"optim.layer_loss_weight":0.05}'
-CELL_BASELINES[B3]="$ALL_BASELINES"; CELL_EXTRA[B3]='--phasef-set={"optim.layer_loss_weight":0.5}'
+# ===========================================================================
+# Per-dataset override search (judged re-baseline, post placement-fix a84bec0).
+# Datasets = $SWEEP4 (pan, STL, coconot, c5). Objective = judge net (HR-OR),
+# best-net epoch (run with JUDGE=1). DEF = current live defaults
+# (top_k 5 / energy-threshold 0.8 / rank-cap 32 / lambda 0.25 / epochs 3 /
+# harmful_only). MAIN search tunes only top_k, lambda, epochs.
+#
+# Option A (paper-grounded, agreed): energy-threshold tau is fixed at PAN's
+# representative 0.8 and rank-cap at 32 for ALL main cells. Pan et al. 2025 (ICML)
+# define the energy-threshold effective rank in their section 4 ONLY as a
+# diagnostic of the residual space's dimensionality (Fig 2, plotted across
+# tau in {0.4,0.6,0.7,0.8,0.9}); they do not tune it, and they apply SVD to
+# W-I, not to the harmful-harmless contrast this repo uses. So tau / rank-cap
+# are demoted to an APPENDIX sensitivity sweep (SE*/RC* below) -- reported as a
+# net-vs-tau curve, NOT cherry-picked.
+#
+# Legacy Round-1 cells A-G were removed: they ran under the LoRA placement bug
+# (pre a84bec0) so every layer-loss axis was measured with L_layer near-inert,
+# and they tuned axes (policy, fixed --rank, LoRA rank, no-balance) dropped from
+# this search. See git history before a84bec0 if needed.
+# ===========================================================================
 
-CELL_BASELINES[A1]="$ALL_BASELINES"; CELL_EXTRA[A1]='--phasef-set={"target.layer_loss_policy":"all"}'
-CELL_BASELINES[A2]="$ALL_BASELINES"; CELL_EXTRA[A2]='--phasef-set={"target.layer_loss_policy":"label_weighted","target.harmless_layer_weight":0.5}'
+# --- Anchors -----------------------------------------------------------------
+CELL_BASELINES[DEF]="$SWEEP4";  CELL_EXTRA[DEF]=''                                               # ours @ current defaults
+CELL_BASELINES[SFT1]="$SWEEP4"; CELL_EXTRA[SFT1]='--phasef-set={"optim.layer_loss_weight":0.0}'  # L_layer ablation (lambda=0)
 
-CELL_BASELINES[D1]="$ALL_BASELINES"; CELL_EXTRA[D1]='--phasef-set={"optim.sft_loss_weight":1.0,"optim.layer_loss_weight":0.5}'
-CELL_BASELINES[D2]="$ALL_BASELINES"; CELL_EXTRA[D2]='--phasef-set={"optim.sft_loss_weight":0.5,"optim.layer_loss_weight":0.5}'
+# --- TK: top_k = #key layers = #supervised LoRA layers (the core lever) ------
+# DEF already covers top_k=5.
+CELL_BASELINES[TK2]="$SWEEP4"; CELL_EXTRA[TK2]='--analyze-extra=["--top-k","2"]'
+CELL_BASELINES[TK3]="$SWEEP4"; CELL_EXTRA[TK3]='--analyze-extra=["--top-k","3"]'
+CELL_BASELINES[TK4]="$SWEEP4"; CELL_EXTRA[TK4]='--analyze-extra=["--top-k","4"]'
+CELL_BASELINES[TK6]="$SWEEP4"; CELL_EXTRA[TK6]='--analyze-extra=["--top-k","6"]'
+CELL_BASELINES[TK7]="$SWEEP4"; CELL_EXTRA[TK7]='--analyze-extra=["--top-k","7"]'
+CELL_BASELINES[TK8]="$SWEEP4"; CELL_EXTRA[TK8]='--analyze-extra=["--top-k","8"]'
 
-CELL_BASELINES[G1]="$ALL_BASELINES"; CELL_EXTRA[G1]='--analyze-extra=["--top-k","1"]'
-CELL_BASELINES[G2]="$ALL_BASELINES"; CELL_EXTRA[G2]='--analyze-extra=["--top-k","5"]'
-CELL_BASELINES[G3]="$ALL_BASELINES"; CELL_EXTRA[G3]='--analyze-extra=["--top-k","7"]'
+# --- LW: L_layer weight lambda ----------------------------------------------
+# DEF covers lambda=0.25; SFT1 covers lambda=0.
+CELL_BASELINES[LW05]="$SWEEP4";  CELL_EXTRA[LW05]='--phasef-set={"optim.layer_loss_weight":0.05}'
+CELL_BASELINES[LW10]="$SWEEP4";  CELL_EXTRA[LW10]='--phasef-set={"optim.layer_loss_weight":0.1}'
+CELL_BASELINES[LW50]="$SWEEP4";  CELL_EXTRA[LW50]='--phasef-set={"optim.layer_loss_weight":0.5}'
+CELL_BASELINES[LW100]="$SWEEP4"; CELL_EXTRA[LW100]='--phasef-set={"optim.layer_loss_weight":1.0}'
 
-CELL_BASELINES[C1]="$BT_STL"; CELL_EXTRA[C1]='--subspace-extra=["--rank","8"]'
-CELL_BASELINES[C2]="$BT_STL"; CELL_EXTRA[C2]='--subspace-extra=["--rank","32"]'
+# --- EP: PhaseF epochs (DEF covers 3) ---------------------------------------
+CELL_BASELINES[EP5]="$SWEEP4"; CELL_EXTRA[EP5]='--phasef-set={"optim.epochs":5}'
 
-CELL_BASELINES[E1]="$ALL_BASELINES"; CELL_EXTRA[E1]='--phasef-set={"lora.rank":8,"lora.alpha":16.0}'
-CELL_BASELINES[E2]="$ALL_BASELINES"; CELL_EXTRA[E2]='--phasef-set={"lora.rank":32,"lora.alpha":64.0}'
-
-CELL_BASELINES[F1]="$BT_ONLY"; CELL_EXTRA[F1]='--subspace-extra=["--no-balance-labels"]'
+# --- APPENDIX sensitivity (NOT main search) ---------------------------------
+# tau (energy-threshold) sweep @ rank-cap 32 -- report net-vs-tau, do not pick a
+# winner. DEF covers tau=0.8.
+CELL_BASELINES[SE06]="$SWEEP4";  CELL_EXTRA[SE06]='--subspace-extra=["--energy-threshold","0.6"]'
+CELL_BASELINES[SE07]="$SWEEP4";  CELL_EXTRA[SE07]='--subspace-extra=["--energy-threshold","0.7"]'
+CELL_BASELINES[SE09]="$SWEEP4";  CELL_EXTRA[SE09]='--subspace-extra=["--energy-threshold","0.9"]'
+CELL_BASELINES[SE095]="$SWEEP4"; CELL_EXTRA[SE095]='--subspace-extra=["--energy-threshold","0.95"]'
+# rank-cap sweep @ tau 0.8 (repo engineering knob, NOT in PAN). DEF covers cap=32.
+CELL_BASELINES[RC8]="$SWEEP4";  CELL_EXTRA[RC8]='--subspace-extra=["--rank-cap","8"]'
+CELL_BASELINES[RC16]="$SWEEP4"; CELL_EXTRA[RC16]='--subspace-extra=["--rank-cap","16"]'
+CELL_BASELINES[RC64]="$SWEEP4"; CELL_EXTRA[RC64]='--subspace-extra=["--rank-cap","64"]'
 
 # ---------------------------------------------------------------------------
 # Combo registry (NAME, all 4 args concatenated)
@@ -74,15 +112,12 @@ CELL_BASELINES[F1]="$BT_ONLY"; CELL_EXTRA[F1]='--subspace-extra=["--no-balance-l
 declare -A COMBO_BASELINES
 declare -A COMBO_EXTRA
 
-# Round-2 templates (edit after Round 1 winners known)
-COMBO_BASELINES[R2_AB]="$ALL_BASELINES"
-COMBO_EXTRA[R2_AB]='--phasef-set={"target.layer_loss_policy":"label_weighted","target.harmless_layer_weight":0.5,"optim.layer_loss_weight":0.1}'
-
-COMBO_BASELINES[R2_AD]="$ALL_BASELINES"
-COMBO_EXTRA[R2_AD]='--phasef-set={"target.layer_loss_policy":"label_weighted","target.harmless_layer_weight":0.5,"optim.sft_loss_weight":1.0,"optim.layer_loss_weight":0.5}'
-
-COMBO_BASELINES[R2_ABC]="$BT_STL"
-COMBO_EXTRA[R2_ABC]='--phasef-set={"target.layer_loss_policy":"label_weighted","target.harmless_layer_weight":0.5,"optim.layer_loss_weight":0.1} --subspace-extra=["--rank","8"]'
+# Stage-2 confirmation combos: filled in per dataset AFTER stage-1 (TK/LW/EP)
+# winners are known -- stack each dataset's best top_k with its best lambda and
+# run >=2 seeds + JUDGE to confirm and to verify ours > sft1. Example template
+# (edit the top_k / lambda to the stage-1 winner, run per dataset):
+#   COMBO_BASELINES[S2_pan]="pan"
+#   COMBO_EXTRA[S2_pan]='--analyze-extra=["--top-k","6"] --phasef-set={"optim.layer_loss_weight":0.5}'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -97,11 +132,27 @@ get_rebuild_flag() {
   if [[ "${FORCE_REBUILD:-0}" == "1" ]]; then echo "--force-rebuild"; else echo ""; fi
 }
 
+get_judge_flag() {
+  # JUDGE=1 -> run the WildGuard judge after each cell and score by best-net
+  # (max judge_HR - judge_OR) epoch, matching D:/output/_table.py. The judge
+  # reuses the cell's own die (it runs after training frees it). Override the
+  # judge die with JUDGE_DEVICE_ID and the model with JUDGE_MODEL if needed.
+  if [[ "${JUDGE:-0}" == "1" ]]; then
+    local f="--judge"
+    [[ -n "${JUDGE_MODEL:-}" ]] && f="$f --judge-model ${JUDGE_MODEL}"
+    [[ -n "${JUDGE_DEVICE_ID:-}" ]] && f="$f --judge-device-id ${JUDGE_DEVICE_ID}"
+    echo "$f"
+  else
+    echo ""
+  fi
+}
+
 run_one() {
   local axis_id="$1" baseline="$2" device="$3" device_id="$4" extra="$5"
-  local dry_flag rebuild_flag
+  local dry_flag rebuild_flag judge_flag
   dry_flag=$(get_dry_flag)
   rebuild_flag=$(get_rebuild_flag)
+  judge_flag=$(get_judge_flag)
   echo ""
   echo "============================================================"
   echo "[sweep] axis=$axis_id baseline=$baseline device=$device:$device_id"
@@ -115,6 +166,7 @@ run_one() {
     --device-id "$device_id" \
     $extra \
     $rebuild_flag \
+    $judge_flag \
     $dry_flag \
     || echo "[sweep][WARN] axis=$axis_id baseline=$baseline failed; continuing"
 }
@@ -432,11 +484,11 @@ case "$SUB" in
   help|*)
     head -n 25 "$0" | grep -E "^#( |$)" | sed 's/^# \?//'
     echo ""
-    echo "Quick examples:"
-    echo "  bash scripts/sweep.sh list                    # see all cells/combos"
-    echo "  bash scripts/sweep.sh axis B                  # all B cells"
-    echo "  bash scripts/sweep.sh cell A2 beavertails     # single cell"
-    echo "  bash scripts/sweep.sh combo R2_AB             # Round 2 combo"
+    echo "Quick examples (JUDGE=1 -> score by WildGuard judge net):"
+    echo "  bash scripts/sweep.sh list                        # see all cells/combos"
+    echo "  JUDGE=1 bash scripts/sweep.sh axis TK             # all top_k cells x SWEEP4"
+    echo "  JUDGE=1 bash scripts/sweep.sh axis_fanout TK npu 16  # fan TK over 16 dies"
+    echo "  JUDGE=1 bash scripts/sweep.sh cell DEF pan        # single anchor cell"
     echo "  bash scripts/sweep.sh summary"
     echo "  bash scripts/sweep.sh winners"
     echo "  bash scripts/sweep.sh status"
