@@ -63,6 +63,23 @@ def extract_model_meta(model: Any) -> Dict[str, Any]:
     }
 
 
+def _detect_chat_eos(tokenizer: Any) -> Tuple[Any, Any]:
+    """Return (token, id) of the chat-turn terminator the model emits: Qwen's
+    <|im_end|> or Llama-3's <|eot_id|>. Forces the chat-mode EOS so generate()
+    stops and training labels carry a learnable EOS (base tokenizers often
+    default eos to a token that never appears in chat output). Qwen is checked
+    first so its existing behaviour is byte-for-byte unchanged."""
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    for tok in ("<|im_end|>", "<|eot_id|>"):
+        try:
+            cid = tokenizer.convert_tokens_to_ids(tok)
+        except Exception:
+            continue
+        if isinstance(cid, int) and cid >= 0 and cid != unk_id:
+            return tok, int(cid)
+    return None, None
+
+
 def load_hf_model(
     model_path: str,
     device_map: str = "auto",
@@ -78,29 +95,34 @@ def load_hf_model(
     model_ref = str(resolved if resolved.exists() else model_path)
     thinking_enabled = bool(chat_template_enable_thinking)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_ref,
-        trust_remote_code=trust_remote_code,
-        local_files_only=local_files_only,
-        use_fast=False,
-    )
-    tokenizer.padding_side = "left"
-    # Qwen3 chat template terminates each turn with <|im_end|>. Base tokenizer
-    # may default eos_token_id to <|endoftext|> which never appears in chat
-    # generations -> model.generate() runs to max_new_tokens, training labels
-    # contain no learnable EOS, OpenCompass HuggingFacewithChatTemplate cannot
-    # stop. Force the chat-mode EOS when the vocab exposes <|im_end|>.
-    # Reference: Qwen3 official ms-swift recipe.
-    im_end_id: int | None = None
+    # Prefer the slow tokenizer (Qwen path, unchanged). Some families ship a
+    # fast-only tokenizer (e.g. Llama-3, tiktoken-based) where use_fast=False
+    # raises -> fall back to the fast tokenizer instead of crashing.
     try:
-        candidate = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        unk_id = getattr(tokenizer, "unk_token_id", None)
-        if isinstance(candidate, int) and candidate >= 0 and candidate != unk_id:
-            im_end_id = int(candidate)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_ref,
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only,
+            use_fast=False,
+        )
     except Exception:
-        im_end_id = None
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_ref,
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only,
+            use_fast=True,
+        )
+    tokenizer.padding_side = "left"
+    # Chat templates terminate each turn with a special token (Qwen: <|im_end|>;
+    # Llama-3: <|eot_id|>). Base tokenizers may default eos_token_id to a token
+    # that never appears in chat generations -> model.generate() runs to
+    # max_new_tokens, training labels carry no learnable EOS, OpenCompass cannot
+    # stop. Force the chat-mode EOS when the vocab exposes one. (im_end_id keeps
+    # its name for the downstream generation_config wiring; it now holds whatever
+    # chat-EOS was detected.) Reference: Qwen3 ms-swift recipe; Llama-3 <|eot_id|>.
+    chat_eos_tok, im_end_id = _detect_chat_eos(tokenizer)
     if im_end_id is not None:
-        tokenizer.eos_token = "<|im_end|>"
+        tokenizer.eos_token = chat_eos_tok
         tokenizer.eos_token_id = im_end_id
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token

@@ -1,0 +1,68 @@
+seed: 42
+model:
+  name: Llama-3.2-1B-Instruct
+  path: ../models/Llama-3.2-1B-Instruct
+  device_map: ''
+  torch_dtype: float32
+  chat_template_enable_thinking: false
+  runtime_backend: npu
+  runtime_device: npu:0
+  trust_remote_code: true
+  local_files_only: true
+  attn_implementation: ''
+adapter:
+  manifest_path: ''
+  checkpoint_path: ''
+datasets:
+  pan:
+    path: ../data/processed/pan_test_set.jsonl
+    split: test
+    max_samples: 0
+    shuffle: false
+    enabled: true
+    placeholder_ok: true
+    max_new_tokens: 1024
+    initial_max_new_tokens: 0
+  mmlu:
+    path: ../data/benchmarks/mmlu
+    split: test
+    max_samples: 0
+    shuffle: false
+    enabled: false
+    placeholder_ok: true
+    max_new_tokens: 512
+    initial_max_new_tokens: 0
+  gsm8k:
+    path: ../data/benchmarks/gsm8k
+    split: test
+    max_samples: 0
+    shuffle: false
+    enabled: false
+    placeholder_ok: true
+    max_new_tokens: 512
+    initial_max_new_tokens: 0
+  humaneval:
+    path: ../data/benchmarks/humaneval
+    split: test
+    max_samples: 0
+    shuffle: false
+    enabled: false
+    placeholder_ok: true
+    max_new_tokens: 1024
+    initial_max_new_tokens: 0
+    exec_timeout_seconds: 3
+  mbpp:
+    path: ../data/benchmarks/mbpp
+    split: test
+    max_samples: 0
+    shuffle: false
+    enabled: false
+    placeholder_ok: true
+    max_new_tokens: 1024
+    initial_max_new_tokens: 0
+    exec_timeout_seconds: 3
+runtime:
+  max_length: 4096
+  batch_size: 16
+output:
+  output_root: ../outputs/baselines/no_sft_llama32_1b_npu

@@ -1,0 +1,70 @@
+seed: 42
+teacher:
+  name: Qwen3-8B
+  path: ../models/Qwen3-8B
+  chat_template_enable_thinking: false
+  device_map: ''
+  torch_dtype: float32
+  runtime_backend: npu
+  runtime_device: npu:0
+  trust_remote_code: true
+  local_files_only: true
+  attn_implementation: ''
+student:
+  name: Qwen3-4B
+  path: ../models/Qwen3-4B
+  chat_template_enable_thinking: false
+  device_map: ''
+  torch_dtype: float32
+  runtime_backend: npu
+  runtime_device: npu:0
+  trust_remote_code: true
+  local_files_only: true
+  attn_implementation: ''
+data:
+  train_split: ../data/processed/safety/safety_tuned_llamas_train.jsonl
+  val_split: ../data/processed/analysis_val_set.jsonl
+  test_split: ../data/processed/pan_test_set.jsonl
+  safety_dataset:
+    name: safety_tuned_llamas
+    repo_or_data_path: ../external/safety-tuned-llamas
+    file_name: safety_only_data_Instructions.json
+    include_harmless_contrast: true
+    harmless_file_name: alpaca_small.json
+    harmless_max_samples: 0
+    force_rebuild: false
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.1
+  target_modules:
+  - self_attn.q_proj
+  - self_attn.k_proj
+  - self_attn.v_proj
+  - self_attn.o_proj
+  - mlp.gate_proj
+  - mlp.up_proj
+  - mlp.down_proj
+optim:
+  epochs: 8
+  batch_size: 32
+  micro_batch_size: 1
+  learning_rate: 5.0e-06
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  max_grad_norm: 0.5
+  lr_scheduler: cosine
+  early_stopping_patience: 0
+  max_length: 1024
+  max_new_tokens: 512
+  log_every_steps: 5
+  gradient_checkpointing: true
+  save_optimizer_state: false
+distill:
+  temperature: 2.0
+  hard_loss_weight: 0.5
+  soft_loss_weight: 0.35
+output:
+  output_root: ../outputs/baselines/distill_qwen3_8b_to_4b_safety_tuned_llamas_npu
+training:
+  mode: full_finetune

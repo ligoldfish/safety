@@ -18,6 +18,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.baselines.config import load_distill_config, load_eval_config, load_sft_config
 from src.utils.config import load_phase1_config, load_phasef_config
+from src.pairs import DEFAULT_PAIR, PAIRS, apply_tokens
+
+# Active teacher->student model pair for this invocation (set in main() from
+# --pair). All config paths flow through _resolve(), which re-targets the
+# canonical Qwen3.5-9B->0.8B config names to this pair via apply_tokens. For the
+# default pair apply_tokens is the identity, so the original flow is byte-for-byte
+# unchanged; only new pairs (Llama-3.x / Qwen3) get re-mapped filenames.
+_ACTIVE_PAIR = DEFAULT_PAIR
 
 
 BASELINE_EVAL_CONFIGS = {
@@ -261,6 +269,16 @@ def parse_args() -> argparse.Namespace:
             help="Requested accelerator count. The current code path is single-process single-device, so only 1 is supported.",
         )
         target_parser.add_argument(
+            "--pair",
+            choices=sorted(PAIRS),
+            default=DEFAULT_PAIR,
+            help=(
+                "Teacher->student model pair (src/pairs.py). Default reproduces the "
+                "original Qwen3.5-9B->0.8B flow unchanged. Other pairs require their "
+                "configs to exist (scripts/gen_pair_configs.py) and models downloaded."
+            ),
+        )
+        target_parser.add_argument(
             "--dry-run",
             action="store_true",
             help="Print the commands without executing them.",
@@ -306,7 +324,18 @@ def parse_args() -> argparse.Namespace:
         )
 
     nosft_parser = subparsers.add_parser("nosft", help="Run no-SFT benchmark evaluation.")
-    nosft_parser.add_argument("--model", choices=["0.8b", "9b"], required=True)
+    nosft_parser.add_argument(
+        "--role",
+        choices=["student", "teacher"],
+        default="student",
+        help="Which model of the --pair to eval (student or teacher). Replaces --model.",
+    )
+    nosft_parser.add_argument(
+        "--model",
+        choices=["0.8b", "9b"],
+        default=None,
+        help="DEPRECATED legacy alias (0.8b=student, 9b=teacher); use --role. Overrides --role if set.",
+    )
     nosft_parser.add_argument(
         "--baseline",
         choices=["pan", *SAFETY_SFT_BASELINES, "all"],
@@ -322,7 +351,18 @@ def parse_args() -> argparse.Namespace:
     add_common_flags(nosft_parser)
 
     sft_parser = subparsers.add_parser("sft", help="Run PAN SFT and then benchmark evaluation.")
-    sft_parser.add_argument("--model", choices=["0.8b", "9b"], required=True)
+    sft_parser.add_argument(
+        "--role",
+        choices=["student", "teacher"],
+        default="student",
+        help="Which model of the --pair to SFT (student or teacher). Replaces --model.",
+    )
+    sft_parser.add_argument(
+        "--model",
+        choices=["0.8b", "9b"],
+        default=None,
+        help="DEPRECATED legacy alias (0.8b=student, 9b=teacher); use --role. Overrides --role if set.",
+    )
     sft_parser.add_argument(
         "--baseline",
         choices=["pan", *SAFETY_SFT_BASELINES],
@@ -541,6 +581,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def _resolve(path_text: str) -> Path:
+    # Re-target canonical (qwen35_9b_to_08b) config paths to the active pair.
+    # Identity for the default pair; only config FILE PATHS pass through here, so
+    # the model-name tokens never match a path string (safe for all pairs).
+    path_text = apply_tokens(path_text, _ACTIVE_PAIR)
     path = Path(path_text)
     if path.is_absolute():
         return path
@@ -2560,6 +2604,18 @@ def _run_full_pipeline(
 
 def main() -> None:
     args = parse_args()
+    global _ACTIVE_PAIR
+    _ACTIVE_PAIR = getattr(args, "pair", DEFAULT_PAIR)
+    # Resolve the teacher/student slot ("0.8b"=student, "9b"=teacher — legacy keys
+    # into the canonical config dicts) from --role, with --model as a legacy
+    # override. apply_tokens() then maps the canonical config name to the pair's
+    # actual model. Only nosft/sft expose --role; other commands fix their slot.
+    if getattr(args, "model", None):
+        _role_slot = args.model
+    elif hasattr(args, "role"):
+        _role_slot = "9b" if args.role == "teacher" else "0.8b"
+    else:
+        _role_slot = "0.8b"
     oc_kwargs = {
         "opencompass_dir": args.opencompass_dir,
         "opencompass_datasets": args.opencompass_datasets,
@@ -2570,7 +2626,7 @@ def main() -> None:
     if args.command == "nosft":
         _run_baseline_nosft(
             args.device,
-            args.model,
+            _role_slot,
             baseline_name=args.baseline,
             device_id=args.device_id,
             num_devices=args.num_devices,
@@ -2583,7 +2639,7 @@ def main() -> None:
             _run_safety_sft(
                 args.device,
                 baseline_name=args.baseline,
-                model_size=args.model,
+                model_size=_role_slot,
                 device_id=args.device_id,
                 num_devices=args.num_devices,
                 dry_run=args.dry_run,
@@ -2593,7 +2649,7 @@ def main() -> None:
             return
         _run_baseline_sft(
             args.device,
-            args.model,
+            _role_slot,
             device_id=args.device_id,
             num_devices=args.num_devices,
             dry_run=args.dry_run,
