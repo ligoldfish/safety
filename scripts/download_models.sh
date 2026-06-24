@@ -13,8 +13,8 @@
 # each download exposes a chat_template and warns if it looks like a base model.
 #
 # GATED MODELS: meta-llama/* require accepting the license on HuggingFace and a
-# token. Run `huggingface-cli login` (or export HF_TOKEN=...) before this script.
-# Qwen/* are open. Needs: pip install -U "huggingface_hub[cli]".
+# token. Run `hf auth login` (or export HF_TOKEN=...) before this script.
+# Qwen/* are open. Needs: pip install -U huggingface_hub  (provides the `hf` CLI).
 #
 # Usage:
 #   bash scripts/download_models.sh            # all 5 models
@@ -42,10 +42,18 @@ ALL_MODELS=(
   "Qwen/Qwen3-0.6B|Qwen3-0.6B|qwen3"                               # qwen3 student  (ALIGNED)
 )
 
-if ! command -v huggingface-cli >/dev/null 2>&1; then
-  echo "[dl] huggingface-cli not found. Install: pip install -U 'huggingface_hub[cli]'" >&2
+# Resolve the HF download CLI. huggingface_hub renamed `huggingface-cli` to `hf`
+# (the old name is now a deprecated no-op that prints a hint and downloads
+# nothing). Prefer `hf`; fall back to the legacy CLI only on older envs.
+if command -v hf >/dev/null 2>&1; then
+  HF_DL=(hf download)
+elif command -v huggingface-cli >/dev/null 2>&1; then
+  HF_DL=(huggingface-cli download)
+else
+  echo "[dl] no HF CLI found. Install: pip install -U huggingface_hub" >&2
   exit 1
 fi
+echo "[dl] using CLI: ${HF_DL[*]}"
 
 echo "[dl] dest=$MODELS_DIR  endpoint=${HF_ENDPOINT:-<official>}  filter=$FILTER"
 mkdir -p "$MODELS_DIR"
@@ -58,8 +66,8 @@ for entry in "${ALL_MODELS[@]}"; do
   dest="$MODELS_DIR/$local_dir"
   echo ""
   echo "=== $repo  ->  $dest ==="
-  huggingface-cli download "$repo" --local-dir "$dest" || {
-    echo "[dl][ERROR] failed: $repo (gated? run huggingface-cli login / set HF_TOKEN; or HF_ENDPOINT= for official)" >&2
+  "${HF_DL[@]}" "$repo" --local-dir "$dest" || {
+    echo "[dl][ERROR] failed: $repo (gated? run 'hf auth login' / set HF_TOKEN; or HF_ENDPOINT= for official)" >&2
     continue
   }
   # Sanity: aligned/chat models ship a chat_template; base models do not.
