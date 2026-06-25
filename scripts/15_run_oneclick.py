@@ -28,6 +28,13 @@ from src.pairs import DEFAULT_PAIR, PAIRS, apply_tokens
 _ACTIVE_PAIR = DEFAULT_PAIR
 
 
+def _pair_suffix() -> str:
+    """'' for the default pair (legacy safety-full/sft1 output dirs unchanged);
+    '_<pair>' otherwise, so different pairs' safety_full_<baseline>_<device>
+    output roots stay disjoint (ours + sft1 still share one per-pair phase1)."""
+    return "" if _ACTIVE_PAIR == DEFAULT_PAIR else f"_{_ACTIVE_PAIR}"
+
+
 BASELINE_EVAL_CONFIGS = {
     ("npu", "0.8b"): "configs/baseline_eval_qwen35_08b_npu.yaml",
     ("ppu", "0.8b"): "configs/baseline_eval_qwen35_08b_ppu.yaml",
@@ -1393,7 +1400,7 @@ def _run_safety_full(
     safety_phase1_output_root = (
         PROJECT_ROOT
         / "outputs"
-        / f"safety_full_{baseline_name}_{device}{cell_suffix}"
+        / f"safety_full_{baseline_name}_{device}{_pair_suffix()}{cell_suffix}"
         / "phase1"
     ).resolve()
     # PhaseF output lives under phase1/training so that 10_sanity_eval and
@@ -2393,7 +2400,7 @@ def _run_safety_sft1(
     safety_phase1_output_root = (
         PROJECT_ROOT
         / "outputs"
-        / f"safety_full_{baseline_name}_{device}"
+        / f"safety_full_{baseline_name}_{device}{_pair_suffix()}"
         / "phase1"
     ).resolve()
     # sft1 lands beside the main "training/" so the two ablations share
