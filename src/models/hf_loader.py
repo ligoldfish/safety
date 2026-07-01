@@ -136,16 +136,22 @@ def load_hf_model(
         "local_files_only": local_files_only,
         "torch_dtype": _resolve_dtype(torch_dtype),
     }
-    if runtime["backend"]:
-        if device_map and str(device_map).lower() not in {"", "none", "cpu"}:
-            model_kwargs["device_map"] = None
-    else:
+    # device_map handling. A REAL device_map (e.g. "auto") means SHARD the model
+    # across the visible devices via HF/accelerate -- keep it and do NOT force a
+    # single-device .to() afterwards. This enables multi-NPU naive model-parallel
+    # for models too big for one card (e.g. 4B full-finetune), with fp32 / AdamW /
+    # the training math entirely unchanged (only weight placement is split). An
+    # empty/none/cpu device_map on NPU keeps the original single-device path.
+    use_device_map = bool(device_map) and str(device_map).lower() not in {"", "none", "cpu"}
+    if use_device_map:
+        model_kwargs["device_map"] = device_map
+    elif not runtime["backend"]:
         model_kwargs["device_map"] = device_map
     if attn_implementation:
         model_kwargs["attn_implementation"] = attn_implementation
 
     model = AutoModelForCausalLM.from_pretrained(model_ref, **model_kwargs)
-    if runtime["device"] is not None:
+    if runtime["device"] is not None and not use_device_map:
         model.to(runtime["device"])
     # Mirror chat-mode EOS into model.generation_config so model.generate()
     # and downstream save_pretrained checkpoints carry stop tokens that match

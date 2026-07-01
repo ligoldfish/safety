@@ -87,6 +87,13 @@ PAIRS: Dict[str, dict] = {
         "student": {"name": "Qwen3-4B", "path": "../models/Qwen3-4B", "tag": "qwen3_4b"},
         "family": "qwen3",
         "target_modules": _DENSE_TARGET_MODULES,
+        # The 4B student full-finetune (baseline sft/distill) does not fit one
+        # 61GB card (weights 16 + grads 16 + AdamW 32 = ~64GB). device_map="auto"
+        # shards it across the 2 dies the run_pairs.sh JOBS ":2" scheduler grants
+        # -> fp32 / AdamW / training math UNCHANGED, only weight placement split.
+        # Applied by gen_pair_configs to baseline_sft_/baseline_distill_ configs
+        # only (ours=LoRA phaseF and eval/nosft fit one card).
+        "device_map": "auto",
     },
     "qwen3_4b_to_06b": {
         "pair_id": "qwen3_4b_to_06b",
