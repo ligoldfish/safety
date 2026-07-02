@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run the cross-scale safety-transfer matrix for the extension model pairs:
 #   4 pairs x 6 datasets x 5 variants (ours, sft1, sft, distill, nosft),
-# scheduling one (pair,dataset) UNIT per NPU die across dies 0-15.
+# scheduling one (pair,dataset) UNIT per NPU die across dies 0-11
+# (dies 12-15 reserved for other users by default; override via NUM_DIES/DIES).
 #
 # Why UNIT = (pair,dataset): ours + sft1 SHARE one per-pair Phase-1 precompute
 # (outputs/safety_full_<ds>_npu_<pair>/phase1) and must not race, so a unit runs
@@ -19,7 +20,7 @@
 # (this script does NOT source them.)
 #
 # Usage:
-#   bash scripts/run_pairs.sh                                 # all 4 pairs x 6 ds, dies 0-15
+#   bash scripts/run_pairs.sh                                 # all 4 pairs x 6 ds, dies 0-11
 #   PAIRS="llama31_8b_to_1b" bash scripts/run_pairs.sh        # one pair (smoke)
 #   DATASETS="pan c5" bash scripts/run_pairs.sh               # subset of datasets
 #   VARIANTS="ours sft1" bash scripts/run_pairs.sh            # subset of variants
@@ -35,7 +36,9 @@ mkdir -p "$LOGDIR"
 PAIRS="${PAIRS:-llama31_8b_to_1b qwen3_8b_to_06b qwen3_8b_to_4b qwen3_4b_to_06b}"
 DATASETS="${DATASETS:-pan safety_tuned_llamas coconot c5 wildjailbreak wildguardmix}"
 VARIANTS="${VARIANTS:-ours sft1 sft distill nosft}"
-NUM_DIES="${NUM_DIES:-16}"
+# Default die pool = 0..11 (dies 12-15 are RESERVED for other users; override
+# with NUM_DIES/START_DIE/DIES only when you know they are free).
+NUM_DIES="${NUM_DIES:-12}"
 START_DIE="${START_DIE:-0}"
 # Explicit die pool. Default = START_DIE..START_DIE+NUM_DIES-1. Pass DIES to
 # EXCLUDE dies you know are occupied, e.g. DIES="1 2 4 5 6 7" (the surest way to
