@@ -177,7 +177,13 @@ try_acquire_dies() {
     if die_idle "$cand"; then got+=("$cand"); else parked+=("$cand"); fi
   done
   if [[ ${#got[@]} -eq $n ]]; then
-    ACQUIRED_DIES="${got[*]}"; return 0
+    # CANN requires ASCEND_RT_VISIBLE_DEVICES in ASCENDING order: a descending
+    # list (e.g. "5,4") makes aclInit fail with 107001 "Invalid device ID"
+    # (observed 2026-07-01: every descending pair died instantly at init, every
+    # ascending pair initialized fine). Sort numerically before handing out.
+    ACQUIRED_DIES="$(printf '%s\n' "${got[@]}" | sort -n | tr '\n' ' ')"
+    ACQUIRED_DIES="${ACQUIRED_DIES% }"
+    return 0
   fi
   [[ ${#got[@]} -gt 0 ]] && free+=("${got[@]}")
   [[ ${#parked[@]} -gt 0 ]] && { free+=("${parked[@]}"); parked=(); }

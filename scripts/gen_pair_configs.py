@@ -78,12 +78,16 @@ def _namespace_output_roots(node, pair_id: str, student_tag: str, teacher_tag: s
             _namespace_output_roots(item, pair_id, student_tag, teacher_tag)
 
 
-def _apply_device_map(data: dict, out_name: str, device_map) -> None:
+def _apply_device_map(data: dict, out_name: str, device_map, only_prefixes=None) -> None:
     """Set device_map on the full-finetune baseline configs (sft: model;
-    distill: teacher+student) so a too-big student shards across cards. Only
+    distill: teacher+student) so a too-big model shards across cards. Only
     baseline_sft_/baseline_distill_ get it -- ours (LoRA phaseF) and eval/nosft
-    fit one card. No-op when the pair has no device_map."""
+    fit one card. ``only_prefixes`` (pair spec "device_map_only") further
+    restricts it, e.g. ["baseline_distill_"] for pairs whose sft fits 1 die but
+    whose 8B-teacher distill is fragmentation-marginal. No-op without device_map."""
     if not device_map or not isinstance(data, dict):
+        return
+    if only_prefixes and not any(out_name.startswith(p) for p in only_prefixes):
         return
     if out_name.startswith("baseline_sft_") and isinstance(data.get("model"), dict):
         data["model"]["device_map"] = device_map
@@ -107,7 +111,7 @@ def _render_one(template: Path, pair_id: str, *, dry_run: bool, force: bool) -> 
     data = yaml.safe_load(text)
     if isinstance(data, dict) and isinstance(data.get("lora"), dict):
         data["lora"]["target_modules"] = list(target_modules)
-    _apply_device_map(data, out_name, spec.get("device_map"))
+    _apply_device_map(data, out_name, spec.get("device_map"), spec.get("device_map_only"))
     _namespace_output_roots(data, pair_id, spec["student"]["tag"], spec["teacher"]["tag"])
     rendered = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
     if dry_run:

@@ -3,7 +3,7 @@ teacher:
   name: Qwen3-8B
   path: ../models/Qwen3-8B
   chat_template_enable_thinking: false
-  device_map: ''
+  device_map: auto
   torch_dtype: float32
   runtime_backend: npu
   runtime_device: npu:0
@@ -14,7 +14,7 @@ student:
   name: Qwen3-0.6B
   path: ../models/Qwen3-0.6B
   chat_template_enable_thinking: false
-  device_map: ''
+  device_map: auto
   torch_dtype: float32
   runtime_backend: npu
   runtime_device: npu:0

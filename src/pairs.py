@@ -73,6 +73,11 @@ PAIRS: Dict[str, dict] = {
         "student": {"name": "Llama-3.2-1B-Instruct", "path": "../models/Llama-3.2-1B-Instruct", "tag": "llama32_1b"},
         "family": "llama3",
         "target_modules": _DENSE_TARGET_MODULES,
+        # 8B-teacher fp32 distill peaks at 51-55GB and dies on fragmentation
+        # spikes (WGM/WJB/c5/coconot OOM'd; pan squeaked through). Shard the
+        # DISTILL step across 2 dies; sft (1B student) stays 1-die.
+        "device_map": "auto",
+        "device_map_only": ["baseline_distill_"],
     },
     "qwen3_8b_to_06b": {
         "pair_id": "qwen3_8b_to_06b",
@@ -80,6 +85,9 @@ PAIRS: Dict[str, dict] = {
         "student": {"name": "Qwen3-0.6B", "path": "../models/Qwen3-0.6B", "tag": "qwen3_06b"},
         "family": "qwen3",
         "target_modules": _DENSE_TARGET_MODULES,
+        # Same 8B-teacher distill marginality (WGM OOM'd at 52.3GB).
+        "device_map": "auto",
+        "device_map_only": ["baseline_distill_"],
     },
     "qwen3_8b_to_4b": {
         "pair_id": "qwen3_8b_to_4b",
