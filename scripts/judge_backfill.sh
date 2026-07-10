@@ -24,6 +24,7 @@
 #   bash scripts/judge_backfill.sh                 # everything, dies 0-7
 #   DIES="0 1 2 3" bash scripts/judge_backfill.sh  # restrict dies
 #   ONLY=qwen3_8b_to_4b bash scripts/judge_backfill.sh   # path filter (regex)
+#   DATASETS="pan c5" bash scripts/judge_backfill.sh     # restrict datasets
 #   DRY_RUN=1 bash scripts/judge_backfill.sh       # list jobs only
 #   FORCE=1 ALLOW_REJUDGE=1 bash scripts/judge_backfill.sh # explicit re-judge
 #   INCLUDE_SWEEP=1 bash scripts/judge_backfill.sh # include sweep outputs too
@@ -53,6 +54,7 @@ DRY="${DRY_RUN:-}"
 INCLUDE_SWEEP="${INCLUDE_SWEEP:-0}"
 EXCLUDE_LIVE_SWEEP="${EXCLUDE_LIVE_SWEEP:-0}"
 EXCLUDE="${EXCLUDE:-}"    # optional extra regex filter on normalized paths
+DATASETS="${DATASETS:-pan safety_tuned_llamas coconot wildguardmix wildjailbreak c5}"
 
 norm_path() { printf '%s' "$1" | tr '\\' '/'; }
 
@@ -93,8 +95,40 @@ ds_of_path() {
   esac
 }
 test_jsonl_of() {  # $1 = dataset
-  if [[ "$1" == "pan" ]]; then echo "data/processed/pan_test_set.jsonl"
-  else echo "data/processed/eval/$1_test.jsonl"; fi
+  local primary fallback
+  if [[ "$1" == "pan" ]]; then
+    primary="data/processed/pan_test_set.jsonl"
+  else
+    primary="data/processed/eval/$1_test.jsonl"
+  fi
+  if [[ -f "$primary" ]]; then
+    echo "$primary"
+    return
+  fi
+  fallback="${primary/data\/processed\//data/processed/processed/}"
+  if [[ "$fallback" != "$primary" && -f "$fallback" ]]; then
+    echo "$fallback"
+    return
+  fi
+  echo "$primary"
+}
+
+canon_dataset() {
+  case "$1" in
+    STL|stl) echo safety_tuned_llamas ;;
+    WGM|wgm) echo wildguardmix ;;
+    WJB|wjb) echo wildjailbreak ;;
+    *)       echo "$1" ;;
+  esac
+}
+
+dataset_enabled() {
+  local want item
+  want="$(canon_dataset "$1")"
+  for item in $DATASETS; do
+    [[ "$(canon_dataset "$item")" == "$want" ]] && return 0
+  done
+  return 1
 }
 
 # --- already-judged checks ---------------------------------------------------
@@ -139,10 +173,16 @@ single_needs_merge() {  # $1 = pan_results.json
 # --- build the job queue: "suite|<dir>|<ds>" / "single|<file>|<ds>" ----------
 jobs=()
 skipped=0
+skipped_dataset=0
 while IFS= read -r suite; do
   [[ -z "$suite" ]] && continue
   is_sweep_path "$suite" && continue
   [[ -n "$ONLY" && ! "$suite" =~ $ONLY ]] && continue
+  ds="$(ds_of_path "$suite")"
+  if ! dataset_enabled "$ds"; then
+    skipped_dataset=$((skipped_dataset+1))
+    continue
+  fi
   prs=()
   while IFS= read -r pr; do prs+=("$pr"); done < <(find "$suite" -name pan_results.json 2>/dev/null | sort)
   [[ ${#prs[@]} -eq 0 ]] && continue
@@ -162,10 +202,9 @@ while IFS= read -r suite; do
     continue
   fi
 
-  ds="$(ds_of_path "$suite")"
   if [[ ${#missing[@]} -eq ${#prs[@]} && ${#prs[@]} -gt 1 ]]; then
     # Fresh suite: judge all epochs in one process so WildGuard loads once.
-    jobs+=("suite|$suite|$(ds_of_path "$suite")")
+    jobs+=("suite|$suite|$ds")
   else
     # Partial backfill: judge ONLY missing epochs; do not re-run existing judge.
     for pr in "${missing[@]}"; do jobs+=("single|$pr|$ds"); done
@@ -177,23 +216,50 @@ while IFS= read -r pr; do
   [[ -z "$pr" ]] && continue
   is_sweep_path "$pr" && continue
   [[ -n "$ONLY" && ! "$pr" =~ $ONLY ]] && continue
+  ds="$(ds_of_path "$pr")"
+  if ! dataset_enabled "$ds"; then
+    skipped_dataset=$((skipped_dataset+1))
+    continue
+  fi
   if single_needs_judge "$pr"; then
-    jobs+=("single|$pr|$(ds_of_path "$pr")")
+    jobs+=("single|$pr|$ds")
   elif single_needs_merge "$pr"; then
-    jobs+=("merge_single|$pr|$(ds_of_path "$pr")")
+    jobs+=("merge_single|$pr|$ds")
   else skipped=$((skipped+1)); fi
 done < <(find outputs -name pan_results.json -not -path "*/eval_suite/*" 2>/dev/null | sort)
 
-echo "[judge] pending=${#jobs[@]} already_judged_skipped=$skipped die_pool=(${DIE_POOL[*]}) include_sweep=$INCLUDE_SWEEP exclude_live_sweep=$EXCLUDE_LIVE_SWEEP force=$FORCE allow_rejudge=$ALLOW_REJUDGE ${ONLY:+only=$ONLY} ${DRY:+(DRY-RUN)}"
+# Missing test-jsonl guard. Do not let one missing prompt source block all other
+# judge backfill jobs; skip only the affected dataset/path and keep going.
+skipped_missing_test_jsonl=0
+runnable_jobs=()
+declare -A missing_test_seen
+for j in "${jobs[@]}"; do
+  if [[ "$j" == merge_* ]]; then
+    runnable_jobs+=("$j")
+    continue
+  fi
+  ds="${j##*|}"
+  tj="$(test_jsonl_of "$ds")"
+  if [[ -f "$tj" ]]; then
+    runnable_jobs+=("$j")
+    continue
+  fi
+  skipped_missing_test_jsonl=$((skipped_missing_test_jsonl+1))
+  if [[ -z "${missing_test_seen[$ds]:-}" ]]; then
+    echo "[judge][WARN] test jsonl missing for ds=$ds: $tj"
+    if [[ "$ds" == "pan" ]]; then
+      echo "[judge][WARN] build PAN data first: $PYBIN scripts/00_prepare_data.py"
+    else
+      echo "[judge][WARN] build it first: $PYBIN scripts/21_build_baseline_eval_jsonls.py --baseline $ds --force-rebuild"
+    fi
+    missing_test_seen[$ds]=1
+  fi
+done
+jobs=("${runnable_jobs[@]}")
+
+echo "[judge] pending=${#jobs[@]} already_judged_skipped=$skipped skipped_dataset=$skipped_dataset skipped_missing_test_jsonl=$skipped_missing_test_jsonl die_pool=(${DIE_POOL[*]}) datasets=($DATASETS) include_sweep=$INCLUDE_SWEEP exclude_live_sweep=$EXCLUDE_LIVE_SWEEP force=$FORCE allow_rejudge=$ALLOW_REJUDGE ${ONLY:+only=$ONLY} ${DRY:+(DRY-RUN)}"
 for j in "${jobs[@]}"; do echo "  - $j"; done
 [[ -n "$DRY" || ${#jobs[@]} -eq 0 ]] && { echo "[judge] nothing to run."; exit 0; }
-
-# missing test-jsonl guard (fail early, per unique ds)
-for j in "${jobs[@]}"; do
-  ds="${j##*|}"; tj="$(test_jsonl_of "$ds")"
-  [[ "$j" == merge_* ]] && continue
-  [[ -f "$tj" ]] || { echo "[judge][ERR] test jsonl missing for ds=$ds: $tj (build it first via 21_build_baseline_eval_jsonls / 19_prepare)"; exit 1; }
-done
 
 merge_existing_one() {  # $1 = pan_results.json with sibling judge_results.json
   $PYBIN - "$1" <<'PY'
