@@ -256,3 +256,14 @@ class ReportWritingTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, 2)
                 self.assertFalse(list(outputs_root.glob("llm_judge_results_*")))
                 self.assertFalse((outputs_root / "reports").exists())
+
+    def test_write_reports_rejects_output_dir_at_or_inside_outputs_root_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outputs_root = root / "outputs"
+            outputs_root.mkdir()
+            for output_dir in (outputs_root, outputs_root / "reports"):
+                with self.assertRaises(ValueError):
+                    self.collector.write_reports([], output_dir, outputs_root)
+                self.assertFalse(list(outputs_root.glob("llm_judge_results_*")))
+                self.assertFalse((outputs_root / "reports").exists())

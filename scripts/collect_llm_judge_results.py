@@ -215,6 +215,7 @@ def collect_rows(
 def write_reports(
     rows: Sequence[dict[str, object]], output_dir: Path, outputs_root: Path
 ) -> list[Path]:
+    _validate_output_dir(output_dir, outputs_root)
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for pair_id in FORMAL_PAIRS:
@@ -261,6 +262,11 @@ def _is_at_or_within(path: Path, root: Path) -> bool:
     return True
 
 
+def _validate_output_dir(output_dir: Path, outputs_root: Path) -> None:
+    if _is_at_or_within(output_dir, outputs_root):
+        raise ValueError("--output-dir must be outside --outputs-root")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--outputs-root", type=Path, default=PROJECT_ROOT / "outputs")
@@ -270,8 +276,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     outputs_root = _resolve_root(args.outputs_root, PROJECT_ROOT)
     output_dir = _resolve_root(args.output_dir, PROJECT_ROOT)
-    if _is_at_or_within(output_dir, outputs_root):
-        parser.error("--output-dir must be outside --outputs-root")
+    try:
+        _validate_output_dir(output_dir, outputs_root)
+    except ValueError as exc:
+        parser.error(str(exc))
     rows = collect_rows(PROJECT_ROOT, outputs_root)
     paths = write_reports(rows, output_dir, outputs_root)
     ok_count = sum(row["status"] == "ok" for row in rows)
