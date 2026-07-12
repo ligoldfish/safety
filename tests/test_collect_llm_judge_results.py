@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+import importlib.util
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def _load_collector():
+    path = PROJECT_ROOT / "scripts" / "collect_llm_judge_results.py"
+    spec = importlib.util.spec_from_file_location("llm_judge_collector", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class ResultSpecTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.collector = _load_collector()
+
+    def test_each_pair_has_52_expected_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "outputs"
+            for pair_id in self.collector.FORMAL_PAIRS:
+                specs = self.collector.iter_result_specs(root, [pair_id])
+                self.assertEqual(len(specs), 52)
+
+    def test_canonical_and_extension_paths_are_exact(self) -> None:
+        root = Path("/repo/outputs")
+        specs = self.collector.iter_result_specs(
+            root, ["qwen35_9b_to_08b", "llama31_8b_to_1b"]
+        )
+        by_key = {(s.pair_id, s.dataset, s.method, s.epoch): s for s in specs}
+        canonical = by_key[("qwen35_9b_to_08b", "pan", "ours", "epoch_002")]
+        self.assertEqual(
+            canonical.result_dir,
+            root / "qwen35_9b_to_08b_phase1_npu" / "training"
+            / "eval_suite" / "epoch_002",
+        )
+        extension = by_key[
+            ("llama31_8b_to_1b", "safety_tuned_llamas", "distill", "epoch_006")
+        ]
+        self.assertEqual(
+            extension.result_dir,
+            root / "baselines"
+            / "distill_llama31_8b_to_1b_safety_tuned_llamas_npu"
+            / "eval_suite" / "epoch_006",
+        )
+        nosft = by_key[("llama31_8b_to_1b", "c5", "nosft", "single")]
+        self.assertEqual(
+            nosft.result_dir,
+            root / "baselines" / "llama32_1b_eval_c5_npu",
+        )
+
+    def test_stl_epoch_rules_are_method_specific(self) -> None:
+        specs = self.collector.iter_result_specs(Path("outputs"), ["qwen35_9b_to_08b"])
+        epochs = {}
+        for spec in specs:
+            if spec.dataset == "safety_tuned_llamas":
+                epochs.setdefault(spec.method, []).append(spec.epoch)
+        self.assertEqual(epochs["ours"], ["epoch_002", "epoch_003"])
+        self.assertEqual(epochs["ours_sft1"], ["epoch_002", "epoch_003"])
+        self.assertEqual(epochs["sft"], ["epoch_006"])
+        self.assertEqual(epochs["distill"], ["epoch_006"])
+        self.assertEqual(epochs["nosft"], ["single"])
+
+    def test_no_constructed_path_can_point_at_search_outputs(self) -> None:
+        specs = self.collector.iter_result_specs(Path("outputs"))
+        forbidden = ("/sweep/", "LW05", "LW10", "TK2", "DEF_", "EP5")
+        for spec in specs:
+            normalized = "/" + spec.result_dir.as_posix() + "/"
+            self.assertFalse(any(token in normalized for token in forbidden))
