@@ -152,3 +152,22 @@ class MetricLoadingTests(unittest.TestCase):
             )
             partial = self.collector.load_result(self._spec(incomplete), root)
             self.assertEqual(partial["status"], "incomplete")
+
+    def test_malformed_summary_structures_are_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            malformed_payloads = (
+                {"results": None},
+                {"results": []},
+                {"results": "bad"},
+                [],
+            )
+            for index, payload in enumerate(malformed_payloads):
+                result_dir = root / f"malformed_{index}"
+                result_dir.mkdir()
+                (result_dir / "summary.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                row = self.collector.load_result(self._spec(result_dir), root)
+                self.assertEqual(row["status"], "malformed")
+                self.assertEqual(row["source_kind"], "")

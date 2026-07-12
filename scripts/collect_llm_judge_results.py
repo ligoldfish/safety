@@ -64,7 +64,14 @@ def _read_candidate(path: Path, summary: bool) -> tuple[dict[str, object] | None
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return None, "malformed", f"cannot read JSON: {exc}"
     if summary:
-        payload = payload.get("results", {}).get("pan", {}) if isinstance(payload, dict) else {}
+        if not isinstance(payload, dict):
+            return None, "malformed", "summary payload is not an object"
+        results = payload.get("results", {})
+        if not isinstance(results, dict):
+            return None, "malformed", "summary results is not an object"
+        payload = results.get("pan", {})
+        if not isinstance(payload, dict):
+            return None, "malformed", "summary results.pan is not an object"
     if not isinstance(payload, dict):
         return None, "malformed", "metric payload is not an object"
     missing = [key for key in CORE_METRICS if key not in payload]
