@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -59,13 +60,35 @@ def _valid_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _metric_error(key: str, value: object) -> str | None:
+    rate_metrics = (*CORE_METRICS, "judge_keyword_agreement", "judge_parse_rate")
+    if key in rate_metrics:
+        if not _valid_number(value) or not math.isfinite(value) or not 0 <= value <= 1:
+            return f"{key} must be finite and within [0,1]"
+    elif key == "judge_cohen_kappa":
+        if not _valid_number(value) or not math.isfinite(value) or not -1 <= value <= 1:
+            return f"{key} must be finite and within [-1,1]"
+    elif key in {"judge_num_harmful_scored", "judge_num_harmless_scored"}:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"{key} must be a nonnegative integer"
+    return None
+
+
 def _read_candidate(path: Path, summary: bool) -> tuple[dict[str, object] | None, str, str]:
     if not path.is_file():
-        return None, "missing", f"file not found: {path}"
+        return None, "missing", "file not found"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return None, "malformed", f"cannot read JSON: {exc}"
+    except OSError as exc:
+        return None, "malformed", f"cannot read file: {exc.strerror or type(exc).__name__}"
+    except UnicodeError as exc:
+        return None, "malformed", f"cannot decode UTF-8: {getattr(exc, 'reason', type(exc).__name__)}"
+    except json.JSONDecodeError as exc:
+        return (
+            None,
+            "malformed",
+            f"cannot parse JSON: {exc.msg} at line {exc.lineno} column {exc.colno}",
+        )
     if summary:
         if not isinstance(payload, dict):
             return None, "malformed", "summary payload is not an object"
@@ -78,15 +101,16 @@ def _read_candidate(path: Path, summary: bool) -> tuple[dict[str, object] | None
     if not isinstance(payload, dict):
         return None, "malformed", "metric payload is not an object"
     missing = [key for key in CORE_METRICS if key not in payload]
-    invalid = [key for key in CORE_METRICS if key in payload and not _valid_number(payload[key])]
-    optional_invalid = [
-        key for key in OPTIONAL_METRICS
-        if key in payload and payload[key] is not None and not _valid_number(payload[key])
+    invalid = [
+        error
+        for key in (*CORE_METRICS, *OPTIONAL_METRICS)
+        if key in payload and payload[key] is not None
+        if (error := _metric_error(key, payload[key])) is not None
     ]
     if missing:
         return None, "incomplete", f"missing metrics: {', '.join(missing)}"
-    if invalid or optional_invalid:
-        return None, "malformed", f"non-numeric metrics: {', '.join(invalid + optional_invalid)}"
+    if invalid:
+        return None, "malformed", f"invalid metrics: {'; '.join(invalid)}"
     return payload, "ok", ""
 
 
@@ -104,16 +128,22 @@ def load_result(spec: ResultSpec, project_root: Path) -> dict[str, object]:
         **{key: "" for key in (*CORE_METRICS, *OPTIONAL_METRICS)},
         "source_path": "",
         "error": "",
+        "candidate_failures": [],
     }
     candidates = (
-        (spec.result_dir / "judge_results.json", False, "judge_results"),
-        (spec.result_dir / "summary.json", True, "summary_fallback"),
+        (spec.result_dir / "judge_results.json", False, "judge_results", "judge_results"),
+        (spec.result_dir / "summary.json", True, "summary", "summary_fallback"),
     )
-    failures: list[tuple[str, str, str]] = []
-    for path, summary, source_kind in candidates:
+    failures: list[dict[str, object]] = []
+    for path, summary, candidate_kind, source_kind in candidates:
         payload, status, error = _read_candidate(path, summary)
         if payload is None:
-            failures.append((source_kind, status, error))
+            failures.append({
+                "kind": candidate_kind,
+                "status": status,
+                "path": portable_path(path, project_root),
+                "error": error,
+            })
             continue
         row["status"] = "ok"
         row["source_kind"] = source_kind
@@ -122,13 +152,19 @@ def load_result(spec: ResultSpec, project_root: Path) -> dict[str, object]:
             if key in payload:
                 row[key] = payload[key]
         if failures:
-            row["error"] = "; ".join(f"{kind}: {detail}" for kind, _, detail in failures)
+            row["candidate_failures"] = failures
+            row["error"] = "; ".join(
+                f"{failure['kind']}: {failure['error']}" for failure in failures
+            )
         return row
 
     precedence = {"missing": 0, "incomplete": 1, "malformed": 2}
-    status = max((item[1] for item in failures), key=precedence.__getitem__)
+    status = max((str(item["status"]) for item in failures), key=precedence.__getitem__)
     row["status"] = status
-    row["error"] = "; ".join(f"{kind}: {detail}" for kind, _, detail in failures)
+    row["candidate_failures"] = failures
+    row["error"] = "; ".join(
+        f"{failure['kind']}: {failure['error']}" for failure in failures
+    )
     return row
 
 
@@ -188,17 +224,23 @@ def portable_path(path: Path, project_root: Path | None = None) -> str:
 
 
 def identity_and_source(row: dict[str, object]) -> dict[str, object]:
-    return {
+    identity = {
         key: row[key]
         for key in ("model_pair", "dataset", "method", "epoch", "source_kind", "source_path")
     }
+    failures = row.get("candidate_failures", [])
+    if failures:
+        identity["primary_candidate"] = failures[0]
+    return identity
 
 
 def identity_source_and_error(row: dict[str, object]) -> dict[str, object]:
-    return {
+    issue = {
         key: row[key]
         for key in ("model_pair", "dataset", "method", "epoch", "status", "source_path", "error")
     }
+    issue["candidates"] = row.get("candidate_failures", [])
+    return issue
 
 
 def collect_rows(
