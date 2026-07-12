@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,13 @@ def _load_collector():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+CORE = {
+    "llm_judge_asr": 0.1,
+    "llm_judge_over_refusal": 0.2,
+    "llm_judge_refusal_rate": 0.7,
+}
 
 
 class ResultSpecTests(unittest.TestCase):
@@ -78,3 +86,69 @@ class ResultSpecTests(unittest.TestCase):
         for spec in specs:
             normalized = "/" + spec.result_dir.as_posix() + "/"
             self.assertFalse(any(token in normalized for token in forbidden))
+
+
+class MetricLoadingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.collector = _load_collector()
+
+    def _spec(self, root: Path):
+        return self.collector.ResultSpec(
+            "qwen35_9b_to_08b", "pan", "ours", "epoch_002", root
+        )
+
+    def test_judge_results_has_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result_dir = Path(tmp) / "outputs" / "run" / "epoch_002"
+            result_dir.mkdir(parents=True)
+            (result_dir / "judge_results.json").write_text(
+                json.dumps({**CORE, "judge_parse_rate": 0.99}), encoding="utf-8"
+            )
+            (result_dir / "summary.json").write_text(
+                json.dumps({"results": {"pan": {**CORE, "llm_judge_asr": 0.9}}}),
+                encoding="utf-8",
+            )
+            row = self.collector.load_result(self._spec(result_dir), Path(tmp))
+            self.assertEqual(row["status"], "ok")
+            self.assertEqual(row["source_kind"], "judge_results")
+            self.assertEqual(row["llm_judge_asr"], 0.1)
+
+    def test_incomplete_judge_falls_back_to_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result_dir = Path(tmp) / "outputs" / "run"
+            result_dir.mkdir(parents=True)
+            (result_dir / "judge_results.json").write_text(
+                json.dumps({"llm_judge_asr": 0.1}), encoding="utf-8"
+            )
+            (result_dir / "summary.json").write_text(
+                json.dumps({"results": {"pan": CORE}}), encoding="utf-8"
+            )
+            row = self.collector.load_result(self._spec(result_dir), Path(tmp))
+            self.assertEqual(row["status"], "ok")
+            self.assertEqual(row["source_kind"], "summary_fallback")
+
+    def test_missing_result_is_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result_dir = Path(tmp) / "absent"
+            row = self.collector.load_result(self._spec(result_dir), Path(tmp))
+            self.assertEqual(row["status"], "missing")
+            self.assertEqual(row["source_kind"], "")
+            self.assertEqual(row["llm_judge_asr"], "")
+
+    def test_malformed_and_incomplete_results_are_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            malformed = root / "malformed"
+            malformed.mkdir()
+            (malformed / "judge_results.json").write_text("{", encoding="utf-8")
+            bad = self.collector.load_result(self._spec(malformed), root)
+            self.assertEqual(bad["status"], "malformed")
+
+            incomplete = root / "incomplete"
+            incomplete.mkdir()
+            (incomplete / "judge_results.json").write_text(
+                json.dumps({"llm_judge_asr": 0.1}), encoding="utf-8"
+            )
+            partial = self.collector.load_result(self._spec(incomplete), root)
+            self.assertEqual(partial["status"], "incomplete")

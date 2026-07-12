@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,23 @@ DATASETS = (
     "wildguardmix", "wildjailbreak", "c5",
 )
 METHODS = ("ours", "ours_sft1", "sft", "distill", "nosft")
+CORE_METRICS = (
+    "llm_judge_asr",
+    "llm_judge_over_refusal",
+    "llm_judge_refusal_rate",
+)
+OPTIONAL_METRICS = (
+    "judge_keyword_agreement",
+    "judge_cohen_kappa",
+    "judge_parse_rate",
+    "judge_num_harmful_scored",
+    "judge_num_harmless_scored",
+)
+CSV_FIELDS = (
+    "model_pair", "teacher_model", "student_model", "dataset", "method",
+    "epoch", "status", "source_kind", *CORE_METRICS, *OPTIONAL_METRICS,
+    "source_path",
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +50,76 @@ class ResultSpec:
     method: str
     epoch: str
     result_dir: Path
+
+
+def _valid_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _read_candidate(path: Path, summary: bool) -> tuple[dict[str, object] | None, str, str]:
+    if not path.is_file():
+        return None, "missing", f"file not found: {path}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return None, "malformed", f"cannot read JSON: {exc}"
+    if summary:
+        payload = payload.get("results", {}).get("pan", {}) if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return None, "malformed", "metric payload is not an object"
+    missing = [key for key in CORE_METRICS if key not in payload]
+    invalid = [key for key in CORE_METRICS if key in payload and not _valid_number(payload[key])]
+    optional_invalid = [
+        key for key in OPTIONAL_METRICS
+        if key in payload and payload[key] is not None and not _valid_number(payload[key])
+    ]
+    if missing:
+        return None, "incomplete", f"missing metrics: {', '.join(missing)}"
+    if invalid or optional_invalid:
+        return None, "malformed", f"non-numeric metrics: {', '.join(invalid + optional_invalid)}"
+    return payload, "ok", ""
+
+
+def load_result(spec: ResultSpec, project_root: Path) -> dict[str, object]:
+    pair = PAIRS[spec.pair_id]
+    row: dict[str, object] = {
+        "model_pair": spec.pair_id,
+        "teacher_model": pair["teacher"]["name"],
+        "student_model": pair["student"]["name"],
+        "dataset": spec.dataset,
+        "method": spec.method,
+        "epoch": spec.epoch,
+        "status": "missing",
+        "source_kind": "",
+        **{key: "" for key in (*CORE_METRICS, *OPTIONAL_METRICS)},
+        "source_path": "",
+        "error": "",
+    }
+    candidates = (
+        (spec.result_dir / "judge_results.json", False, "judge_results"),
+        (spec.result_dir / "summary.json", True, "summary_fallback"),
+    )
+    failures: list[tuple[str, str, str]] = []
+    for path, summary, source_kind in candidates:
+        payload, status, error = _read_candidate(path, summary)
+        if payload is None:
+            failures.append((source_kind, status, error))
+            continue
+        row["status"] = "ok"
+        row["source_kind"] = source_kind
+        row["source_path"] = path.relative_to(project_root).as_posix()
+        for key in (*CORE_METRICS, *OPTIONAL_METRICS):
+            if key in payload:
+                row[key] = payload[key]
+        if failures:
+            row["error"] = "; ".join(f"{kind}: {detail}" for kind, _, detail in failures)
+        return row
+
+    precedence = {"missing": 0, "incomplete": 1, "malformed": 2}
+    status = max((item[1] for item in failures), key=precedence.__getitem__)
+    row["status"] = status
+    row["error"] = "; ".join(f"{kind}: {detail}" for kind, _, detail in failures)
+    return row
 
 
 def _epochs(dataset: str, method: str) -> tuple[str, ...]:
