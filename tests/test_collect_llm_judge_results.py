@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+import csv
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -171,3 +172,58 @@ class MetricLoadingTests(unittest.TestCase):
                 row = self.collector.load_result(self._spec(result_dir), root)
                 self.assertEqual(row["status"], "malformed")
                 self.assertEqual(row["source_kind"], "")
+
+
+class ReportWritingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.collector = _load_collector()
+
+    def test_writes_one_csv_per_pair_and_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = []
+            for pair_id in self.collector.FORMAL_PAIRS:
+                spec = self.collector.ResultSpec(
+                    pair_id, "pan", "nosft", "single", root / pair_id
+                )
+                rows.append(self.collector.load_result(spec, root))
+            paths = self.collector.write_reports(rows, root / "reports", root / "outputs")
+            self.assertEqual(len(paths), 6)
+            for pair_id in self.collector.FORMAL_PAIRS:
+                csv_path = root / "reports" / f"llm_judge_results_{pair_id}.csv"
+                self.assertTrue(csv_path.is_file())
+                with csv_path.open(encoding="utf-8", newline="") as handle:
+                    records = list(csv.DictReader(handle))
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["status"], "missing")
+            audit = json.loads(
+                (root / "reports" / "llm_judge_results_audit.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(audit["status_counts"], {"missing": 5})
+            self.assertEqual(len(audit["issues"]), 5)
+
+    def test_summary_fallback_is_listed_in_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result_dir = root / "run"
+            result_dir.mkdir()
+            (result_dir / "summary.json").write_text(
+                json.dumps({"results": {"pan": CORE}}), encoding="utf-8"
+            )
+            spec = self.collector.ResultSpec(
+                "qwen35_9b_to_08b", "pan", "ours", "epoch_002", result_dir
+            )
+            row = self.collector.load_result(spec, root)
+            self.collector.write_reports([row], root / "reports", root / "outputs")
+            audit = json.loads(
+                (root / "reports" / "llm_judge_results_audit.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(audit["summary_fallback_rows"]), 1)
+
+    def test_main_exit_code_respects_allow_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            common = ["--outputs-root", str(root / "outputs"), "--output-dir", str(root / "reports")]
+            self.assertEqual(self.collector.main(common), 1)
+            self.assertEqual(self.collector.main([*common, "--allow-missing"]), 0)

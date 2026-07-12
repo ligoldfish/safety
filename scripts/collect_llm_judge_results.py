@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import argparse
+import csv
 import json
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -173,3 +176,97 @@ def iter_result_specs(
                     result_dir = root if epoch == "single" else root / epoch
                     specs.append(ResultSpec(pair_id, dataset, method, epoch, result_dir))
     return specs
+
+
+def portable_path(path: Path) -> str:
+    return path.as_posix()
+
+
+def identity_and_source(row: dict[str, object]) -> dict[str, object]:
+    return {
+        key: row[key]
+        for key in ("model_pair", "dataset", "method", "epoch", "source_kind", "source_path")
+    }
+
+
+def identity_source_and_error(row: dict[str, object]) -> dict[str, object]:
+    return {
+        key: row[key]
+        for key in ("model_pair", "dataset", "method", "epoch", "status", "source_path", "error")
+    }
+
+
+def collect_rows(
+    project_root: Path,
+    outputs_root: Path,
+    pair_ids: Sequence[str] = FORMAL_PAIRS,
+) -> list[dict[str, object]]:
+    return [
+        load_result(spec, project_root)
+        for spec in iter_result_specs(outputs_root, pair_ids)
+    ]
+
+
+def write_reports(
+    rows: Sequence[dict[str, object]], output_dir: Path, outputs_root: Path
+) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for pair_id in FORMAL_PAIRS:
+        path = output_dir / f"llm_judge_results_{pair_id}.csv"
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(row for row in rows if row["model_pair"] == pair_id)
+        paths.append(path)
+
+    audit = {
+        "outputs_root": portable_path(outputs_root),
+        "total_rows": len(rows),
+        "status_counts": dict(sorted(Counter(row["status"] for row in rows).items())),
+        "source_kind_counts": dict(sorted(
+            Counter(row["source_kind"] for row in rows if row["source_kind"]).items()
+        )),
+        "summary_fallback_rows": [
+            identity_and_source(row)
+            for row in rows
+            if row["source_kind"] == "summary_fallback"
+        ],
+        "issues": [
+            identity_source_and_error(row)
+            for row in rows
+            if row["status"] != "ok"
+        ],
+    }
+    audit_path = output_dir / "llm_judge_results_audit.json"
+    audit_path.write_text(json.dumps(audit, indent=2) + "\n", encoding="utf-8")
+    paths.append(audit_path)
+    return paths
+
+
+def _resolve_root(path: Path, project_root: Path) -> Path:
+    return path if path.is_absolute() else project_root / path
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--outputs-root", type=Path, default=PROJECT_ROOT / "outputs")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT)
+    parser.add_argument("--allow-missing", action="store_true")
+    args = parser.parse_args(argv)
+
+    outputs_root = _resolve_root(args.outputs_root, PROJECT_ROOT)
+    output_dir = _resolve_root(args.output_dir, PROJECT_ROOT)
+    rows = collect_rows(PROJECT_ROOT, outputs_root)
+    paths = write_reports(rows, output_dir, outputs_root)
+    ok_count = sum(row["status"] == "ok" for row in rows)
+    fallback_count = sum(row["source_kind"] == "summary_fallback" for row in rows)
+    issue_count = len(rows) - ok_count
+    print(f"total={len(rows)} ok={ok_count} fallback={fallback_count} issues={issue_count}")
+    for path in paths:
+        print(portable_path(path))
+    return 1 if issue_count and not args.allow_missing else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
