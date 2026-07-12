@@ -117,7 +117,7 @@ def load_result(spec: ResultSpec, project_root: Path) -> dict[str, object]:
             continue
         row["status"] = "ok"
         row["source_kind"] = source_kind
-        row["source_path"] = path.relative_to(project_root).as_posix()
+        row["source_path"] = portable_path(path, project_root)
         for key in (*CORE_METRICS, *OPTIONAL_METRICS):
             if key in payload:
                 row[key] = payload[key]
@@ -178,7 +178,12 @@ def iter_result_specs(
     return specs
 
 
-def portable_path(path: Path) -> str:
+def portable_path(path: Path, project_root: Path | None = None) -> str:
+    if project_root is not None:
+        try:
+            return path.relative_to(project_root).as_posix()
+        except ValueError:
+            pass
     return path.as_posix()
 
 
@@ -248,6 +253,14 @@ def _resolve_root(path: Path, project_root: Path) -> Path:
     return path if path.is_absolute() else project_root / path
 
 
+def _is_at_or_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--outputs-root", type=Path, default=PROJECT_ROOT / "outputs")
@@ -257,6 +270,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     outputs_root = _resolve_root(args.outputs_root, PROJECT_ROOT)
     output_dir = _resolve_root(args.output_dir, PROJECT_ROOT)
+    if _is_at_or_within(output_dir, outputs_root):
+        parser.error("--output-dir must be outside --outputs-root")
     rows = collect_rows(PROJECT_ROOT, outputs_root)
     paths = write_reports(rows, output_dir, outputs_root)
     ok_count = sum(row["status"] == "ok" for row in rows)

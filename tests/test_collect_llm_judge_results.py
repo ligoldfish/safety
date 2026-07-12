@@ -115,6 +115,20 @@ class MetricLoadingTests(unittest.TestCase):
             self.assertEqual(row["source_kind"], "judge_results")
             self.assertEqual(row["llm_judge_asr"], 0.1)
 
+    def test_external_source_path_is_portable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_root = root / "project"
+            result_dir = root / "external_outputs" / "run"
+            result_dir.mkdir(parents=True)
+            source_path = result_dir / "judge_results.json"
+            source_path.write_text(json.dumps(CORE), encoding="utf-8")
+
+            row = self.collector.load_result(self._spec(result_dir), project_root)
+
+            self.assertEqual(row["status"], "ok")
+            self.assertEqual(row["source_path"], source_path.as_posix())
+
     def test_incomplete_judge_falls_back_to_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result_dir = Path(tmp) / "outputs" / "run"
@@ -227,3 +241,18 @@ class ReportWritingTests(unittest.TestCase):
             common = ["--outputs-root", str(root / "outputs"), "--output-dir", str(root / "reports")]
             self.assertEqual(self.collector.main(common), 1)
             self.assertEqual(self.collector.main([*common, "--allow-missing"]), 0)
+
+    def test_main_rejects_output_dir_at_or_inside_outputs_root_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outputs_root = root / "outputs"
+            outputs_root.mkdir()
+            for output_dir in (outputs_root, outputs_root / "reports"):
+                with self.assertRaises(SystemExit) as raised:
+                    self.collector.main([
+                        "--outputs-root", str(outputs_root),
+                        "--output-dir", str(output_dir),
+                    ])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(list(outputs_root.glob("llm_judge_results_*")))
+                self.assertFalse((outputs_root / "reports").exists())
