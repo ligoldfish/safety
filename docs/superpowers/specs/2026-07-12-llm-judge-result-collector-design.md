@@ -22,9 +22,12 @@ The expected matrix is explicit rather than discovered recursively:
 The model registry in `src/pairs.py` supplies teacher, student, and model-tag
 metadata. The path resolver constructs only canonical formal paths:
 
-- `ours` and `ours_sft1` come from
+- PAN `ours` and `ours_sft1` come from
+  `outputs/<pair>_phase1_npu/training[_sft1]/eval_suite`.
+- The other five datasets' `ours` and `ours_sft1` come from
   `outputs/safety_full_<dataset>_npu[_<pair>]/phase1/training[_sft1]/eval_suite`.
-  The canonical Qwen3.5 pair uses the legacy path without a pair suffix.
+  The canonical Qwen3.5 pair uses the legacy safety-full path without a pair
+  suffix.
 - `sft` comes from `outputs/baselines/sft_<student-tag>[_<dataset>]_npu`.
 - `distill` comes from
   `outputs/baselines/distill_<pair>[_<dataset>]_npu`.

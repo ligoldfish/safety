@@ -83,7 +83,7 @@ class ResultSpecTests(unittest.TestCase):
         canonical = by_key[("qwen35_9b_to_08b", "pan", "ours", "epoch_002")]
         self.assertEqual(
             canonical.result_dir,
-            root / "safety_full_pan_npu" / "phase1" / "training"
+            root / "qwen35_9b_to_08b_phase1_npu" / "training"
             / "eval_suite" / "epoch_002",
         )
         extension = by_key[
@@ -180,8 +180,10 @@ def _method_root(outputs_root: Path, pair_id: str, dataset: str, method: str) ->
     student_tag = pair["student"]["tag"]
     dataset_suffix = "" if dataset == "pan" else f"_{dataset}"
     if method in {"ours", "ours_sft1"}:
-        pair_suffix = "" if pair_id == DEFAULT_PAIR else f"_{pair_id}"
         training = "training_sft1" if method == "ours_sft1" else "training"
+        if dataset == "pan":
+            return outputs_root / f"{pair_id}_phase1_npu" / training / "eval_suite"
+        pair_suffix = "" if pair_id == DEFAULT_PAIR else f"_{pair_id}"
         return (
             outputs_root / f"safety_full_{dataset}_npu{pair_suffix}"
             / "phase1" / training / "eval_suite"
