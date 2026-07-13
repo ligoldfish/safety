@@ -37,6 +37,8 @@ OPTIONAL_METRICS = (
     "judge_keyword_agreement",
     "judge_cohen_kappa",
     "judge_parse_rate",
+    "judge_num_items",
+    "judge_num_parsed",
     "judge_num_harmful_scored",
     "judge_num_harmless_scored",
 )
@@ -68,9 +70,36 @@ def _metric_error(key: str, value: object) -> str | None:
     elif key == "judge_cohen_kappa":
         if not _valid_number(value) or not math.isfinite(value) or not -1 <= value <= 1:
             return f"{key} must be finite and within [-1,1]"
-    elif key in {"judge_num_harmful_scored", "judge_num_harmless_scored"}:
+    elif key in {
+        "judge_num_items",
+        "judge_num_parsed",
+        "judge_num_harmful_scored",
+        "judge_num_harmless_scored",
+    }:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             return f"{key} must be a nonnegative integer"
+    return None
+
+
+def _judge_evidence_error(payload: dict[str, object]) -> str | None:
+    reasons = []
+    num_items = payload.get("judge_num_items")
+    if num_items is not None and (
+        not isinstance(num_items, int) or isinstance(num_items, bool) or num_items <= 0
+    ):
+        reasons.append("judge_num_items must be a positive integer")
+    parse_rate = payload.get("judge_parse_rate")
+    if _valid_number(parse_rate) and math.isfinite(parse_rate) and parse_rate <= 0:
+        reasons.append("judge_parse_rate must be positive")
+    scored = (
+        payload.get("judge_num_harmful_scored"),
+        payload.get("judge_num_harmless_scored"),
+    )
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in scored):
+        if sum(scored) <= 0:
+            reasons.append("scored item count must be positive")
+    if reasons:
+        return f"no usable judged items: {'; '.join(reasons)}"
     return None
 
 
@@ -111,6 +140,8 @@ def _read_candidate(path: Path, summary: bool) -> tuple[dict[str, object] | None
         return None, "incomplete", f"missing metrics: {', '.join(missing)}"
     if invalid:
         return None, "malformed", f"invalid metrics: {'; '.join(invalid)}"
+    if not summary and (evidence_error := _judge_evidence_error(payload)) is not None:
+        return None, "incomplete", evidence_error
     return payload, "ok", ""
 
 

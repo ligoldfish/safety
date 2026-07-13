@@ -141,7 +141,13 @@ class MetricLoadingTests(unittest.TestCase):
             result_dir = Path(tmp) / "outputs" / "run" / "epoch_002"
             result_dir.mkdir(parents=True)
             (result_dir / "judge_results.json").write_text(
-                json.dumps({**CORE, "judge_parse_rate": 0.99}), encoding="utf-8"
+                json.dumps({
+                    **CORE,
+                    "judge_parse_rate": 0.99,
+                    "judge_num_items": 100,
+                    "judge_num_parsed": 99,
+                }),
+                encoding="utf-8",
             )
             (result_dir / "summary.json").write_text(
                 json.dumps({"results": {"pan": {**CORE, "llm_judge_asr": 0.9}}}),
@@ -151,6 +157,8 @@ class MetricLoadingTests(unittest.TestCase):
             self.assertEqual(row["status"], "ok")
             self.assertEqual(row["source_kind"], "judge_results")
             self.assertEqual(row["llm_judge_asr"], 0.1)
+            self.assertEqual(row["judge_num_items"], 100)
+            self.assertEqual(row["judge_num_parsed"], 99)
 
     def test_external_source_path_is_portable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -204,17 +212,18 @@ class MetricLoadingTests(unittest.TestCase):
                     self.assertEqual(row["status"], "malformed")
                     self.assertIn(metric, row["error"])
 
-    def test_accepts_metric_domain_boundaries_and_integer_counts(self) -> None:
+    def test_accepts_metric_domain_boundaries_with_usable_judged_items(self) -> None:
         payloads = (
             {
                 "llm_judge_asr": 0,
                 "llm_judge_over_refusal": 0,
                 "llm_judge_refusal_rate": 0,
                 "judge_keyword_agreement": 0,
-                "judge_parse_rate": 0,
+                "judge_parse_rate": 0.5,
                 "judge_cohen_kappa": -1,
-                "judge_num_harmful_scored": 0,
+                "judge_num_harmful_scored": 1,
                 "judge_num_harmless_scored": 0,
+                "judge_num_items": 2,
             },
             {
                 "llm_judge_asr": 1,
@@ -225,6 +234,7 @@ class MetricLoadingTests(unittest.TestCase):
                 "judge_cohen_kappa": 1,
                 "judge_num_harmful_scored": 2,
                 "judge_num_harmless_scored": 3,
+                "judge_num_items": 5,
             },
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -237,6 +247,33 @@ class MetricLoadingTests(unittest.TestCase):
                 )
                 row = self.collector.load_result(self._spec(result_dir), root)
                 self.assertEqual(row["status"], "ok")
+
+    def test_zero_item_judge_is_incomplete_and_can_fall_back_to_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result_dir = root / "zero_item"
+            result_dir.mkdir()
+            (result_dir / "judge_results.json").write_text(
+                json.dumps({
+                    **CORE,
+                    "judge_parse_rate": 0,
+                    "judge_num_harmful_scored": 0,
+                    "judge_num_harmless_scored": 0,
+                    "judge_num_items": 0,
+                }),
+                encoding="utf-8",
+            )
+
+            without_summary = self.collector.load_result(self._spec(result_dir), root)
+            self.assertEqual(without_summary["status"], "incomplete")
+            self.assertIn("no usable judged items", without_summary["error"])
+
+            (result_dir / "summary.json").write_text(
+                json.dumps({"results": {"pan": CORE}}), encoding="utf-8"
+            )
+            with_summary = self.collector.load_result(self._spec(result_dir), root)
+            self.assertEqual(with_summary["status"], "ok")
+            self.assertEqual(with_summary["source_kind"], "summary_fallback")
 
     def test_incomplete_judge_falls_back_to_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

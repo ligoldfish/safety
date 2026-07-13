@@ -28,6 +28,7 @@ Example (whole eval_suite, all epochs):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -76,6 +77,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also merge llm_judge_* scalars into the sibling summary.json results.pan.",
     )
+    parser.add_argument(
+        "--allow-unmatched",
+        action="store_true",
+        help="Allow judging only the matched subset when generation IDs are absent from the test JSONL.",
+    )
     return parser.parse_args()
 
 
@@ -96,15 +102,27 @@ def _load_id_to_prompt(test_jsonl: Path) -> Dict[str, str]:
     return mapping
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _judge_one(
     pan_results: Path,
     id_to_prompt: Dict[str, str],
     judge: WildGuardJudge,
     out_path: Optional[Path],
     merge_summary: bool,
+    allow_unmatched: bool = False,
+    test_jsonl_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     data = json.loads(pan_results.read_text(encoding="utf-8"))
     generations: List[Dict[str, Any]] = data.get("generations") or []
+    if not generations:
+        raise ValueError(f"No generations found in {pan_results}")
 
     pairs = []
     items = []
@@ -125,7 +143,15 @@ def _judge_one(
             }
         )
 
-    verdicts = judge.score(pairs) if pairs else []
+    if unmatched and not allow_unmatched:
+        raise ValueError(
+            f"{len(unmatched)} unmatched generation IDs for {pan_results}; "
+            f"the selected test JSONL is not compatible (sample: {unmatched[:5]})"
+        )
+    if not pairs:
+        raise ValueError(f"No generation IDs from {pan_results} matched the selected test JSONL")
+
+    verdicts = judge.score(pairs)
     for item, verdict in zip(items, verdicts):
         item["verdict"] = verdict
 
@@ -133,10 +159,16 @@ def _judge_one(
     metrics["judge_model"] = str(judge.model_path)
     metrics["num_unmatched_ids"] = len(unmatched)
     metrics["num_generations"] = len(generations)
+    if metrics["judge_parse_rate"] <= 0:
+        raise RuntimeError(
+            f"WildGuard parsed zero verdicts for {pan_results}; refusing to write an invalid result"
+        )
 
     payload = {
         **metrics,
         "pan_results": str(pan_results),
+        "test_jsonl": str(test_jsonl_path) if test_jsonl_path else "",
+        "test_jsonl_sha256": _sha256(test_jsonl_path) if test_jsonl_path else "",
         "test_jsonl_prompt_count": len(id_to_prompt),
         "unmatched_ids_sample": unmatched[:20],
         "generations": [
@@ -167,6 +199,8 @@ def _judge_one(
                 "judge_keyword_agreement",
                 "judge_cohen_kappa",
                 "judge_parse_rate",
+                "judge_num_items",
+                "judge_num_parsed",
                 "judge_num_harmful_scored",
                 "judge_num_harmless_scored",
             ):
@@ -221,7 +255,15 @@ def main() -> None:
 
     out_override = Path(args.out) if args.out else None
     for pan_results in targets:
-        _judge_one(pan_results, id_to_prompt, judge, out_override, args.merge_summary)
+        _judge_one(
+            pan_results,
+            id_to_prompt,
+            judge,
+            out_override,
+            args.merge_summary,
+            args.allow_unmatched,
+            test_jsonl_path=test_jsonl,
+        )
 
 
 if __name__ == "__main__":
