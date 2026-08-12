@@ -6,6 +6,8 @@ from typing import Any, Dict, List
 
 import yaml
 
+from src.ablations.platform import resolve_portable_path
+
 
 @dataclass
 class Phase1ModelConfig:
@@ -218,28 +220,23 @@ def _read_yaml(path: str | Path) -> Dict[str, Any]:
     return payload
 
 
-def _resolve_path(value: str, base_dir: Path) -> str:
-    if not value:
-        return value
-    if "://" in value:
-        return value
-    path = Path(value)
-    if path.is_absolute():
-        return str(path)
-    return str((base_dir / path).resolve())
+def _resolve_path(value: str, base_dir: Path, *, category: str) -> str:
+    return resolve_portable_path(value, base_dir, category=category)
 
 
 def _to_model_config(raw: Dict[str, Any], base_dir: Path) -> Phase1ModelConfig:
     data = dict(raw)
-    data["path"] = _resolve_path(str(data["path"]), base_dir)
+    data["path"] = _resolve_path(str(data["path"]), base_dir, category="model")
     return Phase1ModelConfig(**data)
 
 
-def _resolve_path_in_mapping(raw: Dict[str, Any], base_dir: Path, keys: List[str]) -> Dict[str, Any]:
+def _resolve_path_in_mapping(
+    raw: Dict[str, Any], base_dir: Path, keys: List[str], *, category: str
+) -> Dict[str, Any]:
     data = dict(raw)
     for key in keys:
         if key in data:
-            data[key] = _resolve_path(str(data[key]), base_dir)
+            data[key] = _resolve_path(str(data[key]), base_dir, category=category)
     return data
 
 
@@ -250,8 +247,8 @@ def load_phase1_config(path: str | Path) -> Phase1Config:
     extraction = dict(raw["extraction"])
 
     for key in ["pan_repo_dir", "raw_dir", "processed_dir", "metadata_dir"]:
-        dataset[key] = _resolve_path(str(dataset[key]), base_dir)
-    extraction["output_root"] = _resolve_path(str(extraction["output_root"]), base_dir)
+        dataset[key] = _resolve_path(str(dataset[key]), base_dir, category="data")
+    extraction["output_root"] = _resolve_path(str(extraction["output_root"]), base_dir, category="output")
 
     return Phase1Config(
         seed=int(raw.get("seed", 42)),
@@ -269,11 +266,13 @@ def load_phaseb_config(path: str | Path) -> PhaseBConfig:
         dict(raw["inputs"]),
         base_dir,
         ["hidden_root"],
+        category="output",
     )
     output = _resolve_path_in_mapping(
         dict(raw["output"]),
         base_dir,
         ["output_root"],
+        category="output",
     )
     method = dict(raw.get("method", {}))
     limits = dict(raw.get("limits", {}))
@@ -295,11 +294,16 @@ def load_phasec_config(path: str | Path) -> PhaseCConfig:
         dict(raw["inputs"]),
         base_dir,
         ["artifact_path", "val_split", "test_split"],
+        category="data",
+    )
+    inputs["artifact_path"] = _resolve_path(
+        str(dict(raw["inputs"])["artifact_path"]), base_dir, category="output"
     )
     output = _resolve_path_in_mapping(
         dict(raw["output"]),
         base_dir,
         ["output_root"],
+        category="output",
     )
     method = dict(raw.get("method", {}))
     limits = dict(raw.get("limits", {}))
@@ -330,11 +334,16 @@ def load_phasef_config(path: str | Path) -> PhaseFConfig:
             "train_anchor_dir",
             "val_anchor_dir",
         ],
+        category="data",
     )
+    for key in ["train_targets_dir", "val_targets_dir", "pairing_path", "train_anchor_dir", "val_anchor_dir"]:
+        if key in raw["inputs"]:
+            inputs[key] = _resolve_path(str(raw["inputs"][key]), base_dir, category="output")
     output = _resolve_path_in_mapping(
         dict(raw["output"]),
         base_dir,
         ["output_root"],
+        category="output",
     )
     lora = dict(raw.get("lora", {}))
     optim = dict(raw.get("optim", {}))
