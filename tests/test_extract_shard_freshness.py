@@ -36,6 +36,14 @@ def test_fingerprint_changes_when_shard_size_changes():
     assert mod._split_fingerprint(recs, shard_size=32) != mod._split_fingerprint(recs, shard_size=64)
 
 
+def test_fingerprint_changes_when_representation_mode_changes():
+    recs = [{"id": "a"}, {"id": "b"}]
+    prompt = mod._split_fingerprint(recs, shard_size=32, representation_mode="last_prompt")
+    generated = mod._split_fingerprint(recs, shard_size=32, representation_mode="first_generated")
+    assert prompt != generated
+    assert prompt["representation_mode"] == "last_prompt"
+
+
 def test_shards_stale_when_ids_change(tmp_path):
     # Prior run wrote a fingerprint for the OLD ids.
     old = mod._split_fingerprint([{"id": "old_a"}, {"id": "old_b"}], shard_size=32)

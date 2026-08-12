@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.layer_scoring import LayerScoreResult, score_teacher_layer, top_k_layers
+from src.ablations.strategies.layers import LayerCandidate, select_layers
 from src.phase_b.hidden_states import load_hidden_state_split
 from src.utils.config import load_phase1_config
 from src.utils.io import ensure_dir, write_json
@@ -75,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         default=1e-4,
         help="L2 penalty for the simple linear probe.",
     )
+    parser.add_argument(
+        "--selection-mode",
+        choices=["effect_probe_sum", "effect_only", "probe_only", "random_k", "evenly_spaced", "last_k"],
+        default="effect_probe_sum",
+    )
+    parser.add_argument("--draw-seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -163,8 +170,17 @@ def main() -> None:
         )
 
     sorted_results = sorted(results, key=lambda item: (-item.final_score, item.layer_idx))
-    key_layer_results = top_k_layers(sorted_results, args.top_k)
-    key_layers = [result.layer_idx for result in key_layer_results]
+    candidates = tuple(
+        LayerCandidate(
+            layer_idx=result.layer_idx,
+            effect_size=result.mean_diff_effect_size,
+            probe_accuracy=result.linear_probe_acc,
+        )
+        for result in results
+    )
+    key_layers = list(
+        select_layers(candidates, k=args.top_k, mode=args.selection_mode, seed=args.draw_seed)
+    )
     csv_rows = [_serialize_layer_result(result) for result in sorted_results]
 
     _write_csv(csv_rows, output_root / "teacher_layer_scores.csv")
@@ -177,7 +193,8 @@ def main() -> None:
             "train_split_dir": train_split.split_dir,
             "val_split_dir": val_split.split_dir,
             "top_k": args.top_k,
-            "selection_metric": "mean_diff_effect_size + linear_probe_balanced_accuracy",
+            "selection_metric": args.selection_mode,
+            "draw_seed": args.draw_seed,
             "key_layers": key_layers,
             "layer_rows": csv_rows,
         },
@@ -193,7 +210,8 @@ def main() -> None:
             "val_split_dir": val_split.split_dir,
             "val_label_counts": val_split.label_counts(),
             "top_k": args.top_k,
-            "selection_metric": "mean_diff_effect_size + linear_probe_balanced_accuracy",
+            "selection_metric": args.selection_mode,
+            "draw_seed": args.draw_seed,
             "selected_key_layers": key_layers,
             "teacher_layer_scores_csv": str(output_root / "teacher_layer_scores.csv"),
             "teacher_key_layers_json": str(output_root / "teacher_key_layers.json"),
