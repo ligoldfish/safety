@@ -657,6 +657,8 @@ def evaluate_generation_refusal_metrics(
     max_new_tokens: int,
     batch_size: int = 1,
     initial_max_new_tokens: int = 0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
 ) -> Dict[str, Any]:
     """PAN safety metrics with refusal/safe-non-refusal/unsafe split.
 
@@ -703,6 +705,10 @@ def evaluate_generation_refusal_metrics(
     else:
         first_pass_max_new_tokens = full_max_new_tokens
     can_retry = first_pass_max_new_tokens < full_max_new_tokens
+    if float(temperature) < 0.0:
+        raise ValueError("temperature must be non-negative")
+    if not 0.0 < float(top_p) <= 1.0:
+        raise ValueError("top_p must be in (0,1]")
 
     eos_ids: List[int] = []
     if isinstance(tokenizer.eos_token_id, (list, tuple)):
@@ -720,14 +726,16 @@ def evaluate_generation_refusal_metrics(
         )
         encoded = {key: value.to(device) for key, value in encoded.items()}
         with torch.inference_mode():
-            generated = model.generate(
-                **encoded,
-                max_new_tokens=gen_max_new_tokens,
-                do_sample=False,
-                use_cache=True,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id,
-            )
+            generation = {
+                "max_new_tokens": gen_max_new_tokens,
+                "do_sample": float(temperature) > 0.0,
+                "use_cache": True,
+                "eos_token_id": tokenizer.eos_token_id,
+                "pad_token_id": tokenizer.pad_token_id,
+            }
+            if generation["do_sample"]:
+                generation.update(temperature=float(temperature), top_p=float(top_p))
+            generated = model.generate(**encoded, **generation)
         # PPU/NPU eager mode: no XLA graph step required.
         prompt_width = int(encoded["input_ids"].size(1))
         generated_only = generated[:, prompt_width:]

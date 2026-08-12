@@ -116,6 +116,8 @@ class PhaseCMethodConfig:
     max_length: int = 4096
     batch_size: int = 1
     intervention_position: str = "last_non_padding"
+    layer_mode: str = "key"
+    random_seed: int = 42
 
 
 @dataclass

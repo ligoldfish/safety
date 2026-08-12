@@ -1,0 +1,14 @@
+schema_version: 1
+teachers:
+  same_size_base:
+    name: same-size-base-teacher
+    path: ../models/teacher-controls/same-size-base
+  safety_tuned:
+    name: safety-tuned-teacher
+    path: ../models/teacher-controls/safety-tuned
+  qwen3_4b:
+    name: Qwen3-4B
+    path: ../models/Qwen3-4B
+  qwen3_8b:
+    name: Qwen3-8B
+    path: ../models/Qwen3-8B

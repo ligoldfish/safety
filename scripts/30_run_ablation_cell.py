@@ -12,6 +12,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.ablations.platform import resolve_portable_path
+
 
 def _json_mapping(value: str, label: str) -> dict:
     payload = json.loads(value or "{}")
@@ -65,6 +67,21 @@ def _stage_configs(args, phase1_updates: dict, phasef_updates: dict) -> tuple[Pa
     phasef_root = phase1_root / "training"
     phase1["extraction"]["output_root"] = str(phase1_root)
     phasef["output"]["output_root"] = str(phasef_root)
+    if args.teacher_variant:
+        registry_path = PROJECT_ROOT / "configs" / "ablations" / "teacher_registry.yaml"
+        if not registry_path.is_file():
+            raise FileNotFoundError(f"teacher registry is missing: {registry_path}")
+        registry = yaml.safe_load(registry_path.read_text(encoding="utf-8")) or {}
+        entry = (registry.get("teachers") or {}).get(args.teacher_variant)
+        if not isinstance(entry, dict):
+            raise ValueError(f"unknown teacher variant: {args.teacher_variant}")
+        teacher = phase1["models"]["teacher"]
+        teacher["name"] = str(entry["name"])
+        teacher["path"] = resolve_portable_path(
+            str(entry["path"]),
+            registry_path.parent,
+            category="model",
+        )
     inputs = phasef["inputs"]
     inputs["train_targets_dir"] = str(phase1_root / "student_targets" / "student_safe_targets_alignment")
     inputs["val_targets_dir"] = str(phase1_root / "student_targets" / "student_safe_targets_val")
@@ -82,37 +99,15 @@ def _stage_configs(args, phase1_updates: dict, phasef_updates: dict) -> tuple[Pa
     return phase1_path, phasef_path
 
 
-def _collect_contract(output_dir: Path, required: list[str], source_root: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    manifest = source_root / "manifest.json"
-    eval_candidates = sorted(source_root.glob("eval_suite/epoch_*/final_summary.json"))
-    sources = {
-        "run_manifest.json": manifest,
-        "training_manifest.json": manifest,
-        "parameter_budget.json": manifest,
-        "eval_predictions.jsonl": next(iter(sorted(source_root.glob("eval_suite/epoch_*/*predictions.jsonl"))), None),
-    }
-    for name in required:
-        destination = output_dir / name
-        source = sources.get(name)
-        if source is not None and Path(source).is_file():
-            destination.write_bytes(Path(source).read_bytes())
-        elif name.endswith(".json") and eval_candidates:
-            destination.write_bytes(eval_candidates[-1].read_bytes())
-        elif not destination.is_file():
-            raise FileNotFoundError(
-                f"real backend did not produce completion artifact {name}; "
-                "the cell remains FAILED instead of fabricating a result"
-            )
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Internal single-cell backend; use scripts/30_ablation.py.")
     parser.add_argument("--cell-id", required=True)
+    parser.add_argument("--experiment-id", default="")
+    parser.add_argument("--cell-spec", default="{}")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--required-artifacts", default="[]")
     parser.add_argument("--analysis-handler", default="")
-    parser.add_argument("--cell-spec", default="{}")
+    parser.add_argument("--evaluation-handler", default="")
     parser.add_argument("--pair", default="qwen35_9b_to_08b")
     parser.add_argument("--dataset", default="pan")
     parser.add_argument("--method", default="ours")
@@ -122,6 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phasef-updates", default="{}")
     parser.add_argument("--phase1-stage-extras", default="{}")
     parser.add_argument("--disable-dataset-overrides", action="store_true")
+    parser.add_argument("--teacher-variant", default="")
     return parser.parse_args()
 
 
@@ -137,6 +133,24 @@ def main() -> int:
             output_dir=Path(args.output_dir),
             required_artifacts=required,
         )
+        return 0
+    if args.evaluation_handler:
+        from src.ablations.evaluation import collect_evaluation_result, prepare_evaluation
+
+        cell_spec = _json_mapping(args.cell_spec, "--cell-spec")
+        plan = prepare_evaluation(
+            args.evaluation_handler,
+            cell_spec,
+            output_dir=Path(args.output_dir),
+            project_root=PROJECT_ROOT,
+            python_executable=sys.executable,
+            device=args.device,
+            device_id=args.device_id,
+        )
+        result = subprocess.run(list(plan.argv), cwd=str(PROJECT_ROOT), check=False)
+        if result.returncode:
+            return int(result.returncode)
+        collect_evaluation_result(args.evaluation_handler, cell_spec, Path(args.output_dir))
         return 0
     phase1_path, phasef_path = _stage_configs(
         args,
@@ -168,7 +182,16 @@ def main() -> int:
     result = subprocess.run(command, cwd=str(PROJECT_ROOT), check=False)
     if result.returncode:
         return int(result.returncode)
-    _collect_contract(Path(args.output_dir), required, Path(args.output_dir) / "pipeline" / "phase1" / "training")
+    from src.ablations.completion import collect_training_contract
+
+    raw_spec = _json_mapping(args.cell_spec, "--cell-spec")
+    raw_spec.setdefault("experiment_id", args.experiment_id)
+    collect_training_contract(
+        Path(args.output_dir),
+        required,
+        Path(args.output_dir) / "pipeline" / "phase1",
+        cell_spec=raw_spec,
+    )
     return 0
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
+import random
 
 import torch
 
@@ -33,10 +34,23 @@ class InterventionSpec:
     reference_center: torch.Tensor
 
 
-def load_intervention_artifact(path: str | Path) -> InterventionArtifact:
+def load_intervention_artifact(
+    path: str | Path,
+    *,
+    layer_mode: str = "key",
+    random_seed: int = 42,
+) -> InterventionArtifact:
     artifact_path = Path(path)
     payload = torch.load(artifact_path, map_location="cpu", weights_only=True)
     best_layer_idx = int(payload["best_layer_idx"])
+    mode = str(layer_mode).strip().lower()
+    if mode == "random":
+        candidates = sorted(int(layer) for layer in payload["models"] if int(layer) != best_layer_idx)
+        if not candidates:
+            raise ValueError("random intervention requires at least one non-key layer in the artifact")
+        best_layer_idx = random.Random(int(random_seed)).choice(candidates)
+    elif mode != "key":
+        raise ValueError(f"unsupported intervention layer mode: {layer_mode}")
     best_model = payload["models"][best_layer_idx]
     return InterventionArtifact(
         artifact_path=str(artifact_path),

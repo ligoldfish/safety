@@ -184,7 +184,11 @@ def main() -> None:
     cfg = load_phasec_config(args.config)
     set_global_seed(cfg.seed)
 
-    artifact = load_intervention_artifact(cfg.inputs.artifact_path)
+    artifact = load_intervention_artifact(
+        cfg.inputs.artifact_path,
+        layer_mode=cfg.method.layer_mode,
+        random_seed=cfg.method.random_seed,
+    )
     spec = build_intervention_spec(artifact)
     layer_model = _layer_model_from_artifact(artifact)
 
@@ -253,6 +257,8 @@ def main() -> None:
             "config_path": str(Path(args.config).resolve()),
             "artifact_path": artifact.artifact_path,
             "best_layer_idx_from_phase_b": artifact.best_layer_idx,
+            "intervention_layer_mode": cfg.method.layer_mode,
+            "intervention_random_seed": cfg.method.random_seed,
             "threshold_from_phase_b": artifact.best_threshold,
             "target_label": artifact.target_label,
             "reference_label": artifact.reference_label,

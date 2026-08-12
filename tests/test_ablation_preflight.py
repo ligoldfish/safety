@@ -7,6 +7,7 @@ from pathlib import Path
 
 from src.ablations.preflight import (
     AssetRequirement,
+    requirements_from_manifest,
     inspect_model_directory,
     inspect_submission_package,
     run_preflight,
@@ -96,6 +97,37 @@ class AblationPreflightTests(unittest.TestCase):
         )
         self.assertNotIn(secret, str(report.to_dict()))
         self.assertNotIn("HF_TOKEN", str(report.to_dict()))
+
+    def test_manifest_requirements_are_exact_and_support_explicit_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = root / "data"
+            data.mkdir()
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text("{}", encoding="utf-8")
+            (model / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (model / "model.safetensors").write_bytes(b"weights")
+            requirements, missing = requirements_from_manifest(
+                ["phase1_data", "wildguard_model", "not_declared"],
+                {
+                    "phase1_data": str(data),
+                    "wildguard_model": {"path": str(model), "kind": "model"},
+                },
+                cell_id="cell-1",
+            )
+            report = run_preflight(requirements)
+        self.assertEqual(report.status, "READY")
+        self.assertEqual(missing, ("not_declared",))
+        self.assertEqual([item.kind for item in requirements], ["directory", "model"])
+
+    def test_manifest_rejects_unknown_kind_and_non_path_payload(self) -> None:
+        with self.assertRaisesRegex(ValueError, "kind"):
+            requirements_from_manifest(
+                ["x"], {"x": {"path": "/x", "kind": "network"}}, cell_id="c"
+            )
+        with self.assertRaisesRegex(ValueError, "path"):
+            requirements_from_manifest(["x"], {"x": []}, cell_id="c")
 
 
 if __name__ == "__main__":

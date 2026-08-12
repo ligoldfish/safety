@@ -86,6 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--device-id", type=int, default=0)
     run.add_argument("--num-devices", type=int, default=1)
     run.add_argument("--dry-run", action="store_true")
+    run.add_argument("--asset-manifest", default="")
     return parser
 
 
@@ -97,6 +98,7 @@ def _context(args) -> RunnerContext:
         device=args.device,
         device_id=args.device_id,
         num_devices=args.num_devices,
+        asset_manifest=(Path(args.asset_manifest).expanduser().resolve() if args.asset_manifest else None),
     )
 
 

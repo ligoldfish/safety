@@ -35,6 +35,30 @@ class AblationCoverageTests(unittest.TestCase):
                 self.assertTrue(all(command.argv and command.completion_artifacts for command in commands))
                 self.assertTrue(all(isinstance(token, str) for command in commands for token in command.argv))
 
+    def test_every_axis_value_changes_the_effective_execution_spec(self) -> None:
+        plan = build_catalog_plan(CATALOG, output_root="/outputs", scope="all")
+        context = RunnerContext(ROOT, Path("/state"), "python", "npu", 0)
+        for experiment_id, definition in CATALOG.experiments.items():
+            cells = [cell for cell in plan.cells if cell.experiment_id == experiment_id]
+            signatures = []
+            for cell in cells:
+                commands = compile_cell_commands(CATALOG, cell, context)
+                normalized = []
+                for command in commands:
+                    normalized.append(
+                        tuple(
+                            "CELL" if token == cell.cell_id else token.replace(cell.cell_id, "CELL")
+                            for token in command.argv
+                        )
+                    )
+                signatures.append(tuple(normalized))
+            with self.subTest(experiment=experiment_id):
+                self.assertEqual(
+                    len(set(signatures)),
+                    len(cells),
+                    "different declared cells compiled to the same effective command",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

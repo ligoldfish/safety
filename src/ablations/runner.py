@@ -13,6 +13,7 @@ from .artifacts import canonical_hash, sha256_file
 from .efficiency import StageProfiler
 from .ledger import ExperimentLedger, LedgerError, RunState
 from .schema import ExecutionKind, ExperimentCatalog, ExperimentCell
+from .preflight import requirements_from_manifest, run_preflight
 
 
 class RunnerError(RuntimeError):
@@ -27,6 +28,7 @@ class RunnerContext:
     device: str = "npu"
     device_id: int = 0
     num_devices: int = 1
+    asset_manifest: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -122,7 +124,9 @@ def _phase_extras(cell: ExperimentCell) -> dict[str, list[str]]:
         add("subspace", "--energy-threshold", axes["energy_threshold"])
         add("subspace", "--rank-cap", axes["rank_cap"])
     if experiment in {"P1-04", "P2-04"}:
-        add("bridge", "--bridge-mode", axes.get("bridge_mode", axes.get("bridge.mode")))
+        bridge_mode = axes.get("bridge_mode", axes.get("bridge.mode"))
+        add("bridge", "--bridge-mode", bridge_mode)
+        add("recompose", "--bridge-mode", bridge_mode)
     if experiment == "P1-07":
         add("pairing", "--pairing-mode", axes["mode"])
     if experiment == "P1-09":
@@ -145,9 +149,10 @@ def phasef_updates_for_cell(cell: ExperimentCell) -> dict[str, object]:
     axes = _merged_axes(cell)
     updates: dict[str, object] = {}
     experiment = cell.experiment_id
-    if experiment == "P0-02":
+    if experiment in {"P0-02", "P0-06"}:
         method = str(axes["method"])
-        updates["seed"] = int(axes["seed"])
+        if "seed" in axes:
+            updates["seed"] = int(axes["seed"])
         updates["target.mode"] = "random_same_norm" if method == "random" else "semantic"
         updates["optim.layer_loss_weight"] = 0.0 if method == "sft1" else 0.25
     elif experiment == "P1-01":
@@ -192,6 +197,14 @@ def _train_command(
 ) -> CommandSpec:
     axes = _merged_axes(cell)
     pair = str(axes.get("pair", "qwen35_9b_to_08b"))
+    teacher_variant = ""
+    if cell.experiment_id == "P2-03":
+        teacher = str(axes["teacher"])
+        pair = "qwen3_8b_to_06b" if teacher == "qwen3_8b" else "qwen3_4b_to_06b"
+        if teacher in {"same_size_base", "safety_tuned"}:
+            teacher_variant = teacher
+    elif cell.experiment_id == "P2-04":
+        pair = "qwen3_8b_to_llama32_1b"
     default_dataset = "wildjailbreak" if cell.experiment_id == "P0-06" else "pan"
     dataset = str(axes.get("dataset", default_dataset))
     method = str(axes.get("method", "ours"))
@@ -202,6 +215,13 @@ def _train_command(
         str(context.project_root / "scripts" / "30_run_ablation_cell.py"),
         "--cell-id",
         cell.cell_id,
+        "--experiment-id",
+        cell.experiment_id,
+        "--cell-spec=" + json.dumps(
+            {"experiment_id": cell.experiment_id, "axes": axes},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
         "--pair",
         pair,
         "--dataset",
@@ -219,16 +239,41 @@ def _train_command(
         "--phase1-stage-extras=" + json.dumps(_phase_extras(cell), ensure_ascii=False, sort_keys=True),
         "--required-artifacts=" + json.dumps(list(definition.completion_artifacts)),
     ]
+    if teacher_variant:
+        argv.extend(["--teacher-variant", teacher_variant])
     if cell.experiment_id in {"P0-06", "P0-07"} and axes.get("config") == "global":
         argv.append("--disable-dataset-overrides")
     return CommandSpec("train", tuple(argv), tuple(definition.completion_artifacts))
 
 
+def _load_asset_manifest(path: Path | None) -> dict[str, object]:
+    if path is None:
+        return {}
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunnerError(f"invalid asset manifest: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RunnerError("asset manifest must be a JSON object")
+    return payload
+
+
 def _worker_command(definition, cell: ExperimentCell, context: RunnerContext) -> CommandSpec:
+    assets = _load_asset_manifest(context.asset_manifest)
+    inputs = {}
+    for requirement in definition.requires:
+        if requirement in assets:
+            raw = assets[requirement]
+            inputs[requirement] = str(raw.get("path", "")) if isinstance(raw, Mapping) else str(raw)
+    worker_flag = (
+        "--evaluation-handler"
+        if definition.handler in {"general_capability_suite", "causal_intervention", "decoding_robustness"}
+        else "--analysis-handler"
+    )
     argv = (
         context.python_executable,
         str(context.project_root / "scripts" / "30_run_ablation_cell.py"),
-        "--analysis-handler",
+        worker_flag,
         definition.handler,
         "--cell-id",
         cell.cell_id,
@@ -237,12 +282,17 @@ def _worker_command(definition, cell: ExperimentCell, context: RunnerContext) ->
                 "experiment_id": cell.experiment_id,
                 "axes": dict(cell.axes),
                 "overrides": dict(cell.overrides),
+                "inputs": inputs,
             },
             ensure_ascii=False,
             sort_keys=True,
         ),
         "--output-dir",
         str(context.state_root / cell.cell_id / "artifacts"),
+        "--device",
+        context.device,
+        "--device-id",
+        str(context.device_id),
         "--required-artifacts=" + json.dumps(list(definition.completion_artifacts)),
     )
     return CommandSpec(definition.execution_kind.value, argv, tuple(definition.completion_artifacts))
@@ -325,11 +375,13 @@ class AblationRunner:
         *,
         executor: Executor | None = None,
         environment: Mapping[str, str] | None = None,
+        enforce_preflight: bool | None = None,
     ) -> None:
         self.catalog = catalog
         self.context = context
         self.executor = executor or self._execute
         self.environment = dict(os.environ if environment is None else environment)
+        self.enforce_preflight = (executor is None) if enforce_preflight is None else bool(enforce_preflight)
 
     @staticmethod
     def _execute(command: list[str], *, cwd: Path, env: Mapping[str, str]):
@@ -347,6 +399,11 @@ class AblationRunner:
             {
                 "cell": asdict(cell),
                 "definition": asdict(self.catalog.experiments[cell.experiment_id]),
+                "asset_manifest": (
+                    None
+                    if self.context.asset_manifest is None
+                    else canonical_hash(_load_asset_manifest(self.context.asset_manifest))
+                ),
             }
         )
         ledger = ExperimentLedger(
@@ -378,6 +435,29 @@ class AblationRunner:
                     {"schema_version": 1, "dry_run": True, "commands": [item.to_dict() for item in commands]},
                 )
                 return ledger.read()
+            if self.enforce_preflight:
+                if self.context.asset_manifest is None:
+                    return ledger.transition(
+                        RunState.BLOCKED,
+                        reason="asset manifest is required for real execution",
+                    )
+                manifest = _load_asset_manifest(self.context.asset_manifest)
+                requirements, missing = requirements_from_manifest(
+                    self.catalog.experiments[cell.experiment_id].requires,
+                    manifest,
+                    cell_id=cell.cell_id,
+                )
+                if missing:
+                    return ledger.transition(
+                        RunState.BLOCKED,
+                        reason=f"asset manifest is missing required keys: {list(missing)}",
+                    )
+                report = run_preflight(requirements, environment=self.environment)
+                if report.status != "READY":
+                    return ledger.transition(
+                        RunState.BLOCKED,
+                        reason=json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True),
+                    )
             ledger.transition(RunState.RUNNING)
             efficiency = []
             try:

@@ -86,7 +86,7 @@ experiments:
     handler: wjb_failure_analysis
     axes:
       config: [global, override]
-      curation: [off, minimal, strict]
+      curation: ["off", minimal, strict]
       method: [sft1, random, ours]
     requires: [wildjailbreak_data, common_test]
     metrics: [target_refusal_rate, template_diversity, common_test_asr]
@@ -284,7 +284,7 @@ experiments:
     question: Do class balance and curation determine the result?
     execution_kind: train
     handler: curation_control
-    axes: {balance: [true, false], curation: [off, minimal, strict]}
+    axes: {balance: [true, false], curation: ["off", minimal, strict]}
     requires: [phase1_data]
     metrics: [drop_reasons, label_counts, wildguard_asr, over_refusal]
     completion_artifacts: [curation_manifest.json, eval_predictions.jsonl]
@@ -337,7 +337,7 @@ experiments:
     execution_kind: evaluate
     handler: causal_intervention
     axes: {layers: [key, random], sign: [-1, 1], strength: [0.25, 0.5, 1.0, 2.0]}
-    requires: [subspace_artifact, intervention_data]
+    requires: [subspace_artifact, intervention_data, intervention_model]
     metrics: [behavior_delta, hidden_projection_delta]
     completion_artifacts: [intervention_results.json]
   - id: P2-03

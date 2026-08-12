@@ -40,6 +40,14 @@ class EvalTaskConfig:
     max_new_tokens: int = 128
     initial_max_new_tokens: int = 0
     exec_timeout_seconds: int = 3
+    temperature: float = 0.0
+    top_p: float = 1.0
+
+    def __post_init__(self) -> None:
+        if float(self.temperature) < 0.0:
+            raise ValueError("temperature must be non-negative")
+        if not 0.0 < float(self.top_p) <= 1.0:
+            raise ValueError("top_p must be in (0,1]")
 
 
 @dataclass

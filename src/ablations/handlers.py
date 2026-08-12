@@ -11,6 +11,7 @@ from .analysis import pan_bucket, spearman_correlation, summarize_corpus_matrix
 from .data_audit import audit_train_eval_splits
 from .manual_audit import build_blind_packet, import_double_annotations
 from .statistics import cohen_kappa, paired_bootstrap
+from .stability import layer_jaccard, principal_angles, projection_overlap
 
 
 class HandlerBlocked(RuntimeError):
@@ -52,7 +53,7 @@ _INPUTS = {
     "general_capability_suite": ("trained_checkpoints", "benchmark_assets"),
     "representation_behavior_analysis": ("pre_post_hidden_states", "aligned_predictions"),
     "subspace_bootstrap": ("alignment_hidden_states",),
-    "causal_intervention": ("subspace_artifact", "intervention_data"),
+    "causal_intervention": ("subspace_artifact", "intervention_data", "intervention_model"),
     "teacher_quality_control": ("teacher_checkpoints",),
     "cross_tokenizer_bridge": ("cross_family_models", "tokenizer_metadata"),
     "decoding_robustness": ("trained_checkpoints", "evaluation_data"),
@@ -128,8 +129,22 @@ def _write_jsonl(path: Path, rows: Sequence[Mapping]) -> None:
 
 
 def _provenance(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
-    del axes
     rows = _read_jsonl(inputs["model_registry"])
+    selectors = {
+        key: str(axes[key])
+        for key in ("pair", "dataset", "method")
+        if key in axes
+    }
+    if selectors:
+        rows = [
+            row
+            for row in rows
+            if all(str(row.get(key, "")) == value for key, value in selectors.items())
+        ]
+        if len(rows) != 1:
+            raise HandlerBlocked(
+                f"main-table provenance cell must match exactly one registry row: {selectors}"
+            )
     required = {"cell_id", "model_hash", "dataset_hash", "config_hash", "checkpoint_hash", "commit"}
     audited = []
     for row in rows:
@@ -169,12 +184,16 @@ def _bootstrap(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
 
 
 def _corpus(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
-    del axes
     path = inputs["common_test"]
     rows = _read_jsonl(path if path.is_file() else path / "scores.jsonl")
+    requested_suite = str(axes.get("test_suite", ""))
+    if requested_suite:
+        rows = [row for row in rows if str(row.get("test_suite", "")) == requested_suite]
+    if not rows:
+        raise HandlerBlocked(f"no common-test rows for suite: {requested_suite}")
     corpora = sorted({str(row["train_corpus"]) for row in rows})
     suites = sorted({str(row["test_suite"]) for row in rows})
-    return {"cross_corpus_matrix.json": summarize_corpus_matrix(rows, corpora=corpora, suites=suites)}
+    return {"cross_corpus_matrix.json": {"train_corpora": corpora, "test_suites": suites, "matrix": summarize_corpus_matrix(rows, corpora=corpora, suites=suites)}}
 
 
 def _iso_hr(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
@@ -197,32 +216,42 @@ def _iso_hr(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
 
 
 def _pan_subgroups(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
-    del axes
     rows = _read_jsonl(inputs["pan_predictions"])
+    grouping = str(axes.get("grouping", "attack_family"))
+    if grouping not in {"attack_family", "benign_length", "benign_topic"}:
+        raise HandlerBlocked(f"unsupported PAN subgroup axis: {grouping}")
     groups: dict[str, list[float]] = {}
     for row in rows:
-        group = str(row.get("attack_family") or pan_bucket(row))
+        group = str(row.get(grouping) or (pan_bucket(row) if grouping == "attack_family" else "unknown"))
         groups.setdefault(group, []).append(float(row["unsafe"]))
     return {"pan_subgroups.json": {name: {"n": len(values), "asr": sum(values) / len(values)} for name, values in sorted(groups.items())}}
 
 
 def _representation(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
-    del axes
     rows = _read_jsonl(inputs["aligned_predictions"])
+    label = str(axes.get("label", ""))
+    if label:
+        rows = [row for row in rows if str(row.get("label", "")) == label]
+    if not rows:
+        raise HandlerBlocked(f"no aligned representation rows for label: {label}")
     pre = [float(row["cosine_pre"]) for row in rows]
     post = [float(row["cosine_post"]) for row in rows]
     behavior = [float(row["behavior_delta"]) for row in rows]
     delta = [right - left for left, right in zip(pre, post)]
-    return {"representation_behavior.json": {"n": len(rows), "mean_cosine_delta": sum(delta) / len(delta), "spearman": spearman_correlation(delta, behavior)}}
+    return {"representation_behavior.json": {"label": label or "all", "n": len(rows), "mean_cosine_delta": sum(delta) / len(delta), "spearman": spearman_correlation(delta, behavior)}}
 
 
 def _efficiency(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
-    del axes
     rows = _read_jsonl(inputs["phase_runtime_logs"])
     required = {"phase", "wall_seconds", "peak_memory_bytes", "disk_delta_bytes", "device_hours"}
     if any(not required <= set(row) for row in rows):
         raise HandlerBlocked("phase runtime log is missing required efficiency fields")
-    return {"efficiency_profile.json": {"phases": rows, "wall_seconds": sum(float(row["wall_seconds"]) for row in rows), "device_hours": sum(float(row["device_hours"]) for row in rows), "peak_memory_bytes": max(int(row["peak_memory_bytes"]) for row in rows)}}
+    phase = str(axes.get("phase", ""))
+    if phase:
+        rows = [row for row in rows if str(row["phase"]) == phase]
+    if not rows:
+        raise HandlerBlocked(f"no efficiency records for phase: {phase}")
+    return {"efficiency_profile.json": {"phase": phase or "all", "phases": rows, "wall_seconds": sum(float(row["wall_seconds"]) for row in rows), "device_hours": sum(float(row["device_hours"]) for row in rows), "peak_memory_bytes": max(int(row["peak_memory_bytes"]) for row in rows)}}
 
 
 def _ethics(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
@@ -236,6 +265,158 @@ def _ethics(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
     return {"ethics_data_audit.json": {"dataset_count": len(datasets), "license_coverage": (len(datasets) - len(missing_license)) / len(datasets), "missing_license": missing_license, "split_manifests": manifests}}
 
 
+def _manual_agreement(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
+    root = inputs["human_annotations"]
+    if not root.is_dir():
+        raise HandlerBlocked("human_annotations must be a directory containing the blind audit files")
+    predictions = _read_jsonl(root / "judge_predictions.jsonl")
+    key = _read_json(root / "blind_key.json")
+    if not isinstance(key, Mapping) or not key:
+        raise HandlerBlocked("blind annotation key must be a non-empty object")
+    try:
+        annotated = import_double_annotations(
+            key,
+            _read_jsonl(root / "rater_a.jsonl"),
+            _read_jsonl(root / "rater_b.jsonl"),
+            allowed_labels={"safe", "unsafe"},
+        )
+    except ValueError as exc:
+        raise HandlerBlocked(str(exc)) from exc
+    stratum = str(axes.get("stratum", ""))
+    if stratum:
+        annotated = [row for row in annotated if str(row.get("stratum", "")) == stratum]
+        predictions = [row for row in predictions if str(row.get("stratum", "")) == stratum]
+    if not annotated or not predictions:
+        raise HandlerBlocked(f"manual audit has no rows for stratum: {stratum}")
+    sample_to_wildguard = {
+        str(row.get("sample_id", "")): str(row.get("wildguard_label", ""))
+        for row in predictions
+    }
+    if set(sample_to_wildguard) != {str(row["sample_id"]) for row in annotated}:
+        raise HandlerBlocked("WildGuard and human judgments must cover identical sample IDs")
+    left = [str(row["rater_a"]) for row in annotated]
+    right = [str(row["rater_b"]) for row in annotated]
+    wildguard = [sample_to_wildguard[str(row["sample_id"])] for row in annotated]
+    consensus = [a if a == b else "disagreement" for a, b in zip(left, right)]
+    comparable = [(w, h) for w, h in zip(wildguard, consensus) if h != "disagreement"]
+    return {
+        "judge_predictions.jsonl": predictions,
+        "manual_audit_summary.json": {
+            "stratum": stratum or "all",
+            "n": len(annotated),
+            "human_human_kappa": cohen_kappa(left, right),
+            "human_human_agreement": sum(a == b for a, b in zip(left, right)) / len(left),
+            "wildguard_human_agreement": (
+                sum(a == b for a, b in comparable) / len(comparable) if comparable else None
+            ),
+            "wildguard_model_path": str(inputs["wildguard_model"]),
+        },
+    }
+
+
+def _bootstrap_subspace(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
+    try:
+        import torch
+
+        from src.ablations.strategies.layers import LayerCandidate, select_layers
+        from src.features.subspace import build_teacher_safe_subspace
+        from src.phase_b.hidden_states import load_hidden_state_split
+    except ImportError as exc:  # pragma: no cover - environment preflight owns this
+        raise HandlerBlocked("subspace bootstrap requires the project torch environment") from exc
+    split = load_hidden_state_split(inputs["alignment_hidden_states"])
+    harmful_mask = torch.tensor([label == "harmful" for label in split.labels], dtype=torch.bool)
+    harmless_mask = torch.tensor([label == "harmless" for label in split.labels], dtype=torch.bool)
+    if not bool(harmful_mask.any()) or not bool(harmless_mask.any()):
+        raise HandlerBlocked("subspace bootstrap requires both harmful and harmless samples")
+    draw = int(axes.get("draw", 0))
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(42 + draw)
+    layer_rows = []
+    baseline_candidates = []
+    bootstrap_candidates = []
+    baseline_subspaces = {}
+    bootstrap_subspaces = {}
+    for layer_idx in split.available_layers:
+        hidden = split.layer_tensors[layer_idx]
+        harmful = hidden[harmful_mask]
+        harmless = hidden[harmless_mask]
+        baseline = build_teacher_safe_subspace(
+            layer_idx=layer_idx,
+            harmful_hidden=harmful,
+            harmless_hidden=harmless,
+            k=min(16, hidden.size(1)),
+        )
+        sampled_harmful = harmful.index_select(
+            0, torch.randint(harmful.size(0), (harmful.size(0),), generator=generator)
+        )
+        sampled_harmless = harmless.index_select(
+            0, torch.randint(harmless.size(0), (harmless.size(0),), generator=generator)
+        )
+        resampled = build_teacher_safe_subspace(
+            layer_idx=layer_idx,
+            harmful_hidden=sampled_harmful,
+            harmless_hidden=sampled_harmless,
+            k=baseline.k,
+        )
+        def effect(result, harmful_values, harmless_values):
+            centered = torch.cat(
+                [
+                    harmful_values - result.harmful_mean,
+                    harmless_values - result.harmless_mean,
+                ],
+                dim=0,
+            )
+            within = centered.norm(dim=1).mean().clamp_min(1e-6)
+            return float((result.mean_diff.norm() / within).item())
+
+        baseline_candidates.append(
+            LayerCandidate(layer_idx, effect(baseline, harmful, harmless), 0.0)
+        )
+        bootstrap_candidates.append(
+            LayerCandidate(
+                layer_idx,
+                effect(resampled, sampled_harmful, sampled_harmless),
+                0.0,
+            )
+        )
+        baseline_subspaces[layer_idx] = baseline
+        bootstrap_subspaces[layer_idx] = resampled
+    selection_k = min(5, len(split.available_layers))
+    baseline_layers = select_layers(
+        baseline_candidates, k=selection_k, mode="effect_only"
+    )
+    bootstrap_layers = select_layers(
+        bootstrap_candidates, k=selection_k, mode="effect_only"
+    )
+    for layer_idx in sorted(set(baseline_layers) & set(bootstrap_layers)):
+        baseline = baseline_subspaces[layer_idx]
+        resampled = bootstrap_subspaces[layer_idx]
+        angles = principal_angles(baseline.basis, resampled.basis)
+        layer_rows.append(
+            {
+                "layer_idx": layer_idx,
+                "rank": baseline.k,
+                "principal_angles_radians": [float(value) for value in angles.tolist()],
+                "mean_principal_angle_radians": float(angles.mean().item()),
+                "projection_overlap": projection_overlap(baseline.basis, resampled.basis),
+            }
+        )
+    return {
+        "bootstrap_stability.json": {
+            "draw": draw,
+            "seed": 42 + draw,
+            "sample_count": split.num_samples,
+            "representation_mode": split.representation_mode,
+            "selection_mode": "effect_only",
+            "selection_k": selection_k,
+            "baseline_key_layers": list(baseline_layers),
+            "bootstrap_key_layers": list(bootstrap_layers),
+            "layer_jaccard": layer_jaccard(baseline_layers, bootstrap_layers),
+            "layers": layer_rows,
+        }
+    }
+
+
 _IMPLEMENTATIONS: dict[str, Callable[[Mapping[str, Path], Mapping], dict[str, object]]] = {
     "provenance_matrix": _provenance,
     "seed_and_paired_bootstrap": _bootstrap,
@@ -245,6 +426,8 @@ _IMPLEMENTATIONS: dict[str, Callable[[Mapping[str, Path], Mapping], dict[str, ob
     "representation_behavior_analysis": _representation,
     "efficiency_profile": _efficiency,
     "ethics_data_audit": _ethics,
+    "judge_agreement_audit": _manual_agreement,
+    "subspace_bootstrap": _bootstrap_subspace,
 }
 
 

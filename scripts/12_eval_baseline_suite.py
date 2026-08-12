@@ -226,6 +226,8 @@ def main() -> None:
                 max_new_tokens=pan_cfg.max_new_tokens,
                 batch_size=cfg.runtime.batch_size,
                 initial_max_new_tokens=pan_cfg.initial_max_new_tokens,
+                temperature=pan_cfg.temperature,
+                top_p=pan_cfg.top_p,
             )
     except Exception as exc:
         if pan_cfg.placeholder_ok:

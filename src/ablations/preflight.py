@@ -42,6 +42,38 @@ class PreflightReport:
         }
 
 
+def requirements_from_manifest(
+    asset_ids: Iterable[str],
+    manifest: Mapping[str, object],
+    *,
+    cell_id: str,
+) -> tuple[list[AssetRequirement], tuple[str, ...]]:
+    """Translate only explicitly declared cell requirements into checks."""
+
+    requirements: list[AssetRequirement] = []
+    missing: list[str] = []
+    for raw_id in asset_ids:
+        asset_id = str(raw_id)
+        if asset_id not in manifest:
+            missing.append(asset_id)
+            continue
+        raw = manifest[asset_id]
+        if isinstance(raw, str):
+            path_text = raw.strip()
+            kind = "directory" if Path(path_text).suffix == "" else "file"
+        elif isinstance(raw, Mapping):
+            path_text = str(raw.get("path", "")).strip()
+            kind = str(raw.get("kind", "directory")).strip().lower()
+        else:
+            raise ValueError(f"asset {asset_id} must declare a path string or object")
+        if not path_text:
+            raise ValueError(f"asset {asset_id} path must be non-empty")
+        if kind not in {"file", "directory", "model"}:
+            raise ValueError(f"asset {asset_id} has unsupported kind: {kind}")
+        requirements.append(AssetRequirement(asset_id, Path(path_text), kind, cell_id))
+    return requirements, tuple(missing)
+
+
 def _cell_id(asset_id: str, path: Path, explicit: str = "") -> str:
     if explicit:
         return explicit
