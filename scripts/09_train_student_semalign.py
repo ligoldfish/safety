@@ -31,6 +31,7 @@ from src.training import (
     write_train_metric,
     write_val_metrics,
 )
+from src.ablations.strategies.targets import permute_target_map
 from src.utils.config import load_phasef_config
 from src.utils.io import ensure_dir, write_json
 from src.utils.logging import log_kv, setup_stage_logger
@@ -58,9 +59,9 @@ def main() -> None:
     output_root = ensure_dir(cfg.output.output_root)
     logger, log_path = setup_stage_logger("09_train_student_semalign", output_root / "logs")
     target_mode = str(cfg.target.mode).strip().lower()
-    if target_mode not in {"semantic", "random_same_norm"}:
+    if target_mode not in {"semantic", "random_same_norm", "within_label_permutation", "cross_label_permutation"}:
         raise ValueError(
-            f"Unsupported target mode: {cfg.target.mode}. Expected 'semantic' or 'random_same_norm'."
+            f"Unsupported target mode: {cfg.target.mode}."
         )
     layer_loss_policy = str(cfg.target.layer_loss_policy).strip().lower()
     if layer_loss_policy not in {"all", "harmful_only", "label_weighted", "harmless_anchor"}:
@@ -68,6 +69,15 @@ def main() -> None:
             f"Unsupported target.layer_loss_policy: {cfg.target.layer_loss_policy}. "
             "Expected 'all', 'harmful_only', 'label_weighted', or 'harmless_anchor'."
         )
+    layer_loss_kind = str(cfg.target.loss_kind).strip().lower()
+    if layer_loss_kind not in {"cosine", "normalized_mse", "raw_mse", "margin_contrastive"}:
+        raise ValueError(
+            f"Unsupported target.loss_kind: {cfg.target.loss_kind}. Expected cosine, "
+            "normalized_mse, raw_mse, or margin_contrastive."
+        )
+    contrastive_margin = float(cfg.target.contrastive_margin)
+    if not math.isfinite(contrastive_margin) or contrastive_margin < 0.0:
+        raise ValueError("target.contrastive_margin must be finite and non-negative.")
 
     semantic_train_target_map, train_pair_keys = load_student_target_map(cfg.inputs.train_targets_dir)
     semantic_val_target_map, val_pair_keys = load_student_target_map(cfg.inputs.val_targets_dir)
@@ -92,10 +102,7 @@ def main() -> None:
         train_anchor_map = load_student_anchor_map(cfg.inputs.train_anchor_dir, layer_ids=unique_student_layers)
         val_anchor_map = load_student_anchor_map(cfg.inputs.val_anchor_dir, layer_ids=unique_student_layers)
 
-    if target_mode == "semantic":
-        train_target_map = semantic_train_target_map
-        val_target_map = semantic_val_target_map
-    else:
+    if target_mode == "random_same_norm":
         train_target_map = build_random_target_map(
             semantic_train_target_map,
             seed=int(cfg.target.random_seed),
@@ -106,6 +113,9 @@ def main() -> None:
             seed=int(cfg.target.random_seed) + 1,
             match_l2_norm=bool(cfg.target.match_l2_norm),
         )
+    else:
+        train_target_map = semantic_train_target_map
+        val_target_map = semantic_val_target_map
 
     train_split_path = Path(cfg.inputs.train_split)
     if not train_split_path.exists():
@@ -119,6 +129,36 @@ def main() -> None:
         )
     train_records = load_records(cfg.inputs.train_split)
     val_records = load_records(cfg.inputs.val_split)
+    permutation_manifests: dict[str, dict[str, str]] = {}
+    if target_mode in {"within_label_permutation", "cross_label_permutation"}:
+        def labels_for_targets(records, targets, *, split_name: str) -> dict[str, str]:
+            labels_by_id = {str(record["id"]): str(record.get("label", "")) for record in records}
+            missing = sorted(set(targets) - set(labels_by_id))
+            if missing:
+                raise ValueError(
+                    f"{split_name} target IDs are absent from the split: {missing[:5]}"
+                )
+            return {sample_id: labels_by_id[sample_id] for sample_id in targets}
+
+        train_target_map, train_permutation = permute_target_map(
+            semantic_train_target_map,
+            labels_for_targets(train_records, semantic_train_target_map, split_name="train"),
+            mode=target_mode,
+            seed=int(cfg.target.random_seed),
+        )
+        val_target_map, val_permutation = permute_target_map(
+            semantic_val_target_map,
+            labels_for_targets(val_records, semantic_val_target_map, split_name="validation"),
+            mode=target_mode,
+            seed=int(cfg.target.random_seed) + 1,
+        )
+        permutation_manifests = {"train": train_permutation, "validation": val_permutation}
+        for split_name, mapping in permutation_manifests.items():
+            permutation_seed = int(cfg.target.random_seed) + (1 if split_name == "validation" else 0)
+            write_json(
+                output_root / f"target_permutation_{split_name}.json",
+                {"mode": target_mode, "seed": permutation_seed, "mapping": mapping},
+            )
     train_dataset = SemAlignDataset(
         train_records,
         train_target_map,
@@ -254,6 +294,8 @@ def main() -> None:
         random_seed=int(cfg.target.random_seed),
         match_l2_norm=bool(cfg.target.match_l2_norm),
         layer_loss_policy=layer_loss_policy,
+        layer_loss_kind=layer_loss_kind,
+        contrastive_margin=contrastive_margin,
         harmful_layer_weight=float(cfg.target.harmful_layer_weight),
         harmless_layer_weight=float(cfg.target.harmless_layer_weight),
         filter_harmful_targets=bool(cfg.target.filter_harmful_targets),
@@ -308,6 +350,8 @@ def main() -> None:
                 layer_loss_weight=cfg.optim.layer_loss_weight,
                 sft_loss_weight=cfg.optim.sft_loss_weight,
                 layer_loss_policy=layer_loss_policy,
+                layer_loss_kind=layer_loss_kind,
+                contrastive_margin=contrastive_margin,
                 harmful_layer_weight=float(cfg.target.harmful_layer_weight),
                 harmless_layer_weight=float(cfg.target.harmless_layer_weight),
             )
@@ -502,6 +546,12 @@ def main() -> None:
             "target_random_seed": int(cfg.target.random_seed),
             "target_match_l2_norm": bool(cfg.target.match_l2_norm),
             "target_layer_loss_policy": layer_loss_policy,
+            "target_loss_kind": layer_loss_kind,
+            "target_contrastive_margin": contrastive_margin,
+            "target_permutation_manifests": {
+                split_name: str(output_root / f"target_permutation_{split_name}.json")
+                for split_name in permutation_manifests
+            },
             "target_harmful_layer_weight": float(cfg.target.harmful_layer_weight),
             "target_harmless_layer_weight": float(cfg.target.harmless_layer_weight),
             "target_filter_harmful_targets": bool(cfg.target.filter_harmful_targets),

@@ -182,6 +182,8 @@ class PhaseFOptimConfig:
 @dataclass
 class PhaseFTargetConfig:
     mode: str = "semantic"
+    loss_kind: str = "cosine"
+    contrastive_margin: float = 0.2
     random_seed: int = 2042
     match_l2_norm: bool = True
     layer_loss_policy: str = "all"

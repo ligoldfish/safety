@@ -10,7 +10,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.layer_pairing import build_layer_pairs
+from src.ablations.strategies.pairing import linear_cka_matrix
 from src.models.hf_loader import load_hf_model
+from src.phase_b.hidden_states import load_hidden_state_split
 from src.utils.config import load_phase1_config
 from src.utils.io import ensure_dir, write_json
 from src.utils.logging import log_kv, setup_stage_logger
@@ -33,6 +35,14 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional explicit path to teacher_key_layers.json.",
     )
+    parser.add_argument(
+        "--pairing-mode",
+        choices=["relative_depth", "cka_nearest", "random_permutation", "same_index_clamped"],
+        default="relative_depth",
+    )
+    parser.add_argument("--draw-seed", type=int, default=2042)
+    parser.add_argument("--teacher-hidden-dir", type=str, default="teacher_alignment")
+    parser.add_argument("--student-hidden-dir", type=str, default="student_alignment")
     return parser.parse_args()
 
 
@@ -78,10 +88,31 @@ def main() -> None:
     )
     del student_model
 
+    cka = None
+    cka_sample_ids = None
+    if args.pairing_mode == "cka_nearest":
+        hidden_root = Path(cfg.extraction.output_root) / "hidden_states"
+        teacher_split = load_hidden_state_split(
+            hidden_root / args.teacher_hidden_dir,
+            selected_layers=teacher_key_layers,
+        )
+        student_split = load_hidden_state_split(hidden_root / args.student_hidden_dir)
+        if teacher_split.sample_ids != student_split.sample_ids:
+            raise ValueError("teacher/student CKA sample IDs must match exactly and in order")
+        cka = linear_cka_matrix(
+            teacher_split.layer_tensors,
+            student_split.layer_tensors,
+            teacher_key_layers=teacher_key_layers,
+        )
+        cka_sample_ids = teacher_split.sample_ids
+
     pairs = build_layer_pairs(
         teacher_key_layers,
         teacher_num_layers=teacher_meta["num_layers"],
         student_num_layers=student_meta["num_layers"],
+        mode=args.pairing_mode,
+        cka=cka,
+        seed=args.draw_seed,
     )
     output_root = ensure_dir(Path(cfg.extraction.output_root) / "layer_pairing")
     output_path = output_root / "teacher_student_layer_pairs.json"
@@ -92,6 +123,10 @@ def main() -> None:
         "student_model": cfg.student.name,
         "teacher_num_layers": teacher_meta["num_layers"],
         "student_num_layers": student_meta["num_layers"],
+        "pairing_mode": args.pairing_mode,
+        "draw_seed": args.draw_seed if args.pairing_mode == "random_permutation" else None,
+        "cka_sample_ids": cka_sample_ids,
+        "cka_matrix": None if cka is None else cka.tolist(),
         "pairs": [
             {
                 "teacher_layer": pair.teacher_layer,

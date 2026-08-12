@@ -20,7 +20,7 @@ from src.training.eval_utils import (
     looks_like_refusal,
     mean,
 )
-from src.training.losses import cosine_layer_alignment_loss
+from src.ablations.strategies.losses import layer_alignment_loss, supervision_weights
 from src.utils.io import ensure_dir, read_jsonl, write_json
 
 
@@ -446,6 +446,8 @@ def forward_semalign_batch(
     layer_loss_policy: str = "all",
     harmful_layer_weight: float = 1.0,
     harmless_layer_weight: float = 1.0,
+    layer_loss_kind: str = "cosine",
+    contrastive_margin: float = 0.2,
 ) -> tuple[torch.Tensor, Dict[str, float]]:
     inputs = {
         "input_ids": batch.input_ids.to(device),
@@ -482,10 +484,12 @@ def forward_semalign_batch(
         harmless_layer_weight=harmless_layer_weight,
         has_layer_target=batch.has_layer_target,
     )
-    loss_layer, cosine_by_layer = cosine_layer_alignment_loss(
+    loss_layer, cosine_by_layer = layer_alignment_loss(
         predicted_by_layer,
         target_by_layer,
+        kind=layer_loss_kind,
         sample_weights=sample_weights,
+        margin=contrastive_margin,
     )
     loss_out = outputs.loss
     loss_total = (sft_loss_weight * loss_out) + (layer_loss_weight * loss_layer)
@@ -523,34 +527,14 @@ def _layer_sample_weights(
     those rows out.
     """
 
-    policy = str(layer_loss_policy).strip().lower()
-    if policy not in {"all", "harmful_only", "label_weighted", "harmless_anchor"}:
-        raise ValueError(
-            f"Unsupported layer_loss_policy: {layer_loss_policy}. "
-            "Expected 'all', 'harmful_only', 'label_weighted', or 'harmless_anchor'."
-        )
-    has_target_list = (
-        [bool(flag) for flag in has_layer_target.detach().cpu().tolist()]
-        if has_layer_target is not None
-        else [True] * len(labels_text)
+    return supervision_weights(
+        labels_text,
+        mode=layer_loss_policy,
+        harmful_weight=harmful_layer_weight,
+        harmless_weight=harmless_layer_weight,
+        has_target=has_layer_target,
+        device=device,
     )
-    any_missing = not all(has_target_list)
-    if policy == "all" and not any_missing:
-        return None
-    weights = []
-    for label, has_target in zip(labels_text, has_target_list):
-        if not has_target:
-            weights.append(0.0)
-            continue
-        if policy == "all":
-            weights.append(1.0)
-        elif str(label) == "harmful":
-            weights.append(float(harmful_layer_weight))
-        elif str(label) == "harmless":
-            weights.append(0.0 if policy == "harmful_only" else float(harmless_layer_weight))
-        else:
-            weights.append(0.0)
-    return torch.tensor(weights, device=device, dtype=torch.float32)
 
 
 @torch.no_grad()
