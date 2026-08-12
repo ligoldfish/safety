@@ -122,6 +122,36 @@ class Tulu3SafetyTests(unittest.TestCase):
 
 
 class SafetyTunedLlamasTests(unittest.TestCase):
+    def test_eval_holdout_is_removed_from_training(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            rows = [
+                {"instruction": f"unsafe {i}", "input": "", "output": "refuse"}
+                for i in range(10)
+            ]
+            harmless = [
+                {"instruction": f"safe {i}", "input": "", "output": "help"}
+                for i in range(10)
+            ]
+            (data_dir / "safety_only_data_Instructions.json").write_text(json.dumps(rows), encoding="utf-8")
+            (data_dir / "alpaca_small.json").write_text(json.dumps(harmless), encoding="utf-8")
+            output = Path(tmpdir) / "train.jsonl"
+            evaluation = Path(tmpdir) / "eval.jsonl"
+            records = build_safety_tuned_llamas_records(
+                output_path=output,
+                repo_or_data_path=data_dir,
+                include_harmless_contrast=True,
+                eval_output_path=evaluation,
+                eval_holdout_fraction=0.2,
+                seed=7,
+            )
+            eval_records = [json.loads(line) for line in evaluation.read_text(encoding="utf-8").splitlines()]
+            from src.ablations.data_audit import audit_train_eval_splits
+            self.assertEqual(len(records), 16)
+            self.assertEqual(len(eval_records), 4)
+            self.assertEqual(audit_train_eval_splits(records, eval_records)["overlap_count"], 0)
+
     def test_missing_file_raises_with_clear_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_dir = Path(tmpdir) / "no-such-repo"
@@ -332,6 +362,31 @@ class RefusalTemplatePoolTests(unittest.TestCase):
 
 
 class WildGuardMixUpstreamResponseTests(unittest.TestCase):
+    def test_official_eval_prompt_is_excluded_from_train(self) -> None:
+        train_rows = [
+            {"id": "overlap", "prompt": "shared prompt", "response": "refuse", "prompt_harm_label": "harmful", "response_harm_label": "unharmful", "response_refusal_label": "refusal"},
+            {"id": "train-only", "prompt": "train prompt", "response": "refuse", "prompt_harm_label": "harmful", "response_harm_label": "unharmful", "response_refusal_label": "refusal"},
+            {"id": "benign", "prompt": "benign train", "response": "help", "prompt_harm_label": "unharmful", "response_harm_label": "unharmful", "response_refusal_label": "compliance"},
+        ]
+        test_rows = [
+            {"id": "test-overlap", "prompt": "shared prompt", "response": "", "prompt_harm_label": "harmful"},
+            {"id": "test-benign", "prompt": "benign test", "response": "", "prompt_harm_label": "unharmful"},
+        ]
+        def fake_load(_source, config, **_kwargs):
+            return test_rows if config == "wildguardtest" else train_rows
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "train.jsonl"
+            evaluation = Path(tmpdir) / "eval.jsonl"
+            with mock.patch.object(safety_datasets, "_load_dataset", side_effect=fake_load):
+                records = build_wildguardmix_records(
+                    output_path=output,
+                    train_subset_mode=False,
+                    eval_output_path=evaluation,
+                )
+            self.assertNotIn("overlap", {item["id"] for item in records})
+            summary = json.loads(output.with_suffix(".jsonl.summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["drops"]["train_eval_prompt_overlap"], 1)
+
     """For harmful WildGuardMix rows we now prefer the upstream
     ``response`` when ``response_harm_label == "unharmful"``, falling back
     to the refusal-template pool when the upstream response is missing

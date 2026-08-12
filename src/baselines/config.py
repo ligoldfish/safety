@@ -107,6 +107,7 @@ class SafetyDatasetConfig:
     max_eval_samples: int = 0
     max_eval_samples_per_label: int = 0
     eval_output_path: str = ""
+    eval_holdout_fraction: float = 0.1
 
 
 @dataclass

@@ -283,15 +283,12 @@ def main() -> None:
         sanity_fraction=float(args.sanity_fraction),
     )
 
-    # Phase F SFT training reads train_set.jsonl (full data). Phase 1 reads
-    # alignment_set.jsonl, which is the SOLE responsibility of
-    # scripts/19b_curate_phase1_subset.py (even in mode=off, where 19b copies
-    # train_set.jsonl byte-for-byte). We deliberately do NOT write
-    # alignment_set.jsonl here: doing so created a race where a previous 19b
-    # crash left the full train set in place, and the next 19b run (without
-    # --force-rebuild) saw the existing file and silently treated it as
-    # already-curated.
+    # Phase F reads train_set.jsonl. Materialize an identical default
+    # alignment_set.jsonl so this standalone command satisfies its documented
+    # five-file contract. 19b may later replace it with a curated subset; its
+    # own manifest/hash remains the authority for whether curation completed.
     write_jsonl(output_dir / "train_set.jsonl", train_split)
+    write_jsonl(output_dir / "alignment_set.jsonl", train_split)
     write_jsonl(output_dir / "analysis_val_set.jsonl", val_split)
     write_jsonl(output_dir / "sanity_test_set.jsonl", sanity_split)
     # pan_train_set is the hidden-state extraction source; SemAlign uses the

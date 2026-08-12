@@ -296,49 +296,14 @@ def _build_safety_tuned_llamas_test(
     out = _eval_jsonl_path("safety_tuned_llamas")
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_jsonl = Path(tmpdir) / "stl_full.jsonl"
-        records = build_safety_tuned_llamas_records(
+        build_safety_tuned_llamas_records(
             output_path=tmp_jsonl,
             repo_or_data_path=repo_path,
             include_harmless_contrast=True,
+            eval_output_path=out,
+            eval_holdout_fraction=holdout_fraction,
+            seed=seed,
         )
-
-    harmful = [r for r in records if r.get("dataset") == "safety_tuned_llamas"]
-    harmless = [r for r in records if r.get("dataset") == "safety_tuned_llamas_harmless"]
-    if not harmful:
-        raise RuntimeError("STL harmful records missing -- builder produced zero.")
-    if not harmless:
-        raise RuntimeError(
-            "STL harmless contrast missing -- ensure alpaca_small.json is in "
-            f"{repo_path}/ or {repo_path}/data/."
-        )
-
-    rng_h = random.Random(seed)
-    rng_h.shuffle(harmful)
-    rng_b = random.Random(seed + 1)
-    rng_b.shuffle(harmless)
-    n_harmful = max(1, int(round(len(harmful) * holdout_fraction)))
-    n_harmless = max(1, int(round(len(harmless) * holdout_fraction)))
-
-    eval_records: List[Dict[str, Any]] = []
-    for r in harmful[:n_harmful]:
-        eval_records.append(
-            {
-                "id": f"stl_test_{r['id']}",
-                "label": "harmful",
-                "messages": list(r["messages"]),
-                "source": r.get("source"),
-            }
-        )
-    for r in harmless[:n_harmless]:
-        eval_records.append(
-            {
-                "id": f"stl_test_{r['id']}",
-                "label": "harmless",
-                "messages": list(r["messages"]),
-                "source": r.get("source"),
-            }
-        )
-    write_jsonl(out, eval_records)
     return out
 
 

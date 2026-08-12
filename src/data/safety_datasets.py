@@ -185,6 +185,7 @@ class SafetyDatasetSpec:
     max_eval_samples: int = 0
     max_eval_samples_per_label: int = 0
     eval_output_path: Optional[str] = None
+    eval_holdout_fraction: float = 0.1
     seed: int = 42
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -1518,17 +1519,8 @@ def build_wildguardmix_records(
         seed=seed,
         drops=drops,
     )
-    records = _sample_balanced_by_label(
-        train_pool,
-        subset_mode=train_subset_mode,
-        max_samples=max_train_samples,
-        max_samples_per_label=max_train_samples_per_label,
-        seed=seed,
-    )
-    _validate_binary_training_records(records)
-    write_jsonl(output_path, records)
-
     eval_records: List[Dict[str, Any]] = []
+    split_drop_records: List[Dict[str, Any]] = []
     test_source = ""
     test_fallback_reason = ""
     if eval_output_path:
@@ -1549,11 +1541,34 @@ def build_wildguardmix_records(
             if len({r["label"] for r in eval_pool}) < 2:
                 raise RuntimeError("WildGuardTest does not contain both labels")
             test_source = f"{source_name}:wildguardtest"
+            from src.ablations.data_audit import exclude_protected_prompts
+
+            train_pool, split_drop_records = exclude_protected_prompts(
+                train_pool,
+                eval_pool,
+                reason="train_eval_prompt_overlap",
+            )
+            if split_drop_records:
+                drops["train_eval_prompt_overlap"] = len(split_drop_records)
         except Exception as exc:
             test_fallback_reason = _format_fallback_reason(exc)
+            # Fallback split is sampled after train selection below.
+            eval_pool = []
+            test_source = f"{source_name}:{split or 'wildguardtrain'} holdout"
+    records = _sample_balanced_by_label(
+        train_pool,
+        subset_mode=train_subset_mode,
+        max_samples=max_train_samples,
+        max_samples_per_label=max_train_samples_per_label,
+        seed=seed,
+    )
+    _validate_binary_training_records(records)
+    write_jsonl(output_path, records)
+
+    if eval_output_path:
+        if not eval_pool:
             selected_ids = {str(record.get("id", "")) for record in records}
             eval_pool = [record for record in train_pool if str(record.get("id", "")) not in selected_ids]
-            test_source = f"{source_name}:{split or 'wildguardtrain'} holdout"
         eval_selected = _sample_balanced_by_label(
             eval_pool,
             subset_mode=eval_subset_mode,
@@ -1563,6 +1578,17 @@ def build_wildguardmix_records(
         )
         eval_records = [_to_eval_record(record, id_prefix="wildguardmix_test") for record in eval_selected]
         write_jsonl(eval_output_path, eval_records)
+        from src.ablations.data_audit import write_data_audit
+
+        write_data_audit(
+            Path(output_path).with_suffix(Path(output_path).suffix + ".split_audit.json"),
+            dataset="wildguardmix",
+            train=records,
+            evaluation=eval_records,
+            drops=split_drop_records,
+            license_name="ODC-BY-1.0",
+            intended_use="safety alignment training and evaluation",
+        )
 
     _write_materialization_summary(
         output_path=output_path,
@@ -2208,6 +2234,8 @@ def build_safety_tuned_llamas_records(
     include_harmless_contrast: bool = False,
     harmless_file_name: str = "alpaca_small.json",
     harmless_max_samples: Optional[int] = None,
+    eval_output_path: str | Path | None = None,
+    eval_holdout_fraction: float = 0.1,
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """Materialize the 2k Safety-Tuned LLaMAs Alpaca-format records.
@@ -2270,6 +2298,25 @@ def build_safety_tuned_llamas_records(
         harmless_records = harmless_records[:harmless_cap]
         records.extend(harmless_records)
 
+    if eval_output_path:
+        from src.ablations.data_audit import stratified_holdout, write_data_audit
+
+        records, eval_records = stratified_holdout(
+            records,
+            fraction=eval_holdout_fraction,
+            seed=seed,
+        )
+        eval_records = [_to_eval_record(record, id_prefix="safety_tuned_llamas_test") for record in eval_records]
+        write_jsonl(eval_output_path, eval_records)
+        write_data_audit(
+            Path(output_path).with_suffix(Path(output_path).suffix + ".split_audit.json"),
+            dataset="safety_tuned_llamas",
+            train=records,
+            evaluation=eval_records,
+            drops=[],
+            license_name="upstream repository license",
+            intended_use="safety alignment training and held-out evaluation",
+        )
     write_jsonl(output_path, records)
     return records
 
@@ -3034,6 +3081,8 @@ def _build_safety_tuned_llamas(spec: SafetyDatasetSpec) -> List[Dict[str, Any]]:
         include_harmless_contrast=bool(spec.include_harmless_contrast),
         harmless_file_name=spec.harmless_file_name or "alpaca_small.json",
         harmless_max_samples=spec.harmless_max_samples,
+        eval_output_path=spec.eval_output_path,
+        eval_holdout_fraction=float(spec.eval_holdout_fraction),
         seed=int(spec.seed),
     )
 

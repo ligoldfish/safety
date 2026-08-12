@@ -25,6 +25,8 @@ data:
     harmless_file_name: alpaca_small.json
     harmless_max_samples: 0  # 0 = auto-balance to harmful count
     force_rebuild: false
+    eval_output_path: ../data/processed/safety/safety_tuned_llamas_eval.jsonl
+    eval_holdout_fraction: 0.1
 lora:
   rank: 8
   alpha: 8.0
