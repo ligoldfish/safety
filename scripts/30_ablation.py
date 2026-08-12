@@ -12,7 +12,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.ablations.catalog import load_catalog
 from src.ablations.planner import build_catalog_plan, validate_plan
-from src.ablations.preflight import AssetRequirement, run_preflight
+from src.ablations.preflight import (
+    AssetRequirement,
+    PreflightIssue,
+    PreflightReport,
+    requirements_from_manifest,
+    run_preflight,
+)
 from src.ablations.runner import AblationRunner, RunnerContext, RunnerError
 from src.ablations.schema import ExperimentCell, ExperimentPlan
 
@@ -69,7 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     preflight = subparsers.add_parser("preflight")
     preflight.add_argument("--plan", required=True)
-    preflight.add_argument("--asset-root", required=True)
+    asset_source = preflight.add_mutually_exclusive_group(required=True)
+    asset_source.add_argument("--asset-manifest")
+    asset_source.add_argument(
+        "--asset-root",
+        help="Legacy layout: every asset is a directory named <asset-root>/<asset-id>.",
+    )
     preflight.add_argument("--output", default="")
 
     for name in ("status", "summarize"):
@@ -123,13 +134,50 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = _read_plan(args.plan)
     if args.command == "preflight":
-        root = Path(args.asset_root).expanduser().resolve()
-        requirements = []
-        for cell in plan.cells:
-            definition = catalog.experiments[cell.experiment_id]
-            for asset_id in definition.requires:
-                requirements.append(AssetRequirement(asset_id, root / asset_id, "directory", cell.cell_id))
-        report = run_preflight(requirements)
+        requirements: list[AssetRequirement] = []
+        missing_issues: list[PreflightIssue] = []
+        if args.asset_manifest:
+            manifest_path = Path(args.asset_manifest).expanduser().resolve()
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RunnerError(f"invalid asset manifest: {manifest_path}") from exc
+            if not isinstance(manifest, dict):
+                raise RunnerError("asset manifest must be a JSON object")
+            for cell in plan.cells:
+                definition = catalog.experiments[cell.experiment_id]
+                cell_requirements, missing = requirements_from_manifest(
+                    definition.requires,
+                    manifest,
+                    cell_id=cell.cell_id,
+                    base_dir=manifest_path.parent,
+                )
+                requirements.extend(cell_requirements)
+                missing_issues.extend(
+                    PreflightIssue(
+                        cell_id=cell.cell_id,
+                        asset_id=asset_id,
+                        code="MANIFEST_KEY_MISSING",
+                        category="manifest",
+                        message="required asset is not declared in the manifest",
+                        suggestion="add a typed path entry to the asset manifest",
+                    )
+                    for asset_id in missing
+                )
+        else:
+            root = Path(args.asset_root).expanduser().resolve()
+            for cell in plan.cells:
+                definition = catalog.experiments[cell.experiment_id]
+                for asset_id in definition.requires:
+                    requirements.append(
+                        AssetRequirement(asset_id, root / asset_id, "directory", cell.cell_id)
+                    )
+        checked = run_preflight(requirements)
+        report = PreflightReport(
+            "READY" if checked.status == "READY" and not missing_issues else "BLOCKED",
+            tuple(missing_issues) + checked.issues,
+            checked.checked,
+        )
         payload = report.to_dict()
         if args.output:
             Path(args.output).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

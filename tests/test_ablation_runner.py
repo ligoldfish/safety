@@ -250,6 +250,40 @@ class AblationCompileTests(unittest.TestCase):
         self.assertIn("32", by_script["07_decompose_teacher_semantics.py"][0])
         self.assertIn("ridge", by_script["08_recompose_student_targets.py"][0])
 
+    def test_safety_full_explicit_configs_preserve_cell_outputs_and_persistent_data(self) -> None:
+        path = ROOT / "scripts" / "15_run_oneclick.py"
+        spec = importlib.util.spec_from_file_location("oneclick_safety_roots_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cell_phase1 = root / "outputs" / "cell" / "pipeline" / "phase1"
+            cell_phasef = cell_phase1 / "training"
+            phase1_path = root / "phase1.yaml"
+            phasef_path = root / "phaseF.yaml"
+            phase1_path.write_text(
+                "extraction:\n  output_root: " + json.dumps(str(cell_phase1)) + "\n",
+                encoding="utf-8",
+            )
+            phasef_path.write_text(
+                "output:\n  output_root: " + json.dumps(str(cell_phasef)) + "\n",
+                encoding="utf-8",
+            )
+            data_root = root / "persistent-data"
+            with patch.dict(os.environ, {"SAFETY_DATA_ROOT": str(data_root)}):
+                processed, pan, phase1_root, phasef_root = module._resolve_safety_full_roots(
+                    baseline_name="c5",
+                    device="npu",
+                    cell_id="cell-123",
+                    phase1_config_path=str(phase1_path),
+                    phasef_config_path=str(phasef_path),
+                )
+        self.assertEqual(processed, (data_root / "processed" / "safety_full_c5").resolve())
+        self.assertEqual(pan, (data_root / "processed").resolve())
+        self.assertEqual(phase1_root, cell_phase1.resolve())
+        self.assertEqual(phasef_root, cell_phasef.resolve())
+
     def test_benchmark_missing_assets_is_blocked_and_decode_is_shared(self) -> None:
         decode = DecodeConfig(temperature=0.7, top_p=0.9, max_new_tokens=1024)
         with tempfile.TemporaryDirectory() as td:

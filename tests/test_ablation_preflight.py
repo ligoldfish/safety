@@ -115,11 +115,27 @@ class AblationPreflightTests(unittest.TestCase):
                     "wildguard_model": {"path": str(model), "kind": "model"},
                 },
                 cell_id="cell-1",
+                base_dir=root,
             )
             report = run_preflight(requirements)
         self.assertEqual(report.status, "READY")
         self.assertEqual(missing, ("not_declared",))
         self.assertEqual([item.kind for item in requirements], ["directory", "model"])
+
+    def test_manifest_relative_paths_are_anchored_to_the_manifest_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "assets" / "phasef").mkdir(parents=True)
+            requirements, missing = requirements_from_manifest(
+                ["phasef_data"],
+                {"phasef_data": {"path": "assets/phasef", "kind": "directory"}},
+                cell_id="cell-relative",
+                base_dir=root,
+            )
+            report = run_preflight(requirements)
+        self.assertEqual(missing, ())
+        self.assertEqual(report.status, "READY")
+        self.assertEqual(requirements[0].path, (root / "assets" / "phasef").resolve())
 
     def test_manifest_rejects_unknown_kind_and_non_path_payload(self) -> None:
         with self.assertRaisesRegex(ValueError, "kind"):

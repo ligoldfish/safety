@@ -446,6 +446,7 @@ class AblationRunner:
                     self.catalog.experiments[cell.experiment_id].requires,
                     manifest,
                     cell_id=cell.cell_id,
+                    base_dir=self.context.asset_manifest.parent,
                 )
                 if missing:
                     return ledger.transition(

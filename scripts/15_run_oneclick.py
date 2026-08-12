@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.baselines.config import load_distill_config, load_eval_config, load_sft_config
+from src.ablations.platform import resolve_portable_path
 from src.utils.config import load_phase1_config, load_phasef_config
 from src.pairs import DEFAULT_PAIR, PAIRS, apply_tokens
 
@@ -1357,6 +1358,71 @@ def _make_safety_full_overrides(
     return phase1_override_path, phasef_override_path
 
 
+def _configured_output_root(config_path: str, section: str) -> Path:
+    path = _resolve(config_path)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get(section), dict):
+        raise ValueError(f"{path} must contain a {section!r} mapping")
+    value = raw[section].get("output_root")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{path} must define {section}.output_root")
+    return Path(
+        resolve_portable_path(value, path.parent, category="output")
+    ).resolve()
+
+
+def _resolve_safety_full_roots(
+    *,
+    baseline_name: str,
+    device: str,
+    cell_id: str,
+    phase1_config_path: str,
+    phasef_config_path: str,
+) -> tuple[Path, Path, Path, Path]:
+    """Resolve persistent data roots and isolated outputs for a safety cell.
+
+    The ablation backend stages configs with cell-owned output roots. Those
+    explicit roots are authoritative; legacy one-click calls without staged
+    configs keep their historical per-baseline naming.
+    """
+
+    safety_processed_dir = Path(
+        resolve_portable_path(
+            str(PROJECT_ROOT / "data" / "processed" / f"safety_full_{baseline_name}"),
+            PROJECT_ROOT,
+            category="data",
+        )
+    ).resolve()
+    pan_processed_dir = Path(
+        resolve_portable_path(
+            str(PROJECT_ROOT / "data" / "processed"),
+            PROJECT_ROOT,
+            category="data",
+        )
+    ).resolve()
+
+    if phase1_config_path:
+        phase1_root = _configured_output_root(phase1_config_path, "extraction")
+    else:
+        cell_suffix = f"_{cell_id}" if cell_id else ""
+        legacy = (
+            PROJECT_ROOT
+            / "outputs"
+            / f"safety_full_{baseline_name}_{device}{_pair_suffix()}{cell_suffix}"
+            / "phase1"
+        )
+        phase1_root = Path(
+            resolve_portable_path(str(legacy), PROJECT_ROOT, category="output")
+        ).resolve()
+
+    phasef_root = (
+        _configured_output_root(phasef_config_path, "output")
+        if phasef_config_path
+        else (phase1_root / "training").resolve()
+    )
+    return safety_processed_dir, pan_processed_dir, phase1_root, phasef_root
+
+
 def _run_safety_full(
     device: str,
     *,
@@ -1419,10 +1485,18 @@ def _run_safety_full(
     )
 
     # 2) Split into PAN-style 5 JSONLs under a per-baseline processed_dir.
-    safety_processed_dir = (
-        PROJECT_ROOT / "data" / "processed" / f"safety_full_{baseline_name}"
-    ).resolve()
-    pan_processed_dir = (PROJECT_ROOT / "data" / "processed").resolve()
+    (
+        safety_processed_dir,
+        pan_processed_dir,
+        safety_phase1_output_root,
+        safety_phasef_output_root,
+    ) = _resolve_safety_full_roots(
+        baseline_name=baseline_name,
+        device=device,
+        cell_id=cell_id,
+        phase1_config_path=phase1_config_path,
+        phasef_config_path=phasef_config_path,
+    )
     if not dry_run:
         safety_processed_dir.mkdir(parents=True, exist_ok=True)
     _run_script(
@@ -1441,20 +1515,8 @@ def _run_safety_full(
         env_overrides=env_overrides,
     )
 
-    # 3) Generate Phase 1 + PhaseF override yamls pointing at the safety dir.
-    # Per-cell isolated output dirs when cell_id provided (parallel sweep mode);
-    # else fall back to per-baseline shared dir (sequential default).
-    cell_suffix = f"_{cell_id}" if cell_id else ""
-    safety_phase1_output_root = (
-        PROJECT_ROOT
-        / "outputs"
-        / f"safety_full_{baseline_name}_{device}{_pair_suffix()}{cell_suffix}"
-        / "phase1"
-    ).resolve()
-    # PhaseF output lives under phase1/training so that 10_sanity_eval and
-    # 11_make_tables — which both default to <phase1.extraction.output_root>/training
-    # — can locate the LoRA checkpoint without --training-dir overrides.
-    safety_phasef_output_root = (safety_phase1_output_root / "training").resolve()
+    # 3) Generate Phase 1 + PhaseF override yamls pointing at the persistent
+    # safety split and the cell-owned output roots resolved above.
     phase1_override, phasef_override = _make_safety_full_overrides(
         device=device,
         device_id=device_id,

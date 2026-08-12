@@ -47,6 +47,7 @@ def requirements_from_manifest(
     manifest: Mapping[str, object],
     *,
     cell_id: str,
+    base_dir: str | Path | None = None,
 ) -> tuple[list[AssetRequirement], tuple[str, ...]]:
     """Translate only explicitly declared cell requirements into checks."""
 
@@ -70,7 +71,10 @@ def requirements_from_manifest(
             raise ValueError(f"asset {asset_id} path must be non-empty")
         if kind not in {"file", "directory", "model"}:
             raise ValueError(f"asset {asset_id} has unsupported kind: {kind}")
-        requirements.append(AssetRequirement(asset_id, Path(path_text), kind, cell_id))
+        path = Path(path_text).expanduser()
+        if not path.is_absolute() and base_dir is not None:
+            path = Path(base_dir) / path
+        requirements.append(AssetRequirement(asset_id, path.resolve(), kind, cell_id))
     return requirements, tuple(missing)
 
 
