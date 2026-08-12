@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.subspace import build_teacher_safe_subspace
+from src.ablations.strategies.subspace import build_control_subspace
 from src.phase_b.hidden_states import load_hidden_state_split
 from src.utils.config import load_phase1_config
 from src.utils.io import ensure_dir, write_json
@@ -85,6 +86,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable per-sample L2 normalization before estimating the safe subspace.",
     )
+    parser.add_argument(
+        "--subspace-mode",
+        choices=["learned", "none", "random_orthogonal"],
+        default="learned",
+    )
+    parser.add_argument("--draw-seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -193,6 +200,11 @@ def main() -> None:
             rank_cap=int(args.rank_cap),
             normalize_hidden=not args.no_normalize_hidden,
         )
+        basis = build_control_subspace(
+            result.basis,
+            mode=args.subspace_mode,
+            seed=args.draw_seed,
+        )
         layer_path = output_root / f"teacher_safe_subspace_layer_{layer_idx:02d}.pt"
         torch.save(
             {
@@ -203,7 +215,10 @@ def main() -> None:
                 # harmful_hidden - harmless_mean). It is NOT a scalar multiple
                 # of mean_diff; it is the subspace of harmful-vs-harmless
                 # differences.
-                "basis": result.basis,
+                "basis": basis,
+                "learned_rank": result.k,
+                "subspace_mode": args.subspace_mode,
+                "draw_seed": args.draw_seed,
                 "singular_values": result.singular_values,
                 # mean_diff: d-vector. harmful_mean - harmless_mean (the r_l
                 # direction from 方案详述 §3.2). Useful as a sanity-check
@@ -231,7 +246,7 @@ def main() -> None:
             "safe_subspace_saved",
             layer_idx=int(layer_idx),
             actual_rank=int(result.k),
-            basis_shape=list(result.basis.shape),
+            basis_shape=list(basis.shape),
             harmful_count=int(result.harmful_count),
             harmless_count=int(result.harmless_count),
             output_path=str(layer_path),
@@ -247,6 +262,8 @@ def main() -> None:
             "key_layers_path": str(key_layers_path),
             "key_layers": key_layers,
             "rank": args.rank,
+            "subspace_mode": args.subspace_mode,
+            "draw_seed": args.draw_seed,
             "balance_labels": not args.no_balance_labels,
             "normalize_hidden": not args.no_normalize_hidden,
             "raw_harmful_count": raw_harmful_count,

@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.projection import project_coeff, project_to_subspace, residual_norm_ratio
+from src.ablations.strategies.subspace import project_with_mode
 from src.utils.config import load_phase1_config
 from src.utils.io import ensure_dir, write_json
 from src.utils.logging import log_kv, setup_stage_logger
@@ -60,6 +61,20 @@ def _load_key_layers(path: Path) -> List[int]:
 
 def _load_subspace_payload(path: Path) -> Dict[str, torch.Tensor]:
     return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def _project_control(
+    hidden: torch.Tensor,
+    subspace_payload: Dict[str, object],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mode = str(subspace_payload.get("subspace_mode", "learned"))
+    basis = subspace_payload["basis"]
+    if not isinstance(basis, torch.Tensor):
+        raise ValueError("subspace payload basis must be a tensor")
+    basis = basis.to(dtype=torch.float32)
+    hidden_safe = project_with_mode(hidden, basis, mode=mode)
+    coeff = hidden.new_empty((hidden.size(0), 0)) if mode == "none" else project_coeff(hidden, basis)
+    return hidden_safe, coeff
 
 
 def main() -> None:
@@ -115,8 +130,7 @@ def main() -> None:
         for layer_idx in key_layers:
             basis = subspaces[layer_idx]["basis"].to(dtype=torch.float32)
             hidden = payload["hidden_by_layer"][str(layer_idx)].to(dtype=torch.float32)
-            coeff = project_coeff(hidden, basis)
-            hidden_safe = project_to_subspace(hidden, basis)
+            hidden_safe, coeff = _project_control(hidden, subspaces[layer_idx])
             residual = hidden - hidden_safe
             residual_ratio = residual_norm_ratio(hidden, hidden_safe)
 
@@ -165,6 +179,10 @@ def main() -> None:
             "safe_subspace_dir": str(safe_subspace_dir),
             "key_layers": key_layers,
             "storage_dtype": args.storage_dtype,
+            "subspace_modes": {
+                str(layer_idx): str(subspaces[layer_idx].get("subspace_mode", "learned"))
+                for layer_idx in key_layers
+            },
             "projection_semantics": (
                 "safe_component_by_layer[l] = h @ U @ U^T where U is the "
                 "layer-l teacher delta safety basis from step 03 (columns are "
