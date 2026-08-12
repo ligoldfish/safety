@@ -49,6 +49,10 @@ class SelectIsoHrTests(unittest.TestCase):
         self.assertIsNone(select_iso_hr([], target_hr=0.8, epsilon=0.05))
         self.assertIsNone(select_iso_hr([{"ckpt": "a", "val_hr": None}], 0.8, 0.05))
 
+    def test_selector_rejects_test_or_unknown_selection_split(self) -> None:
+        with self.assertRaises(ValueError):
+            select_iso_hr([{"ckpt": "a", "val_hr": 0.8}], 0.8, 0.05, selection_split="test")
+
 
 class ReadHelperTests(unittest.TestCase):
     def test_read_val_and_last_epoch_and_test(self) -> None:

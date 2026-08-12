@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-config", type=str, default="", help="Eval yaml; needed for --run-eval.")
     parser.add_argument("--run-eval", action="store_true", help="Run 12_eval on a selected checkpoint lacking a test summary.")
     parser.add_argument("--out", type=str, default="", help="CSV output path.")
+    parser.add_argument("--selection-split", choices=["validation"], default="validation")
     return parser.parse_args()
 
 
@@ -106,7 +107,7 @@ def main() -> None:
         if name == "ours":
             continue
         candidates = [{"ckpt": k, "val_hr": v["val_hr"]} for k, v in val[name].items()]
-        sel = select_iso_hr(candidates, target_hr, eps_frac)
+        sel = select_iso_hr(candidates, target_hr, eps_frac, selection_split=args.selection_split)
         if sel is None:
             needs_more_epochs.append(f"{name} (no val HR)")
             continue
