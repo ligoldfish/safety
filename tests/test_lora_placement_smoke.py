@@ -84,6 +84,16 @@ def _injection_covers_supervised(injection, pair_to_student_layer) -> bool:
 
 
 class LoraPlacementSmokeTest(unittest.TestCase):
+    def test_all_layers_placement_covers_every_transformer_block(self):
+        from scripts.train_student_helpers import resolve_lora_layers
+
+        selected = [16, 18, 19]
+        self.assertEqual(resolve_lora_layers(selected, placement="selected", num_layers=24), selected)
+        self.assertEqual(
+            resolve_lora_layers(selected, placement="all_layers_parameter_matched", num_layers=24),
+            list(range(24)),
+        )
+
     def test_inject_lands_on_paired_layers_not_bottom(self):
         # WGM-style pairing: pair idx -> physical student layer
         pair_to_student_layer = {0: 19, 1: 16, 2: 18}

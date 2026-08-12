@@ -5,7 +5,13 @@ from dataclasses import replace
 from pathlib import Path
 
 from src.ablations.catalog import load_catalog
-from src.ablations.planner import PlanError, build_main_table_plan, canonical_cell_id, validate_plan
+from src.ablations.planner import (
+    PlanError,
+    build_catalog_plan,
+    build_main_table_plan,
+    canonical_cell_id,
+    validate_plan,
+)
 from src.ablations.schema import ExperimentCell
 
 
@@ -14,6 +20,25 @@ CATALOG_PATH = ROOT / "configs" / "ablations" / "catalog.yaml"
 
 
 class AblationPlannerTests(unittest.TestCase):
+    def test_all_plan_covers_every_experiment_and_keeps_outputs_unique(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        plan = build_catalog_plan(catalog, output_root="/persistent/outputs", scope="all")
+        self.assertEqual({cell.experiment_id for cell in plan.cells}, set(catalog.experiments))
+        self.assertEqual(
+            sum(cell.experiment_id == "P0-01" for cell in plan.cells),
+            150,
+        )
+        self.assertEqual(len({cell.cell_id for cell in plan.cells}), len(plan.cells))
+        self.assertEqual(len({cell.output_dir for cell in plan.cells}), len(plan.cells))
+        p105 = [cell for cell in plan.cells if cell.experiment_id == "P1-05"]
+        self.assertEqual(len(p105), 8)
+        self.assertEqual(sum(cell.axes["mode"] == "random_k" for cell in p105), 5)
+        p115 = [cell for cell in plan.cells if cell.experiment_id == "P1-15"]
+        self.assertEqual(len(p115), 8)
+        self.assertTrue(
+            all(cell.axes["rank_cap"] == 32 or cell.axes["energy_threshold"] == 0.8 for cell in p115)
+        )
+
     def test_main_table_is_exactly_150_unique_cells(self) -> None:
         plan = build_main_table_plan(load_catalog(CATALOG_PATH), output_root="/persistent/outputs")
         self.assertEqual(len(plan.cells), 150)

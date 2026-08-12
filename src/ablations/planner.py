@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 from dataclasses import asdict
 from pathlib import PurePosixPath
@@ -50,6 +51,91 @@ def build_main_table_plan(catalog: ExperimentCatalog, *, output_root: str) -> Ex
                         output_dir=output_dir,
                     )
                 )
+    plan = ExperimentPlan(schema_version=catalog.schema_version, cells=tuple(cells))
+    validate_plan(plan)
+    return plan
+
+
+def _expand_axes(axes: Mapping[str, tuple[Any, ...]]) -> Iterable[dict[str, Any]]:
+    if not axes:
+        yield {}
+        return
+    keys = tuple(axes)
+    for values in itertools.product(*(axes[key] for key in keys)):
+        yield dict(zip(keys, values))
+
+
+def _valid_declared_cell(experiment_id: str, axes: Mapping[str, Any]) -> bool:
+    """Apply the correlated-axis constraints stated in the experiment design."""
+
+    if experiment_id == "P1-05":
+        # selected/evenly/last are deterministic single cells; only random-K
+        # has the five independent draws required by the design.
+        return str(axes.get("mode")) == "random_k" or int(axes.get("draw", 0)) == 0
+    if experiment_id == "P1-15":
+        # Two one-dimensional sensitivity curves: tau @ cap=32 and cap @ tau=.8.
+        return int(axes.get("rank_cap")) == 32 or float(axes.get("energy_threshold")) == 0.8
+    return True
+
+
+def build_catalog_plan(
+    catalog: ExperimentCatalog,
+    *,
+    output_root: str,
+    scope: str = "all",
+) -> ExperimentPlan:
+    """Expand a stable, immutable plan without loading data or models.
+
+    ``P0-01`` is the exact 5 x 6 x 5 main-table provenance matrix. Every
+    other experiment expands its declared axes as a Cartesian product. This
+    intentionally makes expensive work visible before submission rather than
+    hiding implicit loops in a launcher.
+    """
+
+    normalized_scope = str(scope).strip().lower().replace("_", "-")
+    if normalized_scope in {"main", "main-table"}:
+        return build_main_table_plan(catalog, output_root=output_root)
+    if normalized_scope not in {"all", "p0", "p1", "p2"}:
+        raise PlanError(f"unknown plan scope: {scope}")
+
+    cells: list[ExperimentCell] = []
+    main_cells = build_main_table_plan(catalog, output_root=output_root).cells
+    selected_ids = {
+        experiment_id
+        for experiment_id in catalog.experiments
+        if normalized_scope == "all" or experiment_id.startswith(normalized_scope.upper() + "-")
+    }
+    if "P0-01" in selected_ids:
+        cells.extend(main_cells)
+    for experiment_id in sorted(selected_ids):
+        if experiment_id == "P0-01":
+            continue
+        definition = catalog.experiments[experiment_id]
+        for axes in _expand_axes(definition.axes):
+            if not _valid_declared_cell(experiment_id, axes):
+                continue
+            overrides = dict(definition.overrides)
+            payload = {
+                "experiment_id": experiment_id,
+                "axes": axes,
+                "overrides": overrides,
+            }
+            cell_id = canonical_cell_id(payload)
+            output_dir = str(
+                PurePosixPath(output_root)
+                / "ablations"
+                / experiment_id.lower()
+                / cell_id
+            )
+            cells.append(
+                ExperimentCell(
+                    cell_id=cell_id,
+                    experiment_id=experiment_id,
+                    axes=axes,
+                    overrides=overrides,
+                    output_dir=output_dir,
+                )
+            )
     plan = ExperimentPlan(schema_version=catalog.schema_version, cells=tuple(cells))
     validate_plan(plan)
     return plan

@@ -6,6 +6,7 @@ import torch
 
 from src.ablations.strategies.representation import extract_position_hidden
 from src.features.first_gen_token import generated_token_mask
+from src.training.trainer_phase1 import select_training_representations
 
 
 class AblationRepresentationTests(unittest.TestCase):
@@ -76,6 +77,32 @@ class AblationRepresentationTests(unittest.TestCase):
         torch.testing.assert_close(generated_mask[0], torch.tensor([0, 0, 0, 1, 1, 0, 0]))
         torch.testing.assert_close(generated_mask[1], torch.tensor([0, 0, 0, 1, 1, 1, 1]))
         torch.testing.assert_close(full_mask[0], torch.tensor([0, 1, 1, 1, 1, 0, 0]))
+
+    def test_phasef_teacher_forced_positions_share_representation_semantics(self) -> None:
+        hidden = torch.tensor(
+            [
+                [[1.0], [2.0], [3.0], [10.0], [20.0], [0.0]],
+                [[4.0], [5.0], [30.0], [40.0], [0.0], [0.0]],
+            ]
+        )
+        attention = torch.tensor([[1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 0, 0]])
+        prompt_lengths = torch.tensor([3, 2])
+        torch.testing.assert_close(
+            select_training_representations(hidden, attention, prompt_lengths, mode="last_prompt"),
+            torch.tensor([[3.0], [5.0]]),
+        )
+        torch.testing.assert_close(
+            select_training_representations(hidden, attention, prompt_lengths, mode="mean_prompt"),
+            torch.tensor([[2.0], [4.5]]),
+        )
+        torch.testing.assert_close(
+            select_training_representations(hidden, attention, prompt_lengths, mode="first_generated"),
+            torch.tensor([[10.0], [30.0]]),
+        )
+        torch.testing.assert_close(
+            select_training_representations(hidden, attention, prompt_lengths, mode="first_4_generated_mean"),
+            torch.tensor([[15.0], [35.0]]),
+        )
 
 
 if __name__ == "__main__":

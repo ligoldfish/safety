@@ -97,7 +97,9 @@ experiments:
     question: Do dataset-specific hyperparameters create unfair budgets or test tuning?
     execution_kind: train
     handler: global_default_budget
-    axes: {config: [global, validation_selected]}
+    axes:
+      dataset: [pan, safety_tuned_llamas, coconot, c5, wildjailbreak, wildguardmix]
+      config: [global, validation_selected]
     requires: [search_ledger]
     metrics: [search_count, training_budget, validation_metric]
     completion_artifacts: [search_ledger.jsonl, budget_summary.json]

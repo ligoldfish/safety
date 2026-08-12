@@ -225,6 +225,7 @@ class BatchPayload:
     attention_mask: torch.Tensor
     labels: torch.Tensor
     prompt_last_positions: torch.Tensor
+    prompt_lengths: torch.Tensor
     layer_targets: Dict[int, torch.Tensor]
     layer_anchors: Dict[int, torch.Tensor] | None
     sample_ids: List[str]
@@ -341,6 +342,7 @@ class SemAlignCollator:
             attention_mask=encoded_full["attention_mask"],
             labels=labels,
             prompt_last_positions=prompt_last_positions,
+            prompt_lengths=prompt_lengths,
             layer_targets=layer_targets,
             layer_anchors=layer_anchors,
             sample_ids=[str(record["id"]) for record in records],
@@ -365,11 +367,48 @@ def build_dataloader(
     )
 
 
+def select_training_representations(
+    hidden: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    *,
+    mode: str,
+) -> torch.Tensor:
+    """Select differentiable teacher-forced positions using Phase1 semantics."""
+
+    if hidden.ndim != 3 or attention_mask.shape != hidden.shape[:2]:
+        raise ValueError("hidden and attention_mask must share [batch, sequence]")
+    if prompt_lengths.ndim != 1 or prompt_lengths.numel() != hidden.size(0):
+        raise ValueError("prompt_lengths must have shape [batch]")
+    normalized = str(mode).strip().lower()
+    positions = torch.arange(hidden.size(1), device=hidden.device).unsqueeze(0)
+    prompt_lengths = prompt_lengths.to(device=hidden.device, dtype=torch.long).unsqueeze(1)
+    valid = attention_mask.to(device=hidden.device, dtype=torch.bool)
+    if normalized == "last_prompt":
+        indices = prompt_lengths.squeeze(1) - 1
+        return hidden[torch.arange(hidden.size(0), device=hidden.device), indices, :]
+    if normalized == "mean_prompt":
+        mask = valid & (positions < prompt_lengths)
+    elif normalized == "first_generated":
+        mask = valid & (positions == prompt_lengths)
+    elif normalized == "first_4_generated_mean":
+        mask = valid & (positions >= prompt_lengths) & (positions < prompt_lengths + 4)
+    else:
+        raise ValueError(f"unsupported representation mode: {mode}")
+    counts = mask.sum(dim=1)
+    if bool((counts == 0).any().detach().cpu().item()):
+        raise ValueError(f"{normalized} has no valid assistant token in one or more training rows")
+    weights = mask.to(dtype=hidden.dtype).unsqueeze(-1)
+    return (hidden * weights).sum(dim=1) / counts.to(dtype=hidden.dtype).unsqueeze(-1)
+
+
 def _capture_layer_outputs(
     model: nn.Module,
     *,
     layer_ids: Sequence[int],
-    prompt_last_positions: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    representation_mode: str,
     cache: Dict[int, torch.Tensor],
     pair_to_student_layer: Dict[int, int],
 ):
@@ -387,8 +426,12 @@ def _capture_layer_outputs(
 
         def hook(_module, _inputs, output, current_pair_idx=int(pair_idx)):
             hidden = output[0] if isinstance(output, tuple) else output
-            batch_indices = torch.arange(hidden.size(0), device=hidden.device)
-            selected = hidden[batch_indices, prompt_last_positions.to(hidden.device), :]
+            selected = select_training_representations(
+                hidden,
+                attention_mask,
+                prompt_lengths,
+                mode=representation_mode,
+            )
             cache[current_pair_idx] = selected
             return output
 
@@ -448,18 +491,20 @@ def forward_semalign_batch(
     harmless_layer_weight: float = 1.0,
     layer_loss_kind: str = "cosine",
     contrastive_margin: float = 0.2,
+    representation_mode: str = "last_prompt",
 ) -> tuple[torch.Tensor, Dict[str, float]]:
     inputs = {
         "input_ids": batch.input_ids.to(device),
         "attention_mask": batch.attention_mask.to(device),
         "labels": batch.labels.to(device),
     }
-    prompt_last_positions = batch.prompt_last_positions.to(device)
     cache: Dict[int, torch.Tensor] = {}
     hooks = _capture_layer_outputs(
         model,
         layer_ids=layer_ids,
-        prompt_last_positions=prompt_last_positions,
+        attention_mask=batch.attention_mask.to(device),
+        prompt_lengths=batch.prompt_lengths.to(device),
+        representation_mode=representation_mode,
         cache=cache,
         pair_to_student_layer=pair_to_student_layer,
     )
@@ -548,6 +593,7 @@ def evaluate_layer_alignment(
     layer_loss_policy: str = "all",
     harmful_layer_weight: float = 1.0,
     harmless_layer_weight: float = 1.0,
+    representation_mode: str = "last_prompt",
 ) -> float:
     cosine_scores: List[float] = []
     model.eval()
@@ -556,12 +602,13 @@ def evaluate_layer_alignment(
             "input_ids": batch.input_ids.to(device),
             "attention_mask": batch.attention_mask.to(device),
         }
-        prompt_last_positions = batch.prompt_last_positions.to(device)
         cache: Dict[int, torch.Tensor] = {}
         hooks = _capture_layer_outputs(
             model,
             layer_ids=layer_ids,
-            prompt_last_positions=prompt_last_positions,
+            attention_mask=batch.attention_mask.to(device),
+            prompt_lengths=batch.prompt_lengths.to(device),
+            representation_mode=representation_mode,
             cache=cache,
             pair_to_student_layer=pair_to_student_layer,
         )

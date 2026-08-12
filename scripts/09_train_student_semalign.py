@@ -36,6 +36,29 @@ from src.utils.config import load_phasef_config
 from src.utils.io import ensure_dir, write_json
 from src.utils.logging import log_kv, setup_stage_logger
 from src.utils.seed import set_global_seed
+from scripts.train_student_helpers import resolve_lora_layers
+
+
+def _limit_per_label(records, value):
+    if value in (None, "", "all", 0, "0"):
+        return records
+    if type(value) is bool:
+        raise ValueError("inputs.max_samples_per_label must be a positive integer or 'all'")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("inputs.max_samples_per_label must be a positive integer or 'all'") from exc
+    if limit <= 0:
+        raise ValueError("inputs.max_samples_per_label must be a positive integer or 'all'")
+    counts = {}
+    kept = []
+    for record in records:
+        label = str(record.get("label", ""))
+        if counts.get(label, 0) >= limit:
+            continue
+        counts[label] = counts.get(label, 0) + 1
+        kept.append(record)
+    return kept
 
 
 def parse_args() -> argparse.Namespace:
@@ -127,7 +150,10 @@ def main() -> None:
             "If you want to skip materialization for a quick test, you can: "
             "cp <dir>/alignment_set.jsonl <dir>/train_set.jsonl (not recommended for real runs)."
         )
-    train_records = load_records(cfg.inputs.train_split)
+    train_records = _limit_per_label(
+        load_records(cfg.inputs.train_split),
+        cfg.inputs.max_samples_per_label,
+    )
     val_records = load_records(cfg.inputs.val_split)
     permutation_manifests: dict[str, dict[str, str]] = {}
     if target_mode in {"within_label_permutation", "cross_label_permutation"}:
@@ -189,12 +215,31 @@ def main() -> None:
     )
     model.train()
 
+    placement = str(cfg.lora.placement).strip().lower()
+    model_layers = getattr(getattr(model, "model", None), "layers", None)
+    if model_layers is None:
+        raise ValueError("student model does not expose model.layers for LoRA placement")
+    injection_layers = resolve_lora_layers(
+        unique_student_layers,
+        placement=placement,
+        num_layers=len(model_layers),
+    )
+    effective_rank = int(cfg.lora.rank)
+    effective_alpha = float(cfg.lora.alpha)
+    if placement == "all_layers_parameter_matched":
+        # Match the approximate LoRA parameter budget to selected-layer LoRA.
+        # Rank is an integer, so the manifest records the exact realized budget.
+        effective_rank = max(
+            1,
+            round(int(cfg.lora.rank) * len(unique_student_layers) / len(injection_layers)),
+        )
+        effective_alpha = float(cfg.lora.alpha) * effective_rank / int(cfg.lora.rank)
     injection = inject_lora_modules(
         model,
-        layer_indices=unique_student_layers,  # paired student layers (e.g. [16,18,19]); NOT pair indices
+        layer_indices=injection_layers,
         target_suffixes=cfg.lora.target_modules,
-        rank=cfg.lora.rank,
-        alpha=cfg.lora.alpha,
+        rank=effective_rank,
+        alpha=effective_alpha,
         dropout=cfg.lora.dropout,
     )
     # Guard: LoRA must be injected on the physical student layers that L_layer supervises.
@@ -296,6 +341,7 @@ def main() -> None:
         layer_loss_policy=layer_loss_policy,
         layer_loss_kind=layer_loss_kind,
         contrastive_margin=contrastive_margin,
+        representation_mode=cfg.target.representation_mode,
         harmful_layer_weight=float(cfg.target.harmful_layer_weight),
         harmless_layer_weight=float(cfg.target.harmless_layer_weight),
         filter_harmful_targets=bool(cfg.target.filter_harmful_targets),
@@ -416,6 +462,7 @@ def main() -> None:
             layer_loss_policy=layer_loss_policy,
             harmful_layer_weight=float(cfg.target.harmful_layer_weight),
             harmless_layer_weight=float(cfg.target.harmless_layer_weight),
+            representation_mode=cfg.target.representation_mode,
         )
         semantic_target_cosine_mean = layer_target_cosine_mean
         if semantic_reference_val_loader is not None:
@@ -428,6 +475,7 @@ def main() -> None:
                 layer_loss_policy=layer_loss_policy,
                 harmful_layer_weight=float(cfg.target.harmful_layer_weight),
                 harmless_layer_weight=float(cfg.target.harmless_layer_weight),
+                representation_mode=cfg.target.representation_mode,
             )
         generation_metrics = evaluate_generation_refusal_metrics(
             model,
@@ -523,6 +571,9 @@ def main() -> None:
             "unique_student_layers": unique_student_layers,
             "lora_modules": injection.replaced_module_names,
             "lora_rank": cfg.lora.rank,
+            "lora_effective_rank": effective_rank,
+            "lora_placement": placement,
+            "lora_injection_layers": injection_layers,
             "lora_alpha": cfg.lora.alpha,
             "lora_dropout": cfg.lora.dropout,
             "epochs": cfg.optim.epochs,
@@ -539,10 +590,12 @@ def main() -> None:
             "best_epoch": best_epoch,
             "epochs_completed": epoch,
             "train_num_samples": len(train_dataset),
+            "train_max_samples_per_label": cfg.inputs.max_samples_per_label,
             "val_num_samples": len(val_dataset),
             "trainable_parameters": trainable_params,
             "total_parameters": total_params,
             "target_mode": target_mode,
+            "target_representation_mode": cfg.target.representation_mode,
             "target_random_seed": int(cfg.target.random_seed),
             "target_match_l2_norm": bool(cfg.target.match_l2_norm),
             "target_layer_loss_policy": layer_loss_policy,

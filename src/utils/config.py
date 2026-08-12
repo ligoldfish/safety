@@ -148,6 +148,7 @@ class PhaseFInputConfig:
     pairing_path: str
     train_anchor_dir: str = ""
     val_anchor_dir: str = ""
+    max_samples_per_label: int | str = "all"
 
 
 @dataclass
@@ -158,6 +159,7 @@ class PhaseFLoRAConfig:
     target_modules: List[str] = field(
         default_factory=lambda: ["self_attn.v_proj", "self_attn.o_proj"]
     )
+    placement: str = "selected"
 
 
 @dataclass
@@ -184,6 +186,7 @@ class PhaseFOptimConfig:
 @dataclass
 class PhaseFTargetConfig:
     mode: str = "semantic"
+    representation_mode: str = "last_prompt"
     loss_kind: str = "cosine"
     contrastive_margin: float = 0.2
     random_seed: int = 2042
