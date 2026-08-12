@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.semantic_recompose import recompose_from_sparse_coeffs
+from src.ablations.strategies.bridge import hidden_bridge_targets, remap_sparse_coefficients
 from src.utils.config import load_phase1_config
 from src.utils.io import ensure_dir, write_json
 from src.utils.logging import log_kv, setup_stage_logger
@@ -51,11 +52,35 @@ def parse_args() -> argparse.Namespace:
         default="float16",
         help="On-disk dtype for recomposed student targets.",
     )
+    parser.add_argument(
+        "--bridge-mode",
+        choices=["vocabulary", "token_string", "embedding_nearest", "ridge", "orthogonal_procrustes"],
+        default="vocabulary",
+    )
     return parser.parse_args()
 
 
 def _load_json(path: Path) -> Dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def build_pair_index(
+    raw_pairs: List[Dict[str, object]],
+) -> tuple[List[Dict[str, int]], Dict[int, List[int]]]:
+    if not raw_pairs:
+        raise ValueError("No pairs found in pairing payload")
+    pair_index_to_pair = [
+        {
+            "pair_idx": idx,
+            "teacher_layer": int(pair["teacher_layer"]),
+            "student_layer": int(pair["student_layer"]),
+        }
+        for idx, pair in enumerate(raw_pairs)
+    ]
+    student_to_pair_indices: Dict[int, List[int]] = defaultdict(list)
+    for entry in pair_index_to_pair:
+        student_to_pair_indices[entry["student_layer"]].append(entry["pair_idx"])
+    return pair_index_to_pair, dict(student_to_pair_indices)
 
 
 def main() -> None:
@@ -69,17 +94,24 @@ def main() -> None:
     storage_dtype = getattr(torch, args.storage_dtype)
 
     input_dir_name, output_dir_name = SPLIT_DIR_MAP[args.split]
-    input_dir = Path(cfg.extraction.output_root) / "semantic_coeffs" / input_dir_name
+    hidden_bridge = args.bridge_mode in {"ridge", "orthogonal_procrustes"}
+    if hidden_bridge:
+        projection_name = input_dir_name.replace("teacher_top256_coeffs", "teacher_safe_component")
+        input_dir = Path(cfg.extraction.output_root) / "safe_projection" / projection_name
+    else:
+        input_dir = Path(cfg.extraction.output_root) / "semantic_coeffs" / input_dir_name
     output_dir = ensure_dir(Path(cfg.extraction.output_root) / "student_targets" / output_dir_name)
     student_basis_path = Path(cfg.extraction.output_root) / "semantic_bases" / "student_semantic_basis.pt"
     pairing_path = Path(cfg.extraction.output_root) / "layer_pairing" / "teacher_student_layer_pairs.json"
 
     student_basis_payload = torch.load(student_basis_path, map_location="cpu", weights_only=True)
     student_basis = student_basis_payload["basis"]
+    bridge_path = Path(cfg.extraction.output_root) / "semantic_bases" / "bridge_artifact.pt"
+    bridge_payload = torch.load(bridge_path, map_location="cpu", weights_only=True)
+    if str(bridge_payload.get("bridge_mode")) != args.bridge_mode:
+        raise ValueError("bridge artifact mode does not match --bridge-mode; rebuild step 05")
     pairing_payload = _load_json(pairing_path)
     raw_pairs = list(pairing_payload["pairs"])
-    if not raw_pairs:
-        raise ValueError(f"No pairs found in pairing file: {pairing_path}")
 
     # Preserve pair list order from 04 so pair_idx is deterministic. Each pair
     # contributes one independent alignment target; multiple pairs may share the
@@ -88,17 +120,7 @@ def main() -> None:
     # pairing, and per the user's option-a choice we keep one target per pair
     # rather than averaging colliding teachers, so the loss can sum K
     # independent cosine terms.
-    pair_index_to_pair: List[Dict[str, int]] = [
-        {
-            "pair_idx": idx,
-            "teacher_layer": int(pair["teacher_layer"]),
-            "student_layer": int(pair["student_layer"]),
-        }
-        for idx, pair in enumerate(raw_pairs)
-    ]
-    student_to_pair_indices: Dict[int, List[int]] = defaultdict(list)
-    for entry in pair_index_to_pair:
-        student_to_pair_indices[entry["student_layer"]].append(entry["pair_idx"])
+    pair_index_to_pair, student_to_pair_indices = build_pair_index(raw_pairs)
 
     part_paths = sorted(input_dir.glob("part_*.pt"))
     if not part_paths:
@@ -125,24 +147,29 @@ def main() -> None:
     manifest_files: List[str] = []
     for part_path in part_paths:
         payload = torch.load(part_path, map_location="cpu", weights_only=True)
-        semantic_coeffs_by_layer = payload["semantic_coeffs_by_layer"]
-
         student_safe_target_by_pair: Dict[str, torch.Tensor] = {}
-        for entry in pair_index_to_pair:
-            teacher_layer = entry["teacher_layer"]
-            teacher_layer_key = str(teacher_layer)
-            if teacher_layer_key not in semantic_coeffs_by_layer:
-                raise KeyError(
-                    f"semantic coeff shard {part_path} is missing teacher layer "
-                    f"{teacher_layer} required by pair_idx={entry['pair_idx']}."
+        if hidden_bridge:
+            safe = {int(k): v.to(torch.float32) for k, v in payload["safe_component_by_layer"].items()}
+            mappings = {int(k): v for k, v in bridge_payload["mappings"].items()}
+            targets = hidden_bridge_targets(safe, pair_index_to_pair, mappings)
+            student_safe_target_by_pair = {str(k): v.to(storage_dtype) for k, v in targets.items()}
+        else:
+            semantic_coeffs_by_layer = payload["semantic_coeffs_by_layer"]
+            token_map = {int(k): int(v) for k, v in bridge_payload["teacher_to_student"].items()}
+            for entry in pair_index_to_pair:
+                teacher_layer = entry["teacher_layer"]
+                teacher_layer_key = str(teacher_layer)
+                if teacher_layer_key not in semantic_coeffs_by_layer:
+                    raise KeyError(
+                        f"semantic coeff shard {part_path} is missing teacher layer "
+                        f"{teacher_layer} required by pair_idx={entry['pair_idx']}."
+                    )
+                coeff_payload = semantic_coeffs_by_layer[teacher_layer_key]
+                mapped_indices, mapped_values, _ = remap_sparse_coefficients(
+                    coeff_payload["top_indices"], coeff_payload["top_values"], token_map
                 )
-            coeff_payload = semantic_coeffs_by_layer[teacher_layer_key]
-            recomposed = recompose_from_sparse_coeffs(
-                student_basis,
-                coeff_payload["top_indices"],
-                coeff_payload["top_values"],
-            )
-            student_safe_target_by_pair[str(entry["pair_idx"])] = recomposed.to(dtype=storage_dtype)
+                recomposed = recompose_from_sparse_coeffs(student_basis, mapped_indices, mapped_values)
+                student_safe_target_by_pair[str(entry["pair_idx"])] = recomposed.to(dtype=storage_dtype)
 
         output_payload = {
             "sample_ids": payload["sample_ids"],
@@ -177,6 +204,8 @@ def main() -> None:
                 for student_layer, pair_indices in student_to_pair_indices.items()
             },
             "storage_dtype": args.storage_dtype,
+            "bridge_mode": args.bridge_mode,
+            "bridge_artifact_path": str(bridge_path),
             "target_semantics": (
                 "student_safe_target_by_pair[pair_idx] = student_basis @ "
                 "sparse_a_{l_T(pair_idx)}. Each pair_idx is one row of the "

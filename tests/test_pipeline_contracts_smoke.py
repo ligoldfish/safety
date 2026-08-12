@@ -115,38 +115,27 @@ class HiddenStateStrictSmokeTests(unittest.TestCase):
                 load_hidden_state_split(split_dir)
 
 
-class CollisionStrictSmokeTests(unittest.TestCase):
+class PerPairCollisionSmokeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = _load_script_module(
             "08_recompose_student_targets.py",
             "script_08_recompose_student_targets",
         )
 
-    def test_strict_rejects_collision(self):
-        teacher_to_student = {5: 2, 6: 2, 7: 3}  # two teachers -> student 2
-        with self.assertRaisesRegex(ValueError, "Multi-teacher-to-one-student"):
-            self.module.resolve_multi_teacher_reduction(
-                teacher_to_student,
-                allow_multi_teacher_mean=False,
-            )
-
-    def test_opt_in_mean_returns_mean_and_groups(self):
-        teacher_to_student = {5: 2, 6: 2, 7: 3}
-        strategy, groups = self.module.resolve_multi_teacher_reduction(
-            teacher_to_student,
-            allow_multi_teacher_mean=True,
+    def test_collision_is_preserved_as_independent_pair_targets(self):
+        pairs, groups = self.module.build_pair_index(
+            [
+                {"teacher_layer": 5, "student_layer": 2},
+                {"teacher_layer": 6, "student_layer": 2},
+                {"teacher_layer": 7, "student_layer": 3},
+            ]
         )
-        self.assertEqual(strategy, "mean")
-        self.assertEqual(groups, {"2": [5, 6]})
+        self.assertEqual([item["pair_idx"] for item in pairs], [0, 1, 2])
+        self.assertEqual(groups, {2: [0, 1], 3: [2]})
 
-    def test_no_collision_returns_strict_single(self):
-        teacher_to_student = {5: 5, 6: 6, 7: 7}
-        strategy, groups = self.module.resolve_multi_teacher_reduction(
-            teacher_to_student,
-            allow_multi_teacher_mean=False,
-        )
-        self.assertEqual(strategy, "strict_single")
-        self.assertEqual(groups, {})
+    def test_empty_pairing_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "No pairs"):
+            self.module.build_pair_index([])
 
 
 class MergedSummaryIsolationSmokeTests(unittest.TestCase):
