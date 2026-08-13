@@ -18,6 +18,7 @@ from src.ablations.preflight import (
     PreflightReport,
     requirements_from_manifest,
     run_preflight,
+    training_model_requirements,
 )
 from src.ablations.runner import AblationRunner, RunnerContext, RunnerError
 from src.ablations.schema import ExperimentCell, ExperimentPlan
@@ -92,6 +93,9 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run")
     run.add_argument("--plan", required=True)
     run.add_argument("--cell-id", default="")
+    run.add_argument("--shard-index", type=int)
+    run.add_argument("--shard-count", type=int)
+    run.add_argument("--max-cells", type=int)
     run.add_argument("--state-root", default="../outputs/ablation-state")
     run.add_argument("--device", choices=["npu", "ppu", "cuda", "cpu"], default="npu")
     run.add_argument("--device-id", type=int, default=0)
@@ -106,11 +110,43 @@ def _context(args) -> RunnerContext:
         project_root=PROJECT_ROOT,
         state_root=Path(args.state_root).expanduser().resolve(),
         python_executable=sys.executable,
-        device=args.device,
-        device_id=args.device_id,
-        num_devices=args.num_devices,
-        asset_manifest=(Path(args.asset_manifest).expanduser().resolve() if args.asset_manifest else None),
+        device=getattr(args, "device", "npu"),
+        device_id=getattr(args, "device_id", 0),
+        num_devices=getattr(args, "num_devices", 1),
+        asset_manifest=(
+            Path(args.asset_manifest).expanduser().resolve()
+            if getattr(args, "asset_manifest", "")
+            else None
+        ),
     )
+
+
+def _bounded_run_cells(args, plan: ExperimentPlan) -> tuple[ExperimentCell, ...]:
+    shard_values = (args.shard_index, args.shard_count, args.max_cells)
+    shard_requested = any(value is not None for value in shard_values)
+    if args.cell_id and shard_requested:
+        raise RunnerError("run accepts either --cell-id or bounded shard arguments, not both")
+    if args.cell_id:
+        return (AblationRunner.select_cell(plan.cells, args.cell_id),)
+    if not shard_requested:
+        raise RunnerError(
+            "run requires --cell-id or all of --shard-index/--shard-count/--max-cells; "
+            "unbounded plan execution is forbidden"
+        )
+    if any(value is None for value in shard_values):
+        raise RunnerError("bounded shard requires --shard-index, --shard-count, and --max-cells")
+    if args.shard_count <= 0 or not 0 <= args.shard_index < args.shard_count:
+        raise RunnerError("shard-index must be in [0, shard-count) and shard-count must be positive")
+    if args.max_cells <= 0:
+        raise RunnerError("max-cells must be positive")
+    selected = tuple(
+        cell
+        for index, cell in enumerate(sorted(plan.cells, key=lambda item: item.cell_id))
+        if index % args.shard_count == args.shard_index
+    )[: args.max_cells]
+    if not selected:
+        raise RunnerError("bounded shard selected no cells")
+    return selected
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -164,6 +200,14 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     for asset_id in missing
                 )
+                if definition.execution_kind.value == "train":
+                    requirements.extend(
+                        training_model_requirements(
+                            cell,
+                            project_root=PROJECT_ROOT,
+                            device="npu",
+                        )
+                    )
         else:
             root = Path(args.asset_root).expanduser().resolve()
             for cell in plan.cells:
@@ -171,6 +215,14 @@ def main(argv: list[str] | None = None) -> int:
                 for asset_id in definition.requires:
                     requirements.append(
                         AssetRequirement(asset_id, root / asset_id, "directory", cell.cell_id)
+                    )
+                if definition.execution_kind.value == "train":
+                    requirements.extend(
+                        training_model_requirements(
+                            cell,
+                            project_root=PROJECT_ROOT,
+                            device="npu",
+                        )
                     )
         checked = run_preflight(requirements)
         report = PreflightReport(
@@ -186,11 +238,32 @@ def main(argv: list[str] | None = None) -> int:
 
     runner = AblationRunner(catalog, _context(args))
     if args.command == "run":
-        if not args.cell_id:
-            raise RunnerError("run requires --cell-id; unbounded plan execution is forbidden")
-        cell = runner.select_cell(plan.cells, args.cell_id)
-        print(json.dumps(runner.run_cell(cell, dry_run=args.dry_run), ensure_ascii=False))
-        return 0
+        selected = _bounded_run_cells(args, plan)
+        results = []
+        exit_code = 0
+        for cell in selected:
+            status = runner.run_cell(cell, dry_run=args.dry_run)
+            results.append(status)
+            if status.get("state") in {"BLOCKED", "FAILED"}:
+                exit_code = 3
+                break
+        if args.cell_id:
+            print(json.dumps(results[0], ensure_ascii=False))
+        else:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "shard_index": args.shard_index,
+                        "shard_count": args.shard_count,
+                        "selected_cell_ids": [cell.cell_id for cell in selected],
+                        "executed_cell_ids": [row["cell_id"] for row in results],
+                        "cells": results,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return exit_code
 
     rows = []
     for cell in plan.cells:

@@ -8,6 +8,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
+import yaml
+
+from .platform import resolve_portable_path
+from .schema import ExperimentCell
+
 
 @dataclass(frozen=True)
 class AssetRequirement:
@@ -40,6 +45,70 @@ class PreflightReport:
             "checked": list(self.checked),
             "issues": [asdict(issue) for issue in self.issues],
         }
+
+
+def _training_pair_and_teacher(cell: ExperimentCell) -> tuple[str, str]:
+    axes = {**dict(cell.overrides), **dict(cell.axes)}
+    pair = str(axes.get("pair", "qwen35_9b_to_08b"))
+    teacher_variant = ""
+    if cell.experiment_id == "P2-03":
+        teacher = str(axes.get("teacher", ""))
+        pair = "qwen3_8b_to_06b" if teacher == "qwen3_8b" else "qwen3_4b_to_06b"
+        if teacher in {"same_size_base", "safety_tuned"}:
+            teacher_variant = teacher
+    elif cell.experiment_id == "P2-04":
+        pair = "qwen3_8b_to_llama32_1b"
+    return pair, teacher_variant
+
+
+def training_model_requirements(
+    cell: ExperimentCell,
+    *,
+    project_root: str | Path,
+    environment: Mapping[str, str] | None = None,
+    device: str = "npu",
+) -> tuple[AssetRequirement, ...]:
+    """Resolve the effective teacher/student snapshots for one training cell."""
+
+    root = Path(project_root).resolve()
+    pair, teacher_variant = _training_pair_and_teacher(cell)
+    config_path = root / "configs" / f"{pair}_phase1_{device}.yaml"
+    if not config_path.is_file():
+        raise ValueError(f"training pair config is missing: {config_path}")
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    try:
+        teacher = dict(raw["models"]["teacher"])
+        student = dict(raw["models"]["student"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"training pair config has invalid model entries: {config_path}") from exc
+    if teacher_variant:
+        registry_path = root / "configs" / "ablations" / "teacher_registry.yaml"
+        registry = yaml.safe_load(registry_path.read_text(encoding="utf-8")) or {}
+        try:
+            teacher = dict(registry["teachers"][teacher_variant])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"teacher registry lacks {teacher_variant}") from exc
+        teacher_base = registry_path.parent
+    else:
+        teacher_base = config_path.parent
+    result = []
+    for asset_id, entry, base in (
+        ("training_teacher_model", teacher, teacher_base),
+        ("training_student_model", student, config_path.parent),
+    ):
+        value = str(entry.get("path", "")).strip()
+        if not value:
+            raise ValueError(f"{asset_id} path is missing from {config_path}")
+        path = Path(
+            resolve_portable_path(
+                value,
+                base,
+                category="model",
+                environment=environment,
+            )
+        ).resolve()
+        result.append(AssetRequirement(asset_id, path, "model", cell.cell_id))
+    return tuple(result)
 
 
 def requirements_from_manifest(

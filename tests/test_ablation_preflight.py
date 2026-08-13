@@ -11,10 +11,20 @@ from src.ablations.preflight import (
     inspect_model_directory,
     inspect_submission_package,
     run_preflight,
+    training_model_requirements,
 )
+from src.ablations.catalog import load_catalog
+from src.ablations.planner import build_catalog_plan
 
 
 class AblationPreflightTests(unittest.TestCase):
+    @staticmethod
+    def _complete_model(path: Path) -> None:
+        path.mkdir(parents=True)
+        (path / "config.json").write_text("{}\n", encoding="utf-8")
+        (path / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+        (path / "model.safetensors").write_bytes(b"weights")
+
     def test_complete_model_passes_and_missing_weights_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             model = Path(tmpdir) / "model"
@@ -144,6 +154,62 @@ class AblationPreflightTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "path"):
             requirements_from_manifest(["x"], {"x": []}, cell_id="c")
+
+    def test_cross_family_training_models_are_resolved_under_persistent_model_root(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        catalog = load_catalog(project / "configs" / "ablations" / "catalog.yaml")
+        plan = build_catalog_plan(catalog, output_root="/out", scope="all")
+        cell = next(
+            item
+            for item in plan.cells
+            if item.experiment_id == "P2-04" and item.axes["bridge_mode"] == "token_string"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            model_root = Path(td) / "models"
+            self._complete_model(model_root / "Qwen3-8B")
+            self._complete_model(model_root / "Llama-3.2-1B-Instruct")
+            requirements = training_model_requirements(
+                cell,
+                project_root=project,
+                environment={"SAFETY_MODEL_ROOT": str(model_root)},
+            )
+            ready = run_preflight(requirements)
+            (model_root / "Llama-3.2-1B-Instruct" / "model.safetensors").unlink()
+            blocked = run_preflight(requirements)
+        self.assertEqual(
+            {item.path for item in requirements},
+            {
+                (model_root / "Qwen3-8B").resolve(),
+                (model_root / "Llama-3.2-1B-Instruct").resolve(),
+            },
+        )
+        self.assertEqual(ready.status, "READY")
+        self.assertEqual(blocked.status, "BLOCKED")
+        self.assertIn("MODEL_WEIGHTS_MISSING", {issue.code for issue in blocked.issues})
+
+    def test_teacher_control_replaces_only_teacher_model_requirement(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        catalog = load_catalog(project / "configs" / "ablations" / "catalog.yaml")
+        plan = build_catalog_plan(catalog, output_root="/out", scope="all")
+        cell = next(
+            item
+            for item in plan.cells
+            if item.experiment_id == "P2-03" and item.axes["teacher"] == "same_size_base"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            model_root = Path(td) / "models"
+            requirements = training_model_requirements(
+                cell,
+                project_root=project,
+                environment={"SAFETY_MODEL_ROOT": str(model_root)},
+            )
+        self.assertEqual(
+            {item.asset_id: item.path for item in requirements},
+            {
+                "training_teacher_model": (model_root / "teacher-controls" / "same-size-base").resolve(),
+                "training_student_model": (model_root / "Qwen3-0.6B").resolve(),
+            },
+        )
 
 
 if __name__ == "__main__":

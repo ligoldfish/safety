@@ -13,7 +13,7 @@ from .artifacts import canonical_hash, sha256_file
 from .efficiency import StageProfiler
 from .ledger import ExperimentLedger, LedgerError, RunState
 from .schema import ExecutionKind, ExperimentCatalog, ExperimentCell
-from .preflight import requirements_from_manifest, run_preflight
+from .preflight import requirements_from_manifest, run_preflight, training_model_requirements
 
 
 class RunnerError(RuntimeError):
@@ -394,6 +394,7 @@ class AblationRunner:
     ) -> None:
         self.catalog = catalog
         self.context = context
+        self._uses_real_executor = executor is None
         self.executor = executor or self._execute
         self.environment = dict(os.environ if environment is None else environment)
         self.enforce_preflight = (executor is None) if enforce_preflight is None else bool(enforce_preflight)
@@ -474,6 +475,22 @@ class AblationRunner:
                         RunState.BLOCKED,
                         reason=json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True),
                     )
+                definition = self.catalog.experiments[cell.experiment_id]
+                if definition.execution_kind is ExecutionKind.TRAIN and self._uses_real_executor:
+                    model_report = run_preflight(
+                        training_model_requirements(
+                            cell,
+                            project_root=self.context.project_root,
+                            environment=self.environment,
+                            device=self.context.device,
+                        ),
+                        environment=self.environment,
+                    )
+                    if model_report.status != "READY":
+                        return ledger.transition(
+                            RunState.BLOCKED,
+                            reason=json.dumps(model_report.to_dict(), ensure_ascii=False, sort_keys=True),
+                        )
             ledger.transition(RunState.RUNNING)
             efficiency = []
             try:

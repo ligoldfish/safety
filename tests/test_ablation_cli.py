@@ -106,6 +106,86 @@ class AblationCliTests(unittest.TestCase):
             {"model_registry", "dataset_registry"},
         )
 
+    def test_bounded_shard_dry_run_is_stable_and_status_is_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plan_path = root / "plan.jsonl"
+            state = root / "state"
+            made = self._run("plan", "--scope", "all", "--output", str(plan_path))
+            self.assertEqual(made.returncode, 0, made.stderr)
+            command = (
+                "run",
+                "--plan",
+                str(plan_path),
+                "--state-root",
+                str(state),
+                "--dry-run",
+                "--shard-index",
+                "1",
+                "--shard-count",
+                "7",
+                "--max-cells",
+                "3",
+            )
+            first = self._run(*command)
+            second = self._run(*command)
+            status = self._run("status", "--plan", str(plan_path), "--state-root", str(state))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        left = json.loads(first.stdout)
+        right = json.loads(second.stdout)
+        self.assertEqual(left["selected_cell_ids"], right["selected_cell_ids"])
+        self.assertEqual(len(left["selected_cell_ids"]), 3)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        states = {row["cell_id"]: row["state"] for row in json.loads(status.stdout)["cells"]}
+        self.assertTrue(all(states[cell_id] == "READY" for cell_id in left["selected_cell_ids"]))
+
+    def test_shard_requires_all_bounds_and_rejects_cell_id_combination(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            plan_path = Path(td) / "plan.jsonl"
+            self.assertEqual(
+                self._run("plan", "--scope", "main-table", "--output", str(plan_path)).returncode,
+                0,
+            )
+            incomplete = self._run(
+                "run", "--plan", str(plan_path), "--shard-index", "0", "--shard-count", "2"
+            )
+            combined = self._run(
+                "run",
+                "--plan",
+                str(plan_path),
+                "--cell-id",
+                "x",
+                "--shard-index",
+                "0",
+                "--shard-count",
+                "2",
+                "--max-cells",
+                "1",
+            )
+        self.assertNotEqual(incomplete.returncode, 0)
+        self.assertIn("max-cells", incomplete.stderr)
+        self.assertNotEqual(combined.returncode, 0)
+        self.assertIn("either", combined.stderr)
+
+    def test_real_run_blocked_by_missing_manifest_returns_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plan_path = root / "plan.jsonl"
+            made = self._run("plan", "--scope", "main-table", "--output", str(plan_path))
+            rows = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines()]
+            result = self._run(
+                "run",
+                "--plan",
+                str(plan_path),
+                "--cell-id",
+                rows[0]["cell_id"],
+                "--state-root",
+                str(root / "state"),
+            )
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(json.loads(result.stdout)["state"], "BLOCKED")
+
 
 if __name__ == "__main__":
     unittest.main()
