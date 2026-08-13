@@ -35,6 +35,75 @@ def _write_jsonl(path: Path, rows: Sequence[Mapping]) -> None:
             handle.write(json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _read_jsonl(path: Path, label: str) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise CompletionError(f"{label} row {line_number} must be an object")
+                rows.append(value)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CompletionError(f"missing or invalid {label}: {path}") from exc
+    if not rows:
+        raise CompletionError(f"empty {label}: {path}")
+    return rows
+
+
+def _validated_search_ledger(cell_spec: Mapping) -> tuple[Path, list[dict], dict]:
+    axes = dict(cell_spec.get("axes") or {})
+    inputs = dict(cell_spec.get("inputs") or {})
+    source_text = str(inputs.get("search_ledger", "")).strip()
+    if not source_text:
+        raise CompletionError("P0-07 requires a declared real search_ledger input")
+    source = Path(source_text)
+    dataset = str(axes.get("dataset", ""))
+    config = str(axes.get("config", ""))
+    rows = [
+        row
+        for row in _read_jsonl(source, "search ledger")
+        if str(row.get("dataset", "")) == dataset
+        and str(row.get("config", "")) == config
+    ]
+    if not rows:
+        raise CompletionError(f"search ledger has no rows for dataset={dataset}, config={config}")
+    required = {
+        "trial_id",
+        "dataset",
+        "config",
+        "method",
+        "selection_split",
+        "selected",
+        "validation_metric",
+    }
+    if any(not required <= set(row) for row in rows):
+        raise CompletionError("search ledger lacks required trial provenance fields")
+    if any(str(row["selection_split"]) != "validation" for row in rows):
+        raise CompletionError("search ledger contains non-validation model selection")
+    counts: dict[str, int] = {}
+    selected: dict[str, str] = {}
+    for row in rows:
+        method = str(row["method"])
+        counts[method] = counts.get(method, 0) + 1
+        if bool(row["selected"]):
+            if method in selected:
+                raise CompletionError(f"method {method} has multiple selected search trials")
+            selected[method] = str(row["trial_id"])
+    if len(counts) < 2 or len(set(counts.values())) != 1:
+        raise CompletionError(f"search budgets must be equal across methods: {counts}")
+    if config == "validation_selected" and set(selected) != set(counts):
+        raise CompletionError("validation_selected requires exactly one selected trial per method")
+    return source, rows, {
+        "search_count": len(rows),
+        "search_count_by_method": dict(sorted(counts.items())),
+        "selected_trial_ids": dict(sorted(selected.items())),
+        "selection_split": "validation",
+    }
+
+
 def _latest_pan_results(phase1_root: Path) -> tuple[Path, dict]:
     candidates = sorted(
         (phase1_root / "training" / "eval_suite").glob("epoch_*/pan_results.json")
@@ -96,6 +165,7 @@ def collect_training_contract(
         "bridge_audit.json": phase1 / "semantic_bases" / "vocab_index_map.json",
     }
     predictions: tuple[Path, dict] | None = None
+    search_contract: tuple[Path, list[dict], dict] | None = None
 
     for name in required_artifacts:
         destination = target / name
@@ -120,10 +190,10 @@ def collect_training_contract(
             shutil.copyfile(source, destination)
             continue
         if name == "search_ledger.jsonl":
-            _write_jsonl(
-                destination,
-                [{**common, "budget": {key: training.get(key) for key in ("epochs_completed", "train_num_samples", "trainable_parameters")}}],
-            )
+            if experiment_id != "P0-07":
+                raise CompletionError("search_ledger.jsonl is only valid for P0-07")
+            search_contract = search_contract or _validated_search_ledger(cell_spec)
+            _write_jsonl(destination, search_contract[1])
             continue
 
         payload: dict
@@ -132,6 +202,19 @@ def collect_training_contract(
             payload = {**common, **_source_record(source, _read_object(source, name))}
         elif name == "run_manifest.json" or name == "training_manifest.json":
             payload = {**common, **_source_record(training_path, training)}
+        elif name == "budget_summary.json" and experiment_id == "P0-07":
+            search_contract = search_contract or _validated_search_ledger(cell_spec)
+            source, _, search_summary = search_contract
+            required_budget = ("trainable_parameters", "total_parameters", "epochs_completed", "train_num_samples")
+            if any(key not in training for key in required_budget):
+                raise CompletionError("training manifest lacks exact parameter/training budget fields")
+            payload = {
+                **common,
+                **search_summary,
+                "search_ledger_source": str(source.resolve()),
+                "search_ledger_sha256": sha256_file(source),
+                "training_budget": {key: training[key] for key in required_budget},
+            }
         elif name == "parameter_budget.json" or name == "budget_summary.json":
             required_budget = ("trainable_parameters", "total_parameters", "epochs_completed", "train_num_samples")
             if any(key not in training for key in required_budget):

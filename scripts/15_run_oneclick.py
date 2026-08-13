@@ -17,6 +17,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.baselines.config import load_distill_config, load_eval_config, load_sft_config
+from src.ablations.efficiency import (
+    append_efficiency_record,
+    phase_for_script,
+    run_profiled_subprocess,
+)
 from src.ablations.platform import resolve_portable_path
 from src.utils.config import load_phase1_config, load_phasef_config
 from src.pairs import DEFAULT_PAIR, PAIRS, apply_tokens
@@ -635,6 +640,31 @@ def _run_script(
     env = os.environ.copy()
     if env_overrides:
         env.update(env_overrides)
+    profile_log = str(env.get("SAFETY_ABLATION_RUNTIME_LOG", "")).strip()
+    phase = phase_for_script(script_name)
+    if profile_log and phase:
+        output_root = str(
+            env.get("SAFETY_ABLATION_PROFILE_OUTPUT_ROOT", PROJECT_ROOT / "outputs")
+        )
+        cell_id = str(env.get("SAFETY_ABLATION_CELL_ID", ""))
+        try:
+            device_count = int(env.get("SAFETY_ABLATION_DEVICE_COUNT", "1"))
+        except ValueError as exc:
+            raise ValueError("SAFETY_ABLATION_DEVICE_COUNT must be an integer") from exc
+        returncode, record = run_profiled_subprocess(
+            cmd,
+            cwd=PROJECT_ROOT,
+            env=env,
+            stage=phase,
+            script=script_name,
+            output_root=output_root,
+            cell_id=cell_id,
+            device_count=device_count,
+        )
+        append_efficiency_record(profile_log, record)
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, cmd)
+        return
     subprocess.run(cmd, cwd=PROJECT_ROOT, check=True, env=env)
 
 

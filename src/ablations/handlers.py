@@ -243,7 +243,7 @@ def _representation(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, obje
 
 def _efficiency(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
     rows = _read_jsonl(inputs["phase_runtime_logs"])
-    required = {"phase", "wall_seconds", "peak_memory_bytes", "disk_delta_bytes", "device_hours"}
+    required = {"phase", "wall_seconds", "peak_memory_bytes", "memory_measurement", "disk_delta_bytes", "device_hours"}
     if any(not required <= set(row) for row in rows):
         raise HandlerBlocked("phase runtime log is missing required efficiency fields")
     phase = str(axes.get("phase", ""))
@@ -251,7 +251,12 @@ def _efficiency(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:
         rows = [row for row in rows if str(row["phase"]) == phase]
     if not rows:
         raise HandlerBlocked(f"no efficiency records for phase: {phase}")
-    return {"efficiency_profile.json": {"phase": phase or "all", "phases": rows, "wall_seconds": sum(float(row["wall_seconds"]) for row in rows), "device_hours": sum(float(row["device_hours"]) for row in rows), "peak_memory_bytes": max(int(row["peak_memory_bytes"]) for row in rows)}}
+    measured_peaks = [
+        int(row["peak_memory_bytes"])
+        for row in rows
+        if row.get("peak_memory_bytes") is not None
+    ]
+    return {"efficiency_profile.json": {"phase": phase or "all", "phases": rows, "wall_seconds": sum(float(row["wall_seconds"]) for row in rows), "device_hours": sum(float(row["device_hours"]) for row in rows), "disk_delta_bytes": sum(int(row["disk_delta_bytes"]) for row in rows), "peak_memory_bytes": max(measured_peaks) if measured_peaks else None, "memory_complete": len(measured_peaks) == len(rows)}}
 
 
 def _ethics(inputs: Mapping[str, Path], axes: Mapping) -> dict[str, object]:

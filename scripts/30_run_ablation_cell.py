@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -121,6 +122,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _training_environment(args: argparse.Namespace) -> dict[str, str]:
+    environment = os.environ.copy()
+    output_dir = Path(args.output_dir).resolve()
+    environment.update(
+        {
+            "SAFETY_ABLATION_RUNTIME_LOG": str(output_dir / "phase_runtime_logs.jsonl"),
+            "SAFETY_ABLATION_PROFILE_OUTPUT_ROOT": str(output_dir / "pipeline" / "phase1"),
+            "SAFETY_ABLATION_CELL_ID": str(args.cell_id),
+            "SAFETY_ABLATION_DEVICE_COUNT": "1",
+        }
+    )
+    return environment
+
+
 def main() -> int:
     args = parse_args()
     required = _json_list(args.required_artifacts, "--required-artifacts")
@@ -179,7 +194,12 @@ def main() -> int:
     ]
     if args.disable_dataset_overrides:
         command.append("--disable-dataset-overrides")
-    result = subprocess.run(command, cwd=str(PROJECT_ROOT), check=False)
+    result = subprocess.run(
+        command,
+        cwd=str(PROJECT_ROOT),
+        check=False,
+        env=_training_environment(args),
+    )
     if result.returncode:
         return int(result.returncode)
     from src.ablations.completion import collect_training_contract

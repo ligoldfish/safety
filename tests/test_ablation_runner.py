@@ -69,6 +69,27 @@ class AblationCompileTests(unittest.TestCase):
         spec = json.loads(spec_arg.split("=", 1)[1])
         self.assertEqual(spec["inputs"]["aligned_sample_predictions"], "/data/pairs.jsonl")
 
+    def test_training_command_receives_declared_manifest_inputs_with_anchored_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ledger = root / "assets" / "search.jsonl"
+            ledger.parent.mkdir()
+            ledger.write_text("{}\n", encoding="utf-8")
+            manifest = root / "assets.json"
+            manifest.write_text(
+                json.dumps({"search_ledger": {"path": "assets/search.jsonl", "kind": "file"}}),
+                encoding="utf-8",
+            )
+            context = RunnerContext(ROOT, root / "state", "python", "npu", 0, asset_manifest=manifest)
+            command = compile_cell_commands(
+                CATALOG,
+                _cell("P0-07", dataset="pan", config="global"),
+                context,
+            )[0]
+        spec_arg = next(token for token in command.argv if token.startswith("--cell-spec="))
+        spec = json.loads(spec_arg.split("=", 1)[1])
+        self.assertEqual(spec["inputs"]["search_ledger"], str(ledger.resolve()))
+
     def test_all_catalog_handlers_are_executable(self) -> None:
         self.assertEqual(
             executable_handlers(),
@@ -283,6 +304,53 @@ class AblationCompileTests(unittest.TestCase):
         self.assertEqual(pan, (data_root / "processed").resolve())
         self.assertEqual(phase1_root, cell_phase1.resolve())
         self.assertEqual(phasef_root, cell_phasef.resolve())
+
+    def test_oneclick_profiles_each_internal_paper_phase_when_cell_log_is_declared(self) -> None:
+        from src.ablations.efficiency import StageEfficiency
+
+        path = ROOT / "scripts" / "15_run_oneclick.py"
+        spec = importlib.util.spec_from_file_location("oneclick_profile_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        calls = []
+        records = []
+
+        def fake_profile(command, **kwargs):
+            calls.append((command, kwargs))
+            return 0, StageEfficiency(
+                1, "cell-9", kwargs["stage"], 1.0, 123, 4, 1, 1 / 3600, 0,
+                script=kwargs["script"], memory_measurement="process_tree_rss",
+            )
+
+        module.run_profiled_subprocess = fake_profile
+        module.append_efficiency_record = lambda path, record: records.append((path, record))
+        with tempfile.TemporaryDirectory() as td, patch.dict(
+            os.environ,
+            {
+                "SAFETY_ABLATION_RUNTIME_LOG": str(Path(td) / "runtime.jsonl"),
+                "SAFETY_ABLATION_PROFILE_OUTPUT_ROOT": str(Path(td) / "pipeline"),
+                "SAFETY_ABLATION_CELL_ID": "cell-9",
+                "SAFETY_ABLATION_DEVICE_COUNT": "1",
+            },
+        ):
+            module._run_script("05_build_semantic_bases.py", [], dry_run=False)
+        self.assertEqual(calls[0][1]["stage"], "semantic_basis")
+        self.assertEqual(calls[0][1]["cell_id"], "cell-9")
+        self.assertEqual(records[0][1].script, "05_build_semantic_bases.py")
+
+    def test_training_backend_declares_cell_owned_runtime_log(self) -> None:
+        path = ROOT / "scripts" / "30_run_ablation_cell.py"
+        spec = importlib.util.spec_from_file_location("ablation_profile_env_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as td:
+            args = SimpleNamespace(output_dir=str(Path(td) / "artifacts"), cell_id="cell-42")
+            environment = module._training_environment(args)
+        self.assertTrue(environment["SAFETY_ABLATION_RUNTIME_LOG"].endswith("phase_runtime_logs.jsonl"))
+        self.assertTrue(environment["SAFETY_ABLATION_PROFILE_OUTPUT_ROOT"].endswith("pipeline\\phase1"))
+        self.assertEqual(environment["SAFETY_ABLATION_CELL_ID"], "cell-42")
 
     def test_benchmark_missing_assets_is_blocked_and_decode_is_shared(self) -> None:
         decode = DecodeConfig(temperature=0.7, top_p=0.9, max_new_tokens=1024)

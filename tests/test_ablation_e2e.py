@@ -215,8 +215,8 @@ class AblationE2ETests(unittest.TestCase):
             root = Path(td)
             logs = root / "runtime.jsonl"
             logs.write_text(
-                json.dumps({"phase": "extract", "wall_seconds": 2, "peak_memory_bytes": 10, "disk_delta_bytes": 3, "device_hours": 0.1}) + "\n"
-                + json.dumps({"phase": "train", "wall_seconds": 5, "peak_memory_bytes": 20, "disk_delta_bytes": 7, "device_hours": 0.3}) + "\n",
+                json.dumps({"phase": "extract", "wall_seconds": 2, "peak_memory_bytes": 10, "memory_measurement": "process_tree_rss", "disk_delta_bytes": 3, "device_hours": 0.1}) + "\n"
+                + json.dumps({"phase": "train", "wall_seconds": 5, "peak_memory_bytes": 20, "memory_measurement": "process_tree_rss", "disk_delta_bytes": 7, "device_hours": 0.3}) + "\n",
                 encoding="utf-8",
             )
             output = root / "out"
@@ -229,6 +229,35 @@ class AblationE2ETests(unittest.TestCase):
             result = json.loads((output / "efficiency_profile.json").read_text(encoding="utf-8"))
         self.assertEqual(result["phase"], "train")
         self.assertEqual(result["wall_seconds"], 5.0)
+
+    def test_efficiency_handler_preserves_unavailable_memory_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            logs = root / "runtime.jsonl"
+            logs.write_text(
+                json.dumps(
+                    {
+                        "phase": "train",
+                        "wall_seconds": 5,
+                        "peak_memory_bytes": None,
+                        "memory_measurement": "unavailable",
+                        "disk_delta_bytes": 7,
+                        "device_hours": 0.3,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output = root / "out"
+            execute_handler(
+                "efficiency_profile",
+                {"axes": {"phase": "train"}, "inputs": {"phase_runtime_logs": str(logs)}},
+                output_dir=output,
+                required_artifacts=["efficiency_profile.json"],
+            )
+            result = json.loads((output / "efficiency_profile.json").read_text(encoding="utf-8"))
+        self.assertIsNone(result["peak_memory_bytes"])
+        self.assertFalse(result["memory_complete"])
 
 
 if __name__ == "__main__":

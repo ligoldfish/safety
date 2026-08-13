@@ -196,6 +196,17 @@ def _train_command(
     context: RunnerContext,
 ) -> CommandSpec:
     axes = _merged_axes(cell)
+    assets = _load_asset_manifest(context.asset_manifest)
+    inputs: dict[str, str] = {}
+    for requirement in definition.requires:
+        if requirement not in assets:
+            continue
+        raw = assets[requirement]
+        path_text = str(raw.get("path", "")) if isinstance(raw, Mapping) else str(raw)
+        path = Path(path_text).expanduser()
+        if not path.is_absolute() and context.asset_manifest is not None:
+            path = context.asset_manifest.parent / path
+        inputs[requirement] = str(path.resolve())
     pair = str(axes.get("pair", "qwen35_9b_to_08b"))
     teacher_variant = ""
     if cell.experiment_id == "P2-03":
@@ -218,7 +229,7 @@ def _train_command(
         "--experiment-id",
         cell.experiment_id,
         "--cell-spec=" + json.dumps(
-            {"experiment_id": cell.experiment_id, "axes": axes},
+            {"experiment_id": cell.experiment_id, "axes": axes, "inputs": inputs},
             ensure_ascii=False,
             sort_keys=True,
         ),
