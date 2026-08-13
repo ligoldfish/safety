@@ -13,6 +13,9 @@ import yaml
 
 from .platform import resolve_portable_path
 from .schema import ExperimentCell
+from .data_audit import audit_train_eval_splits
+from src.data.dataset_io import PAN_REQUIRED_FILES
+from src.pairs import apply_tokens
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,113 @@ def training_model_requirements(
         ).resolve()
         result.append(AssetRequirement(asset_id, path, "model", cell.cell_id))
     return tuple(result)
+
+
+def _resolved_yaml_path(
+    value: object,
+    *,
+    base_dir: Path,
+    category: str,
+    environment: Mapping[str, str] | None,
+) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"training {category} path is missing")
+    return Path(
+        resolve_portable_path(
+            text,
+            base_dir,
+            category=category,
+            environment=environment,
+        )
+    ).resolve()
+
+
+def training_data_requirements(
+    cell: ExperimentCell,
+    *,
+    project_root: str | Path,
+    environment: Mapping[str, str] | None = None,
+    device: str = "npu",
+) -> tuple[AssetRequirement, ...]:
+    """Resolve only the source files the effective training pipeline reads."""
+
+    root = Path(project_root).resolve()
+    axes = {**dict(cell.overrides), **dict(cell.axes)}
+    dataset = str(
+        axes.get(
+            "dataset",
+            "wildjailbreak" if cell.experiment_id == "P0-06" else "pan",
+        )
+    )
+    pair, _ = _training_pair_and_teacher(cell)
+    phase1_path = root / "configs" / f"{pair}_phase1_{device}.yaml"
+    if not phase1_path.is_file():
+        raise ValueError(f"training pair config is missing: {phase1_path}")
+    phase1 = yaml.safe_load(phase1_path.read_text(encoding="utf-8")) or {}
+    try:
+        phase1_dataset = dict(phase1["dataset"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"training pair config has invalid dataset: {phase1_path}") from exc
+
+    if dataset == "pan":
+        pan_root = _resolved_yaml_path(
+            phase1_dataset.get("pan_repo_dir"),
+            base_dir=phase1_path.parent,
+            category="data",
+            environment=environment,
+        )
+        return tuple(
+            AssetRequirement(
+                "training_pan_" + Path(filename).stem,
+                pan_root / "data" / filename,
+                "file",
+                cell.cell_id,
+            )
+            for filename in PAN_REQUIRED_FILES
+        )
+
+    sft_name = apply_tokens(
+        f"baseline_sft_qwen35_08b_{dataset}_{device}.yaml",
+        pair,
+    )
+    sft_path = root / "configs" / sft_name
+    if not sft_path.is_file():
+        raise ValueError(f"training dataset config is missing: {sft_path}")
+    sft = yaml.safe_load(sft_path.read_text(encoding="utf-8")) or {}
+    try:
+        data = dict(sft["data"])
+        safety = dict(data.get("safety_dataset") or {})
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"training dataset config has invalid data block: {sft_path}") from exc
+    train = _resolved_yaml_path(
+        data.get("train_split"),
+        base_dir=sft_path.parent,
+        category="data",
+        environment=environment,
+    )
+    evaluation = _resolved_yaml_path(
+        safety.get("eval_output_path") or data.get("test_split"),
+        base_dir=sft_path.parent,
+        category="data",
+        environment=environment,
+    )
+    pan_processed = _resolved_yaml_path(
+        phase1_dataset.get("processed_dir"),
+        base_dir=phase1_path.parent,
+        category="data",
+        environment=environment,
+    )
+    return (
+        AssetRequirement("training_safety_train", train, "file", cell.cell_id),
+        AssetRequirement("training_safety_eval", evaluation, "file", cell.cell_id),
+        AssetRequirement(
+            "training_pan_test",
+            pan_processed / "pan_test_set.jsonl",
+            "file",
+            cell.cell_id,
+        ),
+    )
 
 
 def requirements_from_manifest(
@@ -410,6 +520,63 @@ def _validate_structured_asset(requirement: AssetRequirement) -> PreflightIssue 
     return None
 
 
+def _validate_training_split_pairs(
+    requirements: Iterable[AssetRequirement],
+) -> list[PreflightIssue]:
+    grouped: dict[str, dict[str, AssetRequirement]] = {}
+    for requirement in requirements:
+        if requirement.asset_id not in {"training_safety_train", "training_safety_eval"}:
+            continue
+        grouped.setdefault(requirement.cell_id, {})[requirement.asset_id] = requirement
+
+    issues: list[PreflightIssue] = []
+    for pair in grouped.values():
+        train_requirement = pair.get("training_safety_train")
+        eval_requirement = pair.get("training_safety_eval")
+        if train_requirement is None or eval_requirement is None:
+            continue
+        train_path = train_requirement.path
+        eval_path = eval_requirement.path
+        if not train_path.is_file() or not eval_path.is_file():
+            continue
+        if train_path.stat().st_size <= 0 or eval_path.stat().st_size <= 0:
+            continue
+        try:
+            train = _read_jsonl_objects(train_path)
+            evaluation = _read_jsonl_objects(eval_path)
+            for name, rows in (("train", train), ("evaluation", evaluation)):
+                ids = [str(row.get("id", "")).strip() for row in rows]
+                labels = {str(row.get("label", "")).strip().lower() for row in rows}
+                if any(not sample_id for sample_id in ids) or len(ids) != len(set(ids)):
+                    raise ValueError(f"{name} sample ids are empty or duplicated")
+                if labels != {"harmful", "harmless"}:
+                    raise ValueError(f"{name} must contain harmful and harmless labels")
+            audit = audit_train_eval_splits(train, evaluation)
+            if (
+                audit["overlap_count"]
+                or audit["train_duplicate_count"]
+                or audit["eval_duplicate_count"]
+            ):
+                issues.append(
+                    _issue(
+                        train_requirement,
+                        "TRAINING_SPLIT_LEAKAGE",
+                        "training/evaluation prompts overlap or contain duplicates",
+                        "regenerate deduplicated prompt-disjoint train and evaluation JSONL files",
+                    )
+                )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            issues.append(
+                _issue(
+                    train_requirement,
+                    "TRAINING_SPLIT_INVALID",
+                    "training/evaluation JSONL lacks unique ids or both safety labels",
+                    "regenerate schema-valid harmful/harmless training and evaluation splits",
+                )
+            )
+    return issues
+
+
 def run_preflight(
     requirements: Iterable[AssetRequirement],
     *,
@@ -418,6 +585,7 @@ def run_preflight(
     # ``environment`` is accepted so callers can test scheduler state, but is
     # deliberately never serialized: tokens and passwords must not enter logs.
     del environment
+    requirements = tuple(requirements)
     issues: list[PreflightIssue] = []
     checked: list[str] = []
     for requirement in requirements:
@@ -432,6 +600,8 @@ def run_preflight(
         elif requirement.kind == "file":
             if not path.is_file():
                 issues.append(_issue(requirement, "ASSET_FILE_MISSING", "required file is missing", "prepare or upload the file before submitting"))
+            elif path.stat().st_size <= 0:
+                issues.append(_issue(requirement, "ASSET_FILE_EMPTY", "required file is empty", "regenerate or re-upload the complete file"))
             else:
                 issue = _validate_structured_asset(requirement)
                 if issue is not None:
@@ -446,6 +616,7 @@ def run_preflight(
                     issues.append(_issue(requirement, "OUTPUT_DISK_INSUFFICIENT", "output volume has insufficient free space", "reduce the plan or provision more persistent storage"))
         else:
             issues.append(_issue(requirement, "ASSET_KIND_UNKNOWN", "unknown requirement kind", "use file, directory, or model"))
+    issues.extend(_validate_training_split_pairs(requirements))
     return PreflightReport("READY" if not issues else "BLOCKED", tuple(issues), tuple(checked))
 
 

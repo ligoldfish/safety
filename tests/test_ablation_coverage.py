@@ -21,7 +21,10 @@ class AblationCoverageTests(unittest.TestCase):
         self.assertEqual(set(contracts), executable_handlers())
         for name, contract in contracts.items():
             with self.subTest(handler=name):
-                self.assertTrue(contract.required_inputs)
+                definition = next(
+                    item for item in CATALOG.experiments.values() if item.handler == name
+                )
+                self.assertEqual(contract.required_inputs, definition.requires)
                 self.assertTrue(contract.description)
                 self.assertNotIn("placeholder", contract.description.lower())
 

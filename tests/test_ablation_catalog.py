@@ -79,6 +79,18 @@ class AblationCatalogTests(unittest.TestCase):
             ("common_test", "wildguard_model"),
         )
 
+    def test_train_cells_only_declare_external_inputs_consumed_by_the_worker(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        expected = {
+            "P0-06": ("common_test", "wildguard_model"),
+            "P0-07": ("search_ledger",),
+        }
+        for experiment_id, definition in catalog.experiments.items():
+            if definition.execution_kind.value != "train":
+                continue
+            with self.subTest(experiment=experiment_id):
+                self.assertEqual(definition.requires, expected.get(experiment_id, ()))
+
     def test_duplicate_ids_are_rejected(self) -> None:
         raw = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
         raw["experiments"].append(dict(raw["experiments"][0]))

@@ -45,7 +45,7 @@ experiments:
     execution_kind: train
     handler: matched_controls
     axes: {method: [sft1, random, ours], seed: [42, 43, 44]}
-    requires: [phase1_data, phasef_data]
+    requires: []
     metrics: [wildguard_asr, harmful_refusal, over_refusal]
     completion_artifacts: [run_manifest.json, eval_predictions.jsonl]
   - id: P0-03
@@ -128,7 +128,7 @@ experiments:
     handler: target_control
     axes: {target_mode: [within_label_permutation, cross_label_permutation]}
     overrides: {target.mode: within_label_permutation}
-    requires: [semantic_targets]
+    requires: []
     metrics: [wildguard_asr, over_refusal]
     completion_artifacts: [permutation_manifest.json, eval_predictions.jsonl]
   - id: P1-02
@@ -139,7 +139,7 @@ experiments:
     handler: subspace_control
     axes: {subspace_mode: [none]}
     overrides: {subspace.mode: none, target.mode: raw_teacher}
-    requires: [teacher_hidden_states]
+    requires: []
     metrics: [wildguard_asr, over_refusal]
     completion_artifacts: [subspace_manifest.json, eval_predictions.jsonl]
   - id: P1-03
@@ -150,7 +150,7 @@ experiments:
     handler: subspace_control
     axes: {draw: [0, 1, 2, 3, 4]}
     overrides: {subspace.mode: random_orthogonal}
-    requires: [teacher_hidden_states, learned_subspace_rank]
+    requires: []
     metrics: [orthogonality_error, wildguard_asr, over_refusal]
     completion_artifacts: [subspace_manifest.json, eval_predictions.jsonl]
   - id: P1-04
@@ -161,7 +161,7 @@ experiments:
     handler: bridge_control
     axes: {bridge_mode: [ridge, orthogonal_procrustes]}
     overrides: {bridge.mode: ridge}
-    requires: [alignment_hidden_states]
+    requires: []
     metrics: [mapping_error, wildguard_asr, over_refusal]
     completion_artifacts: [bridge_artifact.pt, eval_predictions.jsonl]
   - id: P1-05
@@ -171,7 +171,7 @@ experiments:
     execution_kind: train
     handler: layer_selection_control
     axes: {mode: [effect_probe_sum, random_k, evenly_spaced, last_k], draw: [0, 1, 2, 3, 4]}
-    requires: [layer_scores]
+    requires: []
     metrics: [trainable_parameters, wildguard_asr, over_refusal]
     completion_artifacts: [layer_selection.json, eval_predictions.jsonl]
   - id: P1-06
@@ -181,7 +181,7 @@ experiments:
     execution_kind: train
     handler: layer_score_control
     axes: {mode: [effect_only, probe_only, effect_probe_sum, random_k]}
-    requires: [layer_scores]
+    requires: []
     metrics: [selected_layers, wildguard_asr, over_refusal]
     completion_artifacts: [layer_selection.json, eval_predictions.jsonl]
   - id: P1-07
@@ -191,7 +191,7 @@ experiments:
     execution_kind: train
     handler: pairing_control
     axes: {mode: [relative_depth, cka_nearest, random_permutation, same_index_clamped]}
-    requires: [teacher_student_alignment_hidden_states]
+    requires: []
     metrics: [pairing_score, wildguard_asr, over_refusal]
     completion_artifacts: [pairing_manifest.json, eval_predictions.jsonl]
   - id: P1-08
@@ -201,7 +201,7 @@ experiments:
     execution_kind: train
     handler: representation_position_control
     axes: {mode: [last_prompt, mean_prompt, first_generated, first_4_generated_mean]}
-    requires: [phase1_data]
+    requires: []
     metrics: [representation_coverage, wildguard_asr, over_refusal]
     completion_artifacts: [position_manifest.json, eval_predictions.jsonl]
   - id: P1-09
@@ -211,7 +211,7 @@ experiments:
     execution_kind: train
     handler: semantic_top_m_sweep
     axes: {top_m: [32, 64, 128, 256, 512, 1024]}
-    requires: [semantic_bases]
+    requires: []
     metrics: [retained_coefficient_energy, wildguard_asr, over_refusal]
     completion_artifacts: [semantic_manifest.json, eval_predictions.jsonl]
   - id: P1-10
@@ -221,7 +221,7 @@ experiments:
     execution_kind: train
     handler: semantic_selection_control
     axes: {selection_mode: [abs, positive, negative], token_filter: [true, false]}
-    requires: [semantic_bases]
+    requires: []
     metrics: [retained_coefficient_energy, wildguard_asr, over_refusal]
     completion_artifacts: [semantic_manifest.json, eval_predictions.jsonl]
   - id: P1-11
@@ -231,7 +231,7 @@ experiments:
     execution_kind: train
     handler: layer_loss_weight_sweep
     axes: {layer_loss_weight: [0.0, 0.05, 0.1, 0.25, 0.5, 1.0]}
-    requires: [phasef_data]
+    requires: []
     metrics: [validation_safety_f1, wildguard_asr, over_refusal]
     completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
   - id: P1-12
@@ -241,7 +241,7 @@ experiments:
     execution_kind: train
     handler: supervision_policy_control
     axes: {mode: [harmful_only, all, label_weighted_1_05, label_weighted_1_1, harmless_anchor]}
-    requires: [phasef_data]
+    requires: []
     metrics: [harmful_cosine, harmless_cosine, wildguard_asr, over_refusal]
     completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
   - id: P1-13
@@ -251,7 +251,7 @@ experiments:
     execution_kind: train
     handler: layer_loss_kind_control
     axes: {loss_kind: [cosine, normalized_mse, raw_mse, margin_contrastive]}
-    requires: [phasef_data]
+    requires: []
     metrics: [layer_loss, wildguard_asr, over_refusal]
     completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
   - id: P1-14
@@ -261,7 +261,7 @@ experiments:
     execution_kind: train
     handler: lora_capacity_control
     axes: {rank: [8, 16, 32], placement: [selected, all_layers_parameter_matched]}
-    requires: [phasef_data]
+    requires: []
     metrics: [trainable_parameters, wildguard_asr, over_refusal]
     completion_artifacts: [parameter_budget.json, eval_predictions.jsonl]
   - id: P1-15
@@ -271,7 +271,7 @@ experiments:
     execution_kind: train
     handler: subspace_hyperparameter_sweep
     axes: {energy_threshold: [0.6, 0.7, 0.8, 0.9, 0.95], rank_cap: [8, 16, 32, 64]}
-    requires: [teacher_hidden_states]
+    requires: []
     metrics: [effective_rank, retained_energy, wildguard_asr, over_refusal]
     completion_artifacts: [subspace_manifest.json, eval_predictions.jsonl]
   - id: P1-16
@@ -281,7 +281,7 @@ experiments:
     execution_kind: train
     handler: data_efficiency_sweep
     axes: {phase: [phase1, phasef], samples_per_label: [100, 250, 500, 1000, all]}
-    requires: [phase1_data, phasef_data]
+    requires: []
     metrics: [sample_count, wildguard_asr, over_refusal]
     completion_artifacts: [sampling_manifest.json, eval_predictions.jsonl]
   - id: P1-17
@@ -291,7 +291,7 @@ experiments:
     execution_kind: train
     handler: curation_control
     axes: {balance: [true, false], curation: ["off", minimal, strict]}
-    requires: [phase1_data]
+    requires: []
     metrics: [drop_reasons, label_counts, wildguard_asr, over_refusal]
     completion_artifacts: [curation_manifest.json, eval_predictions.jsonl]
   - id: P1-18
@@ -301,7 +301,7 @@ experiments:
     execution_kind: analyze
     handler: pan_subgroup_analysis
     axes: {grouping: [attack_family, benign_length, benign_topic]}
-    requires: [pan_predictions, pan_metadata]
+    requires: [pan_predictions]
     metrics: [subgroup_asr, subgroup_hr, subgroup_over_refusal]
     completion_artifacts: [pan_subgroups.json]
   - id: P1-19
@@ -321,7 +321,7 @@ experiments:
     execution_kind: analyze
     handler: representation_behavior_analysis
     axes: {label: [harmful, harmless]}
-    requires: [pre_post_hidden_states, aligned_predictions]
+    requires: [aligned_predictions]
     metrics: [layer_cosine_change, behavior_correlation]
     completion_artifacts: [representation_behavior.json]
 
@@ -353,7 +353,7 @@ experiments:
     execution_kind: train
     handler: teacher_quality_control
     axes: {teacher: [same_size_base, safety_tuned, qwen3_4b, qwen3_8b]}
-    requires: [teacher_checkpoints]
+    requires: []
     metrics: [target_quality, student_gain, correlation]
     completion_artifacts: [teacher_quality.json, eval_predictions.jsonl]
   - id: P2-04
@@ -364,7 +364,7 @@ experiments:
     handler: cross_tokenizer_bridge
     axes: {bridge_mode: [token_string, embedding_nearest]}
     overrides: {bridge.mode: token_string}
-    requires: [cross_family_models, tokenizer_metadata]
+    requires: []
     metrics: [match_coverage, conflict_rate, wildguard_asr, over_refusal]
     completion_artifacts: [bridge_audit.json, eval_predictions.jsonl]
   - id: P2-05

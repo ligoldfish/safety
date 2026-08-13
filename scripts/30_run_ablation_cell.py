@@ -63,6 +63,15 @@ def _stage_configs(args, phase1_updates: dict, phasef_updates: dict) -> tuple[Pa
         raise FileNotFoundError(f"pair/device configs are missing: {phase1_source}, {phasef_source}")
     phase1 = yaml.safe_load(phase1_source.read_text(encoding="utf-8"))
     phasef = yaml.safe_load(phasef_source.read_text(encoding="utf-8"))
+    dataset = phase1.get("dataset")
+    if isinstance(dataset, dict):
+        for key in ("pan_repo_dir", "raw_dir", "processed_dir", "metadata_dir"):
+            if key in dataset:
+                dataset[key] = resolve_portable_path(
+                    str(dataset[key]),
+                    phase1_source.parent,
+                    category="data",
+                )
     _absolutize_paths(phase1, phase1_source.parent)
     _absolutize_paths(phasef, phasef_source.parent)
     phase1_root = (Path(args.output_dir) / "pipeline" / "phase1").resolve()

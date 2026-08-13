@@ -17,6 +17,7 @@ from .preflight import (
     _expand_manifest_path,
     requirements_from_manifest,
     run_preflight,
+    training_data_requirements,
     training_model_requirements,
 )
 
@@ -487,13 +488,18 @@ class AblationRunner:
                     )
                 definition = self.catalog.experiments[cell.experiment_id]
                 if definition.execution_kind is ExecutionKind.TRAIN and self._uses_real_executor:
-                    model_report = run_preflight(
-                        training_model_requirements(
-                            cell,
-                            project_root=self.context.project_root,
-                            environment=self.environment,
-                            device=self.context.device,
+                    training_requirements = (
+                        *training_model_requirements(
+                            cell, project_root=self.context.project_root,
+                            environment=self.environment, device=self.context.device,
                         ),
+                        *training_data_requirements(
+                            cell, project_root=self.context.project_root,
+                            environment=self.environment, device=self.context.device,
+                        ),
+                    )
+                    model_report = run_preflight(
+                        training_requirements,
                         environment=self.environment,
                     )
                     if model_report.status != "READY":

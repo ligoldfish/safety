@@ -12,6 +12,7 @@ from src.ablations.preflight import (
     inspect_model_directory,
     inspect_submission_package,
     run_preflight,
+    training_data_requirements,
     training_model_requirements,
 )
 from src.ablations.catalog import load_catalog
@@ -354,6 +355,72 @@ class AblationPreflightTests(unittest.TestCase):
                 "training_student_model": (model_root / "Qwen3-0.6B").resolve(),
             },
         )
+
+    def test_training_data_requirements_follow_the_effective_dataset_config(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        catalog = load_catalog(project / "configs" / "ablations" / "catalog.yaml")
+        plan = build_catalog_plan(catalog, output_root="/out", scope="all")
+        pan = next(item for item in plan.cells if item.experiment_id == "P1-11")
+        wjb = next(item for item in plan.cells if item.experiment_id == "P0-06")
+        with tempfile.TemporaryDirectory() as td:
+            data_root = Path(td) / "data"
+            environment = {"SAFETY_DATA_ROOT": str(data_root)}
+            pan_requirements = training_data_requirements(
+                pan, project_root=project, environment=environment
+            )
+            wjb_requirements = training_data_requirements(
+                wjb, project_root=project, environment=environment
+            )
+        self.assertEqual(
+            {item.asset_id for item in pan_requirements},
+            {
+                "training_pan_toxicity",
+                "training_pan_safety",
+                "training_pan_add_moderation",
+                "training_pan_sr_moderation",
+            },
+        )
+        self.assertEqual(
+            {item.asset_id: item.path for item in wjb_requirements},
+            {
+                "training_safety_train": (data_root / "processed" / "safety" / "wildjailbreak_20k_train.jsonl").resolve(),
+                "training_safety_eval": (data_root / "processed" / "eval" / "wildjailbreak_test.jsonl").resolve(),
+                "training_pan_test": (data_root / "processed" / "pan_test_set.jsonl").resolve(),
+            },
+        )
+
+    def test_training_splits_block_empty_duplicate_or_overlapping_prompts(self) -> None:
+        def row(sample_id: str, prompt: str, label: str) -> dict:
+            return {"id": sample_id, "user_text": prompt, "label": label}
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            train = root / "train.jsonl"
+            evaluation = root / "eval.jsonl"
+            requirements = [
+                AssetRequirement("training_safety_train", train, "file", "cell"),
+                AssetRequirement("training_safety_eval", evaluation, "file", "cell"),
+            ]
+            train.write_text("", encoding="utf-8")
+            evaluation.write_text(json.dumps(row("e", "unique eval", "harmful")) + "\n", encoding="utf-8")
+            empty = run_preflight(requirements)
+            train.write_text(
+                "".join(json.dumps(item) + "\n" for item in [
+                    row("t1", "duplicate", "harmful"),
+                    row("t2", "duplicate", "harmless"),
+                ]),
+                encoding="utf-8",
+            )
+            evaluation.write_text(
+                "".join(json.dumps(item) + "\n" for item in [
+                    row("e1", "duplicate", "harmful"),
+                    row("e2", "unique eval", "harmless"),
+                ]),
+                encoding="utf-8",
+            )
+            leaked = run_preflight(requirements)
+        self.assertIn("ASSET_FILE_EMPTY", {item.code for item in empty.issues})
+        self.assertIn("TRAINING_SPLIT_LEAKAGE", {item.code for item in leaked.issues})
 
 
 if __name__ == "__main__":

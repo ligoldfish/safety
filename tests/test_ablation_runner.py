@@ -73,15 +73,15 @@ class AblationCompileTests(unittest.TestCase):
     def test_compiled_cell_uses_the_same_expanded_manifest_path_as_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            data = root / "phasef"
-            data.mkdir()
+            data = root / "pan-predictions.jsonl"
+            data.write_text("{}\n", encoding="utf-8")
             manifest = root / "assets.json"
             manifest.write_text(
                 json.dumps(
                     {
-                        "phasef_data": {
-                            "path": "${SAFETY_DATA_ROOT}/phasef",
-                            "kind": "directory",
+                        "pan_predictions": {
+                            "path": "${SAFETY_DATA_ROOT}/pan-predictions.jsonl",
+                            "kind": "file",
                         }
                     }
                 ),
@@ -90,7 +90,7 @@ class AblationCompileTests(unittest.TestCase):
             with patch.dict("os.environ", {"SAFETY_DATA_ROOT": str(root)}, clear=False):
                 command = compile_cell_commands(
                     CATALOG,
-                    _cell("P1-11", layer_loss_weight=0.25),
+                    _cell("P1-18", grouping="attack_family"),
                     RunnerContext(
                         ROOT,
                         root / "state",
@@ -103,7 +103,7 @@ class AblationCompileTests(unittest.TestCase):
             spec = json.loads(
                 next(x for x in command.argv if x.startswith("--cell-spec=")).split("=", 1)[1]
             )
-        self.assertEqual(spec["inputs"]["phasef_data"], str(data.resolve()))
+        self.assertEqual(spec["inputs"]["pan_predictions"], str(data.resolve()))
 
     def test_worker_extracts_paths_from_strict_asset_manifest_entries(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -244,6 +244,29 @@ class AblationCompileTests(unittest.TestCase):
         self.assertEqual(
             phase1["models"]["teacher"]["path"],
             str((model_root / "teacher-controls" / "same-size-base").resolve()),
+        )
+
+    def test_staged_pan_source_respects_the_persistent_data_root(self) -> None:
+        path = ROOT / "scripts" / "30_run_ablation_cell.py"
+        spec = importlib.util.spec_from_file_location("ablation_cell_pan_path_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            args = SimpleNamespace(
+                output_dir=str(root / "out"),
+                pair="qwen35_9b_to_08b",
+                device="npu",
+                teacher_variant="",
+            )
+            data_root = root / "persistent-data"
+            with patch.dict(os.environ, {"SAFETY_DATA_ROOT": str(data_root)}):
+                phase1_path, _ = module._stage_configs(args, {}, {})
+            payload = yaml.safe_load(phase1_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            Path(payload["dataset"]["pan_repo_dir"]),
+            (data_root / "external" / "safety-residual-space").resolve(),
         )
 
     def test_every_train_cell_compiles_only_supported_phasef_fields(self) -> None:
@@ -600,7 +623,7 @@ class AblationCompileTests(unittest.TestCase):
 
 class AblationRunnerStateTests(unittest.TestCase):
     def test_real_runner_blocks_before_execution_when_assets_are_missing(self) -> None:
-        cell = _cell("P1-11", layer_loss_weight=0.25)
+        cell = _cell("P0-07", dataset="pan", config="global")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = root / "assets.json"
@@ -614,7 +637,7 @@ class AblationRunnerStateTests(unittest.TestCase):
             )
             status = runner.run_cell(cell)
         self.assertEqual(status["state"], "BLOCKED")
-        self.assertIn("phasef_data", status["reason"])
+        self.assertIn("search_ledger", status["reason"])
         self.assertEqual(called, [])
 
     def test_ready_manifest_allows_execution_and_is_part_of_fingerprint(self) -> None:

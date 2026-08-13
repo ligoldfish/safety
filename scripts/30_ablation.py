@@ -18,6 +18,7 @@ from src.ablations.preflight import (
     PreflightReport,
     requirements_from_manifest,
     run_preflight,
+    training_data_requirements,
     training_model_requirements,
 )
 from src.ablations.runner import AblationRunner, RunnerContext, RunnerError
@@ -237,6 +238,13 @@ def main(argv: list[str] | None = None) -> int:
                             device="npu",
                         )
                     )
+                    requirements.extend(
+                        training_data_requirements(
+                            cell,
+                            project_root=PROJECT_ROOT,
+                            device="npu",
+                        )
+                    )
         else:
             root = Path(args.asset_root).expanduser().resolve()
             for cell in plan.cells:
@@ -248,6 +256,13 @@ def main(argv: list[str] | None = None) -> int:
                 if definition.execution_kind.value == "train":
                     requirements.extend(
                         training_model_requirements(
+                            cell,
+                            project_root=PROJECT_ROOT,
+                            device="npu",
+                        )
+                    )
+                    requirements.extend(
+                        training_data_requirements(
                             cell,
                             project_root=PROJECT_ROOT,
                             device="npu",
