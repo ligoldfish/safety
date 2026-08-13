@@ -58,6 +58,11 @@ def _read_jsonl(path: Path, label: str) -> list[dict]:
 
 
 def _validated_search_ledger(cell_spec: Mapping) -> tuple[Path, list[dict], dict]:
+    from src.ablations.fairness import (
+        load_search_ledger_snapshot,
+        resolve_fairness_configuration,
+    )
+
     axes = dict(cell_spec.get("axes") or {})
     inputs = dict(cell_spec.get("inputs") or {})
     source_text = str(inputs.get("search_ledger", "")).strip()
@@ -66,27 +71,18 @@ def _validated_search_ledger(cell_spec: Mapping) -> tuple[Path, list[dict], dict
     source = Path(source_text)
     dataset = str(axes.get("dataset", ""))
     config = str(axes.get("config", ""))
+    try:
+        all_rows, ledger_hash = load_search_ledger_snapshot(source)
+    except ValueError as exc:
+        raise CompletionError(str(exc)) from exc
     rows = [
         row
-        for row in _read_jsonl(source, "search ledger")
+        for row in all_rows
         if str(row.get("dataset", "")) == dataset
         and str(row.get("config", "")) == config
     ]
     if not rows:
         raise CompletionError(f"search ledger has no rows for dataset={dataset}, config={config}")
-    required = {
-        "trial_id",
-        "dataset",
-        "config",
-        "method",
-        "selection_split",
-        "selected",
-        "validation_metric",
-    }
-    if any(not required <= set(row) for row in rows):
-        raise CompletionError("search ledger lacks required trial provenance fields")
-    if any(str(row["selection_split"]) != "validation" for row in rows):
-        raise CompletionError("search ledger contains non-validation model selection")
     counts: dict[str, int] = {}
     selected: dict[str, str] = {}
     for row in rows:
@@ -96,16 +92,107 @@ def _validated_search_ledger(cell_spec: Mapping) -> tuple[Path, list[dict], dict
             if method in selected:
                 raise CompletionError(f"method {method} has multiple selected search trials")
             selected[method] = str(row["trial_id"])
-    if len(counts) < 2 or len(set(counts.values())) != 1:
-        raise CompletionError(f"search budgets must be equal across methods: {counts}")
-    if config == "validation_selected" and set(selected) != set(counts):
-        raise CompletionError("validation_selected requires exactly one selected trial per method")
+    try:
+        applied = resolve_fairness_configuration(cell_spec)
+    except ValueError as exc:
+        raise CompletionError(str(exc)) from exc
+    declared = cell_spec.get("fairness_configuration")
+    expected_declared = {
+        "hyperparameters": applied.hyperparameters,
+        "selected_trial_id": applied.selected_trial_id,
+        "search_ledger_sha256": applied.search_ledger_sha256,
+    }
+    if declared is None:
+        raise CompletionError("applied fairness configuration evidence is missing")
+    if str(declared.get("search_ledger_sha256", "")) != ledger_hash:
+        raise CompletionError("search ledger changed after worker configuration")
+    if declared != expected_declared:
+        raise CompletionError("applied fairness configuration does not match the search ledger")
+    method = str(axes.get("method", ""))
     return source, rows, {
-        "search_count": len(rows),
-        "search_count_by_method": dict(sorted(counts.items())),
+        "search_count": 0 if config == "global" else len(rows),
+        "search_count_by_method": (
+            {method: 0 for method in sorted(counts)}
+            if config == "global"
+            else dict(sorted(counts.items()))
+        ),
         "selected_trial_ids": dict(sorted(selected.items())),
         "selection_split": "validation",
+        "current_method": method,
+        "applied_trial_id": applied.selected_trial_id,
+        "applied_hyperparameters": applied.hyperparameters,
+        "search_ledger_sha256": ledger_hash,
     }
+
+
+def _validate_fairness_backend(
+    phase1: Path,
+    training: Mapping,
+    search_summary: Mapping,
+) -> dict[str, int | float | str]:
+    expected = dict(search_summary.get("applied_hyperparameters") or {})
+    method = str(search_summary.get("current_method", ""))
+    layer = _read_object(
+        phase1 / "layer_analysis" / "teacher_key_layers.json",
+        "P0-07 layer analysis manifest",
+    )
+    subspace = _read_object(
+        phase1 / "safe_subspaces" / "manifest.json",
+        "P0-07 subspace manifest",
+    )
+    actual = {
+        "top_k": layer.get("top_k"),
+        "energy_threshold": subspace.get("energy_threshold"),
+        "rank_cap": subspace.get("rank_cap"),
+        "layer_loss_weight": training.get("layer_loss_weight"),
+        "epochs": training.get("epochs"),
+        "target_mode": training.get("target_mode"),
+    }
+    expected_mode = "random_same_norm" if method == "random" else "semantic"
+    if (
+        actual["top_k"] != expected.get("top_k")
+        or actual["rank_cap"] != expected.get("rank_cap")
+        or actual["epochs"] != expected.get("epochs")
+        or actual["target_mode"] != expected_mode
+        or type(actual["energy_threshold"]) not in {int, float}
+        or type(actual["layer_loss_weight"]) not in {int, float}
+        or not math.isclose(
+            float(actual["energy_threshold"]),
+            float(expected.get("energy_threshold", float("nan"))),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            float(actual["layer_loss_weight"]),
+            float(expected.get("layer_loss_weight", float("nan"))),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise CompletionError(
+            f"backend fairness configuration differs from applied winner: expected={expected}, actual={actual}"
+        )
+    return actual
+
+
+def _validated_training_budget(training: Mapping) -> dict[str, int]:
+    keys = (
+        "trainable_parameters",
+        "total_parameters",
+        "epochs_completed",
+        "train_num_samples",
+        "optimizer_steps",
+        "training_tokens_seen",
+    )
+    budget: dict[str, int] = {}
+    for key in keys:
+        value = training.get(key)
+        if type(value) is not int or value <= 0:
+            raise CompletionError(f"training budget field {key} must be a positive integer")
+        budget[key] = value
+    if budget["trainable_parameters"] > budget["total_parameters"]:
+        raise CompletionError("training budget has trainable_parameters > total_parameters")
+    return budget
 
 
 def _latest_pan_results(phase1_root: Path) -> tuple[Path, dict]:
@@ -398,15 +485,19 @@ def collect_training_contract(
         elif name == "budget_summary.json" and experiment_id == "P0-07":
             search_contract = search_contract or _validated_search_ledger(cell_spec)
             source, _, search_summary = search_contract
-            required_budget = ("trainable_parameters", "total_parameters", "epochs_completed", "train_num_samples")
-            if any(key not in training for key in required_budget):
-                raise CompletionError("training manifest lacks exact parameter/training budget fields")
+            training_budget = _validated_training_budget(training)
+            backend_configuration = _validate_fairness_backend(
+                phase1,
+                training,
+                search_summary,
+            )
             payload = {
                 **common,
                 **search_summary,
                 "search_ledger_source": str(source.resolve()),
-                "search_ledger_sha256": sha256_file(source),
-                "training_budget": {key: training[key] for key in required_budget},
+                "search_ledger_sha256": search_summary["search_ledger_sha256"],
+                "training_budget": training_budget,
+                "backend_configuration": backend_configuration,
             }
         elif name == "parameter_budget.json" or name == "budget_summary.json":
             required_budget = ("trainable_parameters", "total_parameters", "epochs_completed", "train_num_samples")

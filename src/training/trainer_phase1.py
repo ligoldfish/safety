@@ -24,6 +24,16 @@ from src.ablations.strategies.losses import layer_alignment_loss, supervision_we
 from src.utils.io import ensure_dir, read_jsonl, write_json
 
 
+def count_nonpadding_tokens(attention_mask: torch.Tensor) -> int:
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        raise ValueError("attention_mask must be a rank-2 tensor")
+    if not torch.isfinite(attention_mask).all():
+        raise ValueError("attention_mask must contain finite binary values")
+    if not torch.all((attention_mask == 0) | (attention_mask == 1)):
+        raise ValueError("attention_mask must contain only 0/1 values")
+    return int(attention_mask.to(dtype=torch.int64).sum().item())
+
+
 def load_student_target_map(target_dir: str | Path) -> tuple[Dict[str, Dict[int, torch.Tensor]], List[int]]:
     """Load per-pair recomposed safety targets emitted by 08_recompose.
 

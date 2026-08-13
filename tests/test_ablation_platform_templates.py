@@ -52,8 +52,8 @@ class AblationPlatformTemplateTests(unittest.TestCase):
             "ASCEND_RT_VISIBLE_DEVICES",
             "checkpoint_registry",
             "search_ledger",
-            "497",
-            "277",
+            "509",
+            "289",
             "31",
             "186",
             "3",
@@ -75,7 +75,7 @@ class AblationPlatformTemplateTests(unittest.TestCase):
         for experiment_id in CATALOG.experiments:
             self.assertIn(experiment_id, coverage)
         for token in (
-            "497", "277", "150", "35/35", "plan", "preflight", "run", "status", "summarize"
+            "509", "289", "150", "35/35", "plan", "preflight", "run", "status", "summarize"
         ):
             self.assertIn(token, coverage + runbook)
 

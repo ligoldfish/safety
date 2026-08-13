@@ -17,9 +17,89 @@ from src.ablations.preflight import (
 )
 from src.ablations.catalog import load_catalog
 from src.ablations.planner import build_catalog_plan
+from tests.fairness_evidence import attach_validation_evidence
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class AblationPreflightTests(unittest.TestCase):
+    def test_complete_fairness_ledger_is_ready_for_all_24_declared_cells(self) -> None:
+        datasets = (
+            "pan",
+            "safety_tuned_llamas",
+            "coconot",
+            "c5",
+            "wildjailbreak",
+            "wildguardmix",
+        )
+        methods = ("sft1", "random", "ours")
+        rows = []
+        for dataset in datasets:
+            for method in methods:
+                rows.append(
+                    {
+                        "trial_id": f"{dataset}-global-{method}",
+                        "dataset": dataset,
+                        "config": "global",
+                        "method": method,
+                        "selection_split": "validation",
+                        "selected": False,
+                        "validation_metric": 0.0,
+                        "hyperparameters": {
+                            "top_k": 5,
+                            "energy_threshold": 0.8,
+                            "rank_cap": 32,
+                            "layer_loss_weight": 0.0 if method == "sft1" else 0.25,
+                            "epochs": 3,
+                        },
+                    }
+                )
+                for index, top_k in enumerate((3, 5)) if dataset in {
+                    "wildjailbreak",
+                    "wildguardmix",
+                } else ():
+                    rows.append(
+                        {
+                            "trial_id": f"{dataset}-validation-{method}-{index}",
+                            "dataset": dataset,
+                            "config": "validation_selected",
+                            "method": method,
+                            "selection_split": "validation",
+                            "selected": index == 1,
+                            "validation_metric": 0.7 + index / 10,
+                            "hyperparameters": {
+                                "top_k": top_k,
+                                "energy_threshold": 0.8,
+                                "rank_cap": 32,
+                                "layer_loss_weight": 0.0 if method == "sft1" else 0.25,
+                                "epochs": 3,
+                            },
+                        }
+                    )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            attach_validation_evidence(rows, root)
+            ledger = root / "search.jsonl"
+            ledger.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            catalog = load_catalog(ROOT / "configs" / "ablations" / "catalog.yaml")
+            cells = [
+                cell
+                for cell in build_catalog_plan(catalog, output_root="/out", scope="all").cells
+                if cell.experiment_id == "P0-07"
+            ]
+            self.assertEqual(len(cells), 24)
+            for cell in cells:
+                requirement = AssetRequirement(
+                    "search_ledger",
+                    ledger,
+                    "file",
+                    cell.cell_id,
+                    selectors=tuple(sorted((key, str(value)) for key, value in cell.axes.items())),
+                )
+                with self.subTest(cell=cell.cell_id):
+                    self.assertEqual(run_preflight([requirement]).status, "READY")
+
     @staticmethod
     def _complete_model(path: Path) -> None:
         path.mkdir(parents=True)
@@ -152,6 +232,30 @@ class AblationPreflightTests(unittest.TestCase):
                 {"trial_id": "a1", "dataset": "pan", "config": "global", "method": "ours", "selection_split": "validation", "selected": False, "validation_metric": 0.8},
                 {"trial_id": "b1", "dataset": "pan", "config": "global", "method": "sft", "selection_split": "test", "selected": False, "validation_metric": 0.7},
                 {"trial_id": "b2", "dataset": "pan", "config": "global", "method": "sft", "selection_split": "validation", "selected": False, "validation_metric": 0.6},
+            ]
+            ledger.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            report = run_preflight(
+                [AssetRequirement("search_ledger", ledger, "file", "p0-07")]
+            )
+        self.assertEqual(report.status, "BLOCKED")
+        self.assertIn("SEARCH_LEDGER_INVALID", {issue.code for issue in report.issues})
+
+    def test_search_ledger_blocks_validation_winners_without_executable_hyperparameters(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "search.jsonl"
+            rows = [
+                {
+                    "trial_id": method,
+                    "dataset": "pan",
+                    "config": "validation_selected",
+                    "method": method,
+                    "selection_split": "validation",
+                    "selected": True,
+                    "validation_metric": 0.8,
+                }
+                for method in ("sft1", "random", "ours")
             ]
             ledger.write_text(
                 "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"

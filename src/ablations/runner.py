@@ -155,7 +155,7 @@ def phasef_updates_for_cell(cell: ExperimentCell) -> dict[str, object]:
     axes = _merged_axes(cell)
     updates: dict[str, object] = {}
     experiment = cell.experiment_id
-    if experiment in {"P0-02", "P0-06"}:
+    if experiment in {"P0-02", "P0-06", "P0-07"}:
         method = str(axes["method"])
         if "seed" in axes:
             updates["seed"] = int(axes["seed"])
@@ -260,7 +260,10 @@ def _train_command(
     ]
     if teacher_variant:
         argv.extend(["--teacher-variant", teacher_variant])
-    if cell.experiment_id in {"P0-06", "P0-07"} and axes.get("config") == "global":
+    if (
+        cell.experiment_id == "P0-07"
+        or (cell.experiment_id == "P0-06" and axes.get("config") == "global")
+    ):
         argv.append("--disable-dataset-overrides")
     return CommandSpec("train", tuple(argv), tuple(definition.completion_artifacts))
 

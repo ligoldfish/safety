@@ -40,7 +40,7 @@ class ModelMateAblationJobTests(unittest.TestCase):
             {
                 "core-train": 175,
                 "wjb": 90,
-                "fairness": 12,
+                "fairness": 24,
                 "evaluate": 31,
                 "analyze": 186,
                 "manual": 3,

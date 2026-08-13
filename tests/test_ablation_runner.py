@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -24,6 +25,7 @@ from src.ablations.runner import (
     phasef_updates_for_cell,
     validate_completion,
 )
+from tests.fairness_evidence import attach_validation_evidence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -142,7 +144,7 @@ class AblationCompileTests(unittest.TestCase):
             context = RunnerContext(ROOT, root / "state", "python", "npu", 0, asset_manifest=manifest)
             command = compile_cell_commands(
                 CATALOG,
-                _cell("P0-07", dataset="pan", config="global"),
+                _cell("P0-07", dataset="pan", config="global", method="ours"),
                 context,
             )[0]
         spec_arg = next(token for token in command.argv if token.startswith("--cell-spec="))
@@ -302,6 +304,109 @@ class AblationCompileTests(unittest.TestCase):
                     _cell("P0-06", config="override", curation="off", method=method)
                 )
                 self.assertEqual({key: updates[key] for key in subset}, subset)
+
+    def test_fairness_method_axis_changes_the_actual_phasef_objective(self) -> None:
+        expected = {
+            "sft1": {"target.mode": "semantic", "optim.layer_loss_weight": 0.0},
+            "random": {"target.mode": "random_same_norm", "optim.layer_loss_weight": 0.25},
+            "ours": {"target.mode": "semantic", "optim.layer_loss_weight": 0.25},
+        }
+        for method, subset in expected.items():
+            with self.subTest(method=method):
+                updates = phasef_updates_for_cell(
+                    _cell("P0-07", dataset="pan", config="global", method=method)
+                )
+                self.assertEqual({key: updates[key] for key in subset}, subset)
+
+    def test_fairness_cells_disable_implicit_dataset_overrides_for_both_policies(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ledger = root / "search.jsonl"
+            ledger.write_text("{}\n", encoding="utf-8")
+            manifest = root / "assets.json"
+            manifest.write_text(
+                json.dumps({"search_ledger": {"path": str(ledger), "kind": "file"}}),
+                encoding="utf-8",
+            )
+            context = RunnerContext(ROOT, root / "state", "python", "npu", 0, asset_manifest=manifest)
+            for dataset, config in (("pan", "global"), ("wildjailbreak", "validation_selected")):
+                with self.subTest(dataset=dataset, config=config):
+                    command = compile_cell_commands(
+                        CATALOG,
+                        _cell("P0-07", dataset=dataset, config=config, method="ours"),
+                        context,
+                    )[0]
+                    self.assertIn("--disable-dataset-overrides", command.argv)
+
+    def test_worker_applies_validation_selected_winner_before_staging(self) -> None:
+        path = ROOT / "scripts" / "30_run_ablation_cell.py"
+        spec = importlib.util.spec_from_file_location("ablation_fairness_worker_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "search.jsonl"
+            rows = []
+            for method in ("sft1", "random", "ours"):
+                rows.append(
+                    {
+                        "trial_id": f"{method}-winner",
+                        "dataset": "wildguardmix",
+                        "config": "validation_selected",
+                        "method": method,
+                        "selection_split": "validation",
+                        "selected": True,
+                        "validation_metric": 0.8,
+                        "hyperparameters": {
+                            "top_k": 7,
+                            "energy_threshold": 0.9,
+                            "rank_cap": 32,
+                            "layer_loss_weight": 0.0 if method == "sft1" else 0.5,
+                            "epochs": 3,
+                        },
+                    }
+                )
+            attach_validation_evidence(rows, Path(td))
+            ledger.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            ledger_hash = hashlib.sha256(ledger.read_bytes()).hexdigest()
+            args = SimpleNamespace(
+                experiment_id="P0-07",
+                cell_spec=json.dumps(
+                    {
+                        "experiment_id": "P0-07",
+                        "axes": {
+                            "dataset": "wildguardmix",
+                            "config": "validation_selected",
+                            "method": "ours",
+                        },
+                        "inputs": {"search_ledger": str(ledger)},
+                    }
+                ),
+                phase1_updates="{}",
+                phasef_updates=json.dumps(
+                    {"target.mode": "semantic", "optim.layer_loss_weight": 0.25}
+                ),
+                phase1_stage_extras="{}",
+            )
+            raw_spec, phase1_updates, phasef_updates, stage_extras = (
+                module._prepare_training_configuration(args)
+            )
+        self.assertEqual(phase1_updates, {})
+        self.assertEqual(phasef_updates["optim.layer_loss_weight"], 0.5)
+        self.assertEqual(phasef_updates["optim.epochs"], 3)
+        self.assertEqual(stage_extras["analyze"], ["--top-k", "7"])
+        self.assertEqual(
+            stage_extras["subspace"],
+            ["--energy-threshold", "0.9", "--rank-cap", "32"],
+        )
+        self.assertEqual(
+            raw_spec["fairness_configuration"]["selected_trial_id"],
+            "ours-winner",
+        )
+        self.assertEqual(
+            raw_spec["fairness_configuration"]["search_ledger_sha256"],
+            ledger_hash,
+        )
 
     def test_wildjailbreak_pair_axis_selects_every_declared_backend_pair(self) -> None:
         context = RunnerContext(ROOT, Path("/state"), "python", "npu", 0)
@@ -623,7 +728,7 @@ class AblationCompileTests(unittest.TestCase):
 
 class AblationRunnerStateTests(unittest.TestCase):
     def test_real_runner_blocks_before_execution_when_assets_are_missing(self) -> None:
-        cell = _cell("P0-07", dataset="pan", config="global")
+        cell = _cell("P0-07", dataset="pan", config="global", method="ours")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = root / "assets.json"

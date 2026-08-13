@@ -109,6 +109,7 @@ experiments:
     axes:
       dataset: [pan, safety_tuned_llamas, coconot, c5, wildjailbreak, wildguardmix]
       config: [global, validation_selected]
+      method: [sft1, random, ours]
     requires: [search_ledger]
     metrics: [search_count, training_budget, validation_metric]
     completion_artifacts: [search_ledger.jsonl, budget_summary.json]

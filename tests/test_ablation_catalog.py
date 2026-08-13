@@ -86,6 +86,13 @@ class AblationCatalogTests(unittest.TestCase):
         self.assertEqual(experiment.axes["method"], ("sft1", "random", "ours"))
         self.assertEqual(experiment.axes["seed"], (42, 43, 44))
 
+    def test_fairness_budget_compares_all_three_methods_on_both_config_policies(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        experiment = catalog.experiments["P0-07"]
+        self.assertEqual(experiment.axes["dataset"], catalog.formal_datasets)
+        self.assertEqual(experiment.axes["config"], ("global", "validation_selected"))
+        self.assertEqual(experiment.axes["method"], ("sft1", "random", "ours"))
+
     def test_mechanism_dataset_scopes_match_the_html_execution_tiers(self) -> None:
         catalog = load_catalog(CATALOG_PATH)
         main_table_components = ("pan", "wildguardmix", "wildjailbreak")

@@ -604,6 +604,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable WJB/WGM dataset-specific Phase1/PhaseF overrides for global-default fairness cells.",
     )
+    full_parser.add_argument(
+        "--skip-test-eval",
+        action="store_true",
+        help=(
+            "After PhaseF training, skip sanity/test evaluation and tables. Reserved for "
+            "validation-only fairness-search candidates; their saved validation generations "
+            "are judged separately and the formal winner is evaluated in P0-07."
+        ),
+    )
     add_common_flags(full_parser)
     return parser.parse_args()
 
@@ -1013,6 +1022,7 @@ def _run_phase1_precompute(
     analyze_extras: Sequence[str] | None = None,
     subspace_extras: Sequence[str] | None = None,
     stage_extras: Mapping[str, Sequence[str]] | None = None,
+    validation_only: bool = False,
 ) -> None:
     allowed_stages = {
         "extract", "extract_alignment", "analyze", "subspace", "pairing", "bridge",
@@ -1028,7 +1038,8 @@ def _run_phase1_precompute(
     if not skip_prepare:
         _run_script("00_prepare_data.py", ["--config", str(phase1_config)], dry_run=dry_run, env_overrides=env_overrides)
 
-    for split in PIPELINE_SPLITS:
+    active_splits = ("alignment", "analysis_val") if validation_only else PIPELINE_SPLITS
+    for split in active_splits:
         split_args = [
             "--config",
             str(phase1_config),
@@ -1094,7 +1105,7 @@ def _run_phase1_precompute(
         env_overrides=env_overrides,
     )
 
-    for split in PIPELINE_SPLITS:
+    for split in active_splits:
         _run_script(
             "06_project_teacher_safe_component.py",
             ["--config", str(phase1_config), "--split", split, *normalized_stage_extras.get("project", ())],
@@ -1486,6 +1497,7 @@ def _run_safety_full(
     stage_extras: Mapping[str, Sequence[str]] | None = None,
     cell_id: str = "",
     disable_dataset_overrides: bool = False,
+    skip_test_eval: bool = False,
 ) -> None:
     _validate_device_request(num_devices)
     if smoke:
@@ -1501,12 +1513,6 @@ def _run_safety_full(
         )
     sft_safety_config = _make_runtime_override_config(
         _resolve(SAFETY_SFT_CONFIGS[config_key]),
-        device=device,
-        device_id=device_id,
-    )
-    eval_config_src = _resolve(_safety_eval_config(device, "0.8b", baseline_name))
-    eval_config = _make_runtime_override_config(
-        eval_config_src,
         device=device,
         device_id=device_id,
     )
@@ -1552,6 +1558,7 @@ def _run_safety_full(
             str(pan_processed_dir),
             "--harmless-source",
             "auto",
+            *(["--validation-only"] if skip_test_eval else []),
         ],
         dry_run=dry_run,
         env_overrides=env_overrides,
@@ -1607,6 +1614,7 @@ def _run_safety_full(
         analyze_extras=merged_analyze_extras,
         subspace_extras=merged_subspace_extras,
         stage_extras=stage_extras,
+        validation_only=skip_test_eval,
     )
 
     # 5) PhaseF training.
@@ -1617,37 +1625,39 @@ def _run_safety_full(
         env_overrides=env_overrides,
     )
 
-    # 6) Sanity eval + tables (still PAN-comparable; uses safety processed_dir).
-    _run_script(
-        "10_sanity_eval.py",
-        ["--config", str(phase1_override)],
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-    )
-    _run_script(
-        "11_make_tables.py",
-        ["--config", str(phase1_override)],
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-    )
+    if not skip_test_eval:
+        eval_config_src = _resolve(_safety_eval_config(device, "0.8b", baseline_name))
+        # 6) Sanity eval + tables (still PAN-comparable; uses safety processed_dir).
+        _run_script(
+            "10_sanity_eval.py",
+            ["--config", str(phase1_override)],
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
+        _run_script(
+            "11_make_tables.py",
+            ["--config", str(phase1_override)],
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
 
-    # 7) PAN safety eval + OpenCompass general eval against every epoch checkpoint.
-    phasef_cfg = load_phasef_config(phasef_override)
-    _run_adapter_eval(
-        device=device,
-        model_size="0.8b",
-        training_output_root=safety_phasef_output_root,
-        epochs=int(phasef_cfg.optim.epochs),
-        device_id=device_id,
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-        opencompass_dir=opencompass_dir,
-        opencompass_datasets=opencompass_datasets,
-        skip_opencompass=skip_opencompass,
-        enable_opencompass=enable_opencompass,
-        safety_eval_datasets=safety_eval_datasets,
-        eval_config_path=str(eval_config_src),
-    )
+        # 7) Test evaluation belongs only to the formal result cell, never a selector.
+        phasef_cfg = load_phasef_config(phasef_override)
+        _run_adapter_eval(
+            device=device,
+            model_size="0.8b",
+            training_output_root=safety_phasef_output_root,
+            epochs=int(phasef_cfg.optim.epochs),
+            device_id=device_id,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+            opencompass_dir=opencompass_dir,
+            opencompass_datasets=opencompass_datasets,
+            skip_opencompass=skip_opencompass,
+            enable_opencompass=enable_opencompass,
+            safety_eval_datasets=safety_eval_datasets,
+            eval_config_path=str(eval_config_src),
+        )
 
 
 def _run_safety_distill(
@@ -2966,6 +2976,7 @@ def main() -> None:
                 stage_extras=stage_extras,
                 cell_id=getattr(args, "cell_id", "") or "",
                 disable_dataset_overrides=bool(getattr(args, "disable_dataset_overrides", False)),
+                skip_test_eval=bool(getattr(args, "skip_test_eval", False)),
                 **oc_kwargs,
             )
             return

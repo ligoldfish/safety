@@ -31,6 +31,35 @@ def _json_list(value: str, label: str) -> list[str]:
     return payload
 
 
+def _merge_stage_extras(base: dict, override: dict) -> dict[str, list[str]]:
+    merged = {str(stage): list(tokens) for stage, tokens in base.items()}
+    for stage, tokens in override.items():
+        if not isinstance(tokens, list) or not all(isinstance(token, str) for token in tokens):
+            raise ValueError(f"phase extras for {stage} must be a JSON list of strings")
+        merged[str(stage)] = list(tokens)
+    return merged
+
+
+def _prepare_training_configuration(args) -> tuple[dict, dict, dict, dict]:
+    raw_spec = _json_mapping(args.cell_spec, "--cell-spec")
+    raw_spec.setdefault("experiment_id", args.experiment_id)
+    phase1_updates = _json_mapping(args.phase1_updates, "--phase1-updates")
+    phasef_updates = _json_mapping(args.phasef_updates, "--phasef-updates")
+    stage_extras = _json_mapping(args.phase1_stage_extras, "--phase1-stage-extras")
+    if args.experiment_id == "P0-07":
+        from src.ablations.fairness import resolve_fairness_configuration
+
+        fairness = resolve_fairness_configuration(raw_spec)
+        phasef_updates.update(fairness.phasef_updates)
+        stage_extras = _merge_stage_extras(stage_extras, fairness.phase1_stage_extras)
+        raw_spec["fairness_configuration"] = {
+            "hyperparameters": fairness.hyperparameters,
+            "selected_trial_id": fairness.selected_trial_id,
+            "search_ledger_sha256": fairness.search_ledger_sha256,
+        }
+    return raw_spec, phase1_updates, phasef_updates, stage_extras
+
+
 def _set_dotted(payload: dict, dotted: str, value) -> None:
     node = payload
     parts = str(dotted).split(".")
@@ -128,6 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phasef-updates", default="{}")
     parser.add_argument("--phase1-stage-extras", default="{}")
     parser.add_argument("--disable-dataset-overrides", action="store_true")
+    parser.add_argument("--skip-test-eval", action="store_true")
     parser.add_argument("--teacher-variant", default="")
     return parser.parse_args()
 
@@ -177,11 +207,10 @@ def main() -> int:
             return int(result.returncode)
         collect_evaluation_result(args.evaluation_handler, cell_spec, Path(args.output_dir))
         return 0
-    phase1_path, phasef_path = _stage_configs(
-        args,
-        _json_mapping(args.phase1_updates, "--phase1-updates"),
-        _json_mapping(args.phasef_updates, "--phasef-updates"),
+    raw_spec, phase1_updates, phasef_updates, stage_extras = (
+        _prepare_training_configuration(args)
     )
+    phase1_path, phasef_path = _stage_configs(args, phase1_updates, phasef_updates)
     command = [
         sys.executable,
         str(PROJECT_ROOT / "scripts" / "15_run_oneclick.py"),
@@ -198,12 +227,14 @@ def main() -> int:
         str(phase1_path),
         "--phasef-config",
         str(phasef_path),
-        "--phase1-stage-extras=" + json.dumps(_json_mapping(args.phase1_stage_extras, "--phase1-stage-extras")),
+        "--phase1-stage-extras=" + json.dumps(stage_extras),
         "--cell-id",
         args.cell_id,
     ]
     if args.disable_dataset_overrides:
         command.append("--disable-dataset-overrides")
+    if args.skip_test_eval:
+        command.append("--skip-test-eval")
     result = subprocess.run(
         command,
         cwd=str(PROJECT_ROOT),
@@ -212,8 +243,6 @@ def main() -> int:
     )
     if result.returncode:
         return int(result.returncode)
-    raw_spec = _json_mapping(args.cell_spec, "--cell-spec")
-    raw_spec.setdefault("experiment_id", args.experiment_id)
     if args.experiment_id == "P0-06":
         from src.ablations.wjb_failure import prepare_failure_evaluations
 

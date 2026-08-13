@@ -41,13 +41,27 @@ class AblationPlannerTests(unittest.TestCase):
         p006 = [cell for cell in plan.cells if cell.experiment_id == "P0-06"]
         self.assertEqual(len(p006), 90)
         self.assertEqual({cell.axes["pair"] for cell in p006}, set(catalog.formal_pairs))
-        self.assertEqual(len(plan.cells), 497)
+        p007 = [cell for cell in plan.cells if cell.experiment_id == "P0-07"]
+        self.assertEqual(len(p007), 24)
+        self.assertEqual({cell.axes["method"] for cell in p007}, {"sft1", "random", "ours"})
+        global_cells = [cell for cell in p007 if cell.axes["config"] == "global"]
+        selected_cells = [
+            cell for cell in p007 if cell.axes["config"] == "validation_selected"
+        ]
+        self.assertEqual(len(global_cells), 18)
+        self.assertEqual({cell.axes["dataset"] for cell in global_cells}, set(catalog.formal_datasets))
+        self.assertEqual(len(selected_cells), 6)
+        self.assertEqual(
+            {cell.axes["dataset"] for cell in selected_cells},
+            {"wildjailbreak", "wildguardmix"},
+        )
+        self.assertEqual(len(plan.cells), 509)
         counts = {kind.value: 0 for kind in {item.execution_kind for item in catalog.experiments.values()}}
         for cell in plan.cells:
             counts[catalog.experiments[cell.experiment_id].execution_kind.value] += 1
         self.assertEqual(
             counts,
-            {"train": 277, "evaluate": 31, "analyze": 186, "manual": 3},
+            {"train": 289, "evaluate": 31, "analyze": 186, "manual": 3},
         )
 
     def test_main_table_is_exactly_150_unique_cells(self) -> None:

@@ -32,6 +32,7 @@ from src.training import (
     write_val_metrics,
 )
 from src.ablations.strategies.targets import permute_target_map
+from src.training.trainer_phase1 import count_nonpadding_tokens
 from src.utils.config import load_phasef_config
 from src.utils.io import ensure_dir, write_json
 from src.utils.logging import log_kv, setup_stage_logger
@@ -370,6 +371,7 @@ def main() -> None:
 
     val_metrics = {}
     global_step = 0
+    training_tokens_seen = 0
     best_val_loss = float("inf")
     best_epoch = 0
     epochs_since_improve = 0
@@ -387,6 +389,7 @@ def main() -> None:
             "active_layer_weight_sum": 0.0,
         }
         for batch_idx, batch in enumerate(train_loader, start=1):
+            training_tokens_seen += count_nonpadding_tokens(batch.attention_mask)
             loss_total, metrics = forward_semalign_batch(
                 model,
                 batch,
@@ -589,6 +592,8 @@ def main() -> None:
             "early_stopping_patience": int(getattr(cfg.optim, "early_stopping_patience", 0) or 0),
             "best_epoch": best_epoch,
             "epochs_completed": epoch,
+            "optimizer_steps": global_step,
+            "training_tokens_seen": training_tokens_seen,
             "train_num_samples": len(train_dataset),
             "train_max_samples_per_label": cfg.inputs.max_samples_per_label,
             "val_num_samples": len(val_dataset),

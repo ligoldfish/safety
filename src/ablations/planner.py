@@ -68,6 +68,15 @@ def _expand_axes(axes: Mapping[str, tuple[Any, ...]]) -> Iterable[dict[str, Any]
 def _valid_declared_cell(experiment_id: str, axes: Mapping[str, Any]) -> bool:
     """Apply the correlated-axis constraints stated in the experiment design."""
 
+    if experiment_id == "P0-07":
+        # The preregistered fixed policy runs on every formal corpus. Only the
+        # two corpora with historical per-dataset overrides receive the
+        # validation-selected comparison; expanding this to the other four
+        # would add unplanned tuning runs and change the fairness budget.
+        return (
+            str(axes.get("config")) == "global"
+            or str(axes.get("dataset")) in {"wildjailbreak", "wildguardmix"}
+        )
     if experiment_id == "P1-05":
         # selected/evenly/last are deterministic single cells; only random-K
         # has the five independent draws required by the design.

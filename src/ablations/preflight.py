@@ -397,50 +397,10 @@ def _validate_checkpoint_registry(requirement: AssetRequirement) -> PreflightIss
 
 
 def _validate_search_ledger(requirement: AssetRequirement) -> PreflightIssue | None:
-    required = {
-        "trial_id",
-        "dataset",
-        "config",
-        "method",
-        "selection_split",
-        "selected",
-        "validation_metric",
-    }
     try:
-        rows = _read_jsonl_objects(requirement.path)
-        groups: dict[tuple[str, str], list[dict]] = {}
-        trial_ids: set[str] = set()
-        for row in rows:
-            if not required <= set(row):
-                raise ValueError("trial provenance fields are missing")
-            trial_id = str(row["trial_id"]).strip()
-            dataset = str(row["dataset"]).strip()
-            config = str(row["config"]).strip()
-            method = str(row["method"]).strip()
-            if not all((trial_id, dataset, config, method)) or trial_id in trial_ids:
-                raise ValueError("trial identity is empty or duplicated")
-            trial_ids.add(trial_id)
-            if str(row["selection_split"]) != "validation":
-                raise ValueError("model selection did not use validation")
-            metric = row["validation_metric"]
-            if type(metric) not in {int, float} or not math.isfinite(float(metric)):
-                raise ValueError("validation metric is not finite")
-            if type(row["selected"]) is not bool:
-                raise ValueError("selected flag is not boolean")
-            groups.setdefault((dataset, config), []).append(row)
-        for (_, config), group in groups.items():
-            counts: dict[str, int] = {}
-            selected: dict[str, int] = {}
-            for row in group:
-                method = str(row["method"])
-                counts[method] = counts.get(method, 0) + 1
-                selected[method] = selected.get(method, 0) + int(row["selected"])
-            if len(counts) < 2 or len(set(counts.values())) != 1:
-                raise ValueError("search budgets differ across methods")
-            if config == "validation_selected" and any(
-                selected.get(method, 0) != 1 for method in counts
-            ):
-                raise ValueError("validation_selected lacks one winner per method")
+        from src.ablations.fairness import load_search_ledger_snapshot
+
+        rows, _ = load_search_ledger_snapshot(requirement.path)
         selectors = dict(requirement.selectors)
         requested = {
             key: value
@@ -456,8 +416,8 @@ def _validate_search_ledger(requirement: AssetRequirement) -> PreflightIssue | N
         return _issue(
             requirement,
             "SEARCH_LEDGER_INVALID",
-            "search ledger is malformed, leaks test selection, or uses unequal budgets",
-            "export validation-only trials with equal search counts for every method",
+            "search ledger is malformed, leaks test selection, has unsafe winners, or uses unequal budgets",
+            "export validation-only trials with equal counts and executable winner hyperparameters for sft1/random/ours",
         )
     return None
 

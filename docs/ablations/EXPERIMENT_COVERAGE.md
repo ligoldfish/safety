@@ -1,6 +1,6 @@
 # 实验覆盖清单
 
-当前 catalog 覆盖 HTML 的 35/35 项，主表精确 150 单元，全计划 497 单元，其中 277 train、
+当前 catalog 覆盖 HTML 的 35/35 项，主表精确 150 单元，全计划 509 单元，其中 289 train、
 31 evaluate、186 analyze、3 manual。下表是代码 handler 与完成产物的审查索引；具体轴值以
 `configs/ablations/catalog.yaml` 为唯一事实源。
 
