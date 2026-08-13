@@ -22,6 +22,7 @@ class AssetRequirement:
     kind: str
     cell_id: str = ""
     min_free_bytes: int = 0
+    selectors: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,7 @@ def requirements_from_manifest(
     *,
     cell_id: str,
     base_dir: str | Path | None = None,
+    selectors: Mapping[str, object] | None = None,
 ) -> tuple[list[AssetRequirement], tuple[str, ...]]:
     """Translate only explicitly declared cell requirements into checks."""
 
@@ -141,11 +143,39 @@ def requirements_from_manifest(
             raise ValueError(f"asset {asset_id} path must be non-empty")
         if kind not in {"file", "directory", "model"}:
             raise ValueError(f"asset {asset_id} has unsupported kind: {kind}")
-        path = Path(path_text).expanduser()
+        path = Path(_expand_manifest_path(path_text)).expanduser()
         if not path.is_absolute() and base_dir is not None:
             path = Path(base_dir) / path
-        requirements.append(AssetRequirement(asset_id, path.resolve(), kind, cell_id))
+        normalized_selectors = tuple(
+            sorted((str(key), str(value)) for key, value in dict(selectors or {}).items())
+        )
+        requirements.append(
+            AssetRequirement(
+                asset_id,
+                path.resolve(),
+                kind,
+                cell_id,
+                selectors=normalized_selectors,
+            )
+        )
     return requirements, tuple(missing)
+
+
+def _expand_manifest_path(value: str) -> str:
+    """Expand only documented, non-secret platform root variables."""
+
+    result = str(value)
+    for name in ("SAFETY_MODEL_ROOT", "SAFETY_DATA_ROOT", "SAFETY_OUTPUT_ROOT"):
+        marker = "${" + name + "}"
+        if marker not in result:
+            continue
+        replacement = str(os.environ.get(name, "")).strip()
+        if not replacement:
+            raise ValueError(f"asset path requires environment variable {name}")
+        result = result.replace(marker, replacement)
+    if "${" in result:
+        raise ValueError("asset path contains an unsupported environment variable")
+    return result
 
 
 def _cell_id(asset_id: str, path: Path, explicit: str = "") -> str:
@@ -234,6 +264,18 @@ def _validate_checkpoint_registry(requirement: AssetRequirement) -> PreflightIss
                     raise ValueError("adapter artifact is empty")
             else:
                 raise ValueError("unsupported checkpoint kind")
+        selectors = dict(requirement.selectors)
+        if selectors:
+            comparable = {
+                key: value
+                for key, value in selectors.items()
+                if key in {"pair", "train_corpus", "method"}
+            }
+            if comparable and not any(
+                all(str(row.get(key, "")) == value for key, value in comparable.items())
+                for row in rows
+            ):
+                raise ValueError("checkpoint registry lacks the requested cell")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return _issue(
             requirement,
@@ -289,6 +331,17 @@ def _validate_search_ledger(requirement: AssetRequirement) -> PreflightIssue | N
                 selected.get(method, 0) != 1 for method in counts
             ):
                 raise ValueError("validation_selected lacks one winner per method")
+        selectors = dict(requirement.selectors)
+        requested = {
+            key: value
+            for key, value in selectors.items()
+            if key in {"dataset", "config", "method"}
+        }
+        if requested and not any(
+            all(str(row.get(key, "")) == value for key, value in requested.items())
+            for row in rows
+        ):
+            raise ValueError("search ledger lacks the requested cell")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return _issue(
             requirement,
@@ -299,11 +352,61 @@ def _validate_search_ledger(requirement: AssetRequirement) -> PreflightIssue | N
     return None
 
 
+def _validate_model_registry(requirement: AssetRequirement) -> PreflightIssue | None:
+    required = {
+        "cell_id",
+        "pair",
+        "dataset",
+        "method",
+        "model_hash",
+        "dataset_hash",
+        "config_hash",
+        "checkpoint_hash",
+        "commit",
+    }
+    try:
+        rows = _read_jsonl_objects(requirement.path)
+        identities: set[tuple[str, str, str]] = set()
+        cell_ids: set[str] = set()
+        for row in rows:
+            if not required <= set(row):
+                raise ValueError("provenance fields are missing")
+            values = {key: str(row[key]).strip() for key in required}
+            if any(not value or "REPLACE_ME" in value for value in values.values()):
+                raise ValueError("provenance field is empty or placeholder")
+            identity = (values["pair"], values["dataset"], values["method"])
+            if identity in identities or values["cell_id"] in cell_ids:
+                raise ValueError("provenance identity is duplicated")
+            identities.add(identity)
+            cell_ids.add(values["cell_id"])
+        selectors = dict(requirement.selectors)
+        requested = {
+            key: value
+            for key, value in selectors.items()
+            if key in {"pair", "dataset", "method"}
+        }
+        if requested and not any(
+            all(str(row.get(key, "")) == value for key, value in requested.items())
+            for row in rows
+        ):
+            raise ValueError("model registry lacks the requested cell")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _issue(
+            requirement,
+            "MODEL_REGISTRY_INVALID",
+            "main-table registry is malformed, duplicated, or contains placeholders",
+            "export one immutable provenance row for every completed pair/dataset/method cell",
+        )
+    return None
+
+
 def _validate_structured_asset(requirement: AssetRequirement) -> PreflightIssue | None:
     if requirement.asset_id == "checkpoint_registry":
         return _validate_checkpoint_registry(requirement)
     if requirement.asset_id == "search_ledger":
         return _validate_search_ledger(requirement)
+    if requirement.asset_id == "model_registry":
+        return _validate_model_registry(requirement)
     return None
 
 

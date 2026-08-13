@@ -101,14 +101,33 @@ class AblationCliTests(unittest.TestCase):
                 self._run("plan", "--scope", "main-table", "--output", str(plan_path)).returncode,
                 0,
             )
-            (root / "model-registry").mkdir()
-            (root / "dataset-registry").mkdir()
+            plan_rows = [
+                json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines()
+            ]
+            model_registry = root / "model-registry.jsonl"
+            model_registry.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "cell_id": row["cell_id"],
+                            **row["axes"],
+                            "model_hash": "a" * 64,
+                            "dataset_hash": "b" * 64,
+                            "config_hash": "c" * 64,
+                            "checkpoint_hash": f"{index:064x}",
+                            "commit": "e" * 40,
+                        }
+                    )
+                    + "\n"
+                    for index, row in enumerate(plan_rows, 1)
+                ),
+                encoding="utf-8",
+            )
             manifest = root / "assets.json"
             manifest.write_text(
                 json.dumps(
                     {
-                        "model_registry": {"path": "model-registry", "kind": "directory"},
-                        "dataset_registry": {"path": "dataset-registry", "kind": "directory"},
+                        "model_registry": {"path": "model-registry.jsonl", "kind": "file"},
                     }
                 ),
                 encoding="utf-8",
@@ -146,7 +165,7 @@ class AblationCliTests(unittest.TestCase):
         self.assertEqual(payload["status"], "BLOCKED")
         self.assertEqual(
             {issue["asset_id"] for issue in payload["issues"]},
-            {"model_registry", "dataset_registry"},
+            {"model_registry"},
         )
 
     def test_bounded_shard_dry_run_is_stable_and_status_is_readable(self) -> None:

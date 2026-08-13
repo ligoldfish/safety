@@ -62,6 +62,23 @@ class AblationCatalogTests(unittest.TestCase):
         self.assertIn("trained_checkpoints", catalog.experiments["P1-19"].requires)
         self.assertIn("trained_checkpoints", catalog.experiments["P2-05"].requires)
 
+    def test_main_table_provenance_uses_registry_rows_with_dataset_hashes(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        self.assertEqual(catalog.experiments["P0-01"].requires, ("model_registry",))
+        self.assertEqual(
+            catalog.experiments["P2-07"].requires,
+            ("dataset_registry", "split_manifests"),
+        )
+
+    def test_wildjailbreak_failure_boundary_covers_all_formal_model_pairs(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        experiment = catalog.experiments["P0-06"]
+        self.assertEqual(experiment.axes["pair"], catalog.formal_pairs)
+        self.assertEqual(
+            experiment.requires,
+            ("common_test", "wildguard_model"),
+        )
+
     def test_duplicate_ids_are_rejected(self) -> None:
         raw = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
         raw["experiments"].append(dict(raw["experiments"][0]))

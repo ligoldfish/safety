@@ -215,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
                     manifest,
                     cell_id=cell.cell_id,
                     base_dir=manifest_path.parent,
+                    selectors={**dict(cell.overrides), **dict(cell.axes)},
                 )
                 requirements.extend(cell_requirements)
                 missing_issues.extend(

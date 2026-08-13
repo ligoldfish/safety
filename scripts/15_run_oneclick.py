@@ -1230,13 +1230,21 @@ def _invoke_phase1_curation(
     """
 
     teacher_path, teacher_runtime = _read_phase1_teacher(phase1_yaml)
+    raw_phase1 = yaml.safe_load(Path(phase1_yaml).read_text(encoding="utf-8")) or {}
+    requested_mode = str(
+        ((raw_phase1.get("dataset") or {}).get("curation_mode") or "auto")
+        if isinstance(raw_phase1, dict)
+        else "auto"
+    ).strip().lower()
+    if requested_mode not in {"auto", "off", "minimal", "strict"}:
+        raise ValueError(f"invalid Phase1 dataset.curation_mode: {requested_mode!r}")
     curate_args = [
         "--baseline",
         baseline_name,
         "--processed-dir",
         str(processed_dir),
         "--mode",
-        "auto",
+        requested_mode,
         "--force-rebuild",
     ]
     if teacher_path:
@@ -1416,13 +1424,6 @@ def _resolve_safety_full_roots(
     configs keep their historical per-baseline naming.
     """
 
-    safety_processed_dir = Path(
-        resolve_portable_path(
-            str(PROJECT_ROOT / "data" / "processed" / f"safety_full_{baseline_name}"),
-            PROJECT_ROOT,
-            category="data",
-        )
-    ).resolve()
     pan_processed_dir = Path(
         resolve_portable_path(
             str(PROJECT_ROOT / "data" / "processed"),
@@ -1433,6 +1434,10 @@ def _resolve_safety_full_roots(
 
     if phase1_config_path:
         phase1_root = _configured_output_root(phase1_config_path, "extraction")
+        # Derived split/curation files are mutable cell outputs. Keeping them
+        # beside the cell-owned Phase1 root prevents concurrent ablation jobs
+        # from overwriting one shared safety_full_<dataset> directory.
+        safety_processed_dir = (phase1_root.parent / "processed").resolve()
     else:
         cell_suffix = f"_{cell_id}" if cell_id else ""
         legacy = (
@@ -1443,6 +1448,13 @@ def _resolve_safety_full_roots(
         )
         phase1_root = Path(
             resolve_portable_path(str(legacy), PROJECT_ROOT, category="output")
+        ).resolve()
+        safety_processed_dir = Path(
+            resolve_portable_path(
+                str(PROJECT_ROOT / "data" / "processed" / f"safety_full_{baseline_name}"),
+                PROJECT_ROOT,
+                category="data",
+            )
         ).resolve()
 
     phasef_root = (

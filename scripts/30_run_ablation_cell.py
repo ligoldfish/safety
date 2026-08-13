@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.ablations.platform import resolve_portable_path
+from src.pairs import apply_tokens
 
 
 def _json_mapping(value: str, label: str) -> dict:
@@ -202,10 +203,52 @@ def main() -> int:
     )
     if result.returncode:
         return int(result.returncode)
-    from src.ablations.completion import collect_training_contract
-
     raw_spec = _json_mapping(args.cell_spec, "--cell-spec")
     raw_spec.setdefault("experiment_id", args.experiment_id)
+    if args.experiment_id == "P0-06":
+        from src.ablations.wjb_failure import prepare_failure_evaluations
+
+        phase1_root = (Path(args.output_dir) / "pipeline" / "phase1").resolve()
+        processed = (phase1_root.parent / "processed").resolve()
+        target_config = PROJECT_ROOT / "configs" / apply_tokens(
+            f"baseline_eval_qwen35_08b_wildjailbreak_{args.device}.yaml",
+            args.pair,
+        )
+        target_payload = yaml.safe_load(target_config.read_text(encoding="utf-8")) or {}
+        target_path_text = str(
+            (((target_payload.get("datasets") or {}).get("pan") or {}).get("path") or "")
+        )
+        if not target_path_text:
+            raise ValueError(f"pair evaluation config lacks datasets.pan.path: {target_config}")
+        target_test_jsonl = resolve_portable_path(
+            target_path_text,
+            target_config.parent,
+            category="data",
+        )
+        failure_plan = prepare_failure_evaluations(
+            raw_spec,
+            phase1_root=phase1_root,
+            phasef_config=phasef_path,
+            project_root=PROJECT_ROOT,
+            python_executable=sys.executable,
+            device=args.device,
+            device_id=args.device_id,
+            target_test_jsonl=target_test_jsonl,
+            training_jsonl=processed / "train_set.jsonl",
+            curation_summary=processed / "curation_summary.json",
+        )
+        for evaluation_command in failure_plan.commands:
+            completed = subprocess.run(
+                list(evaluation_command),
+                cwd=str(PROJECT_ROOT),
+                check=False,
+                env=_training_environment(args),
+            )
+            if completed.returncode:
+                return int(completed.returncode)
+
+    from src.ablations.completion import collect_training_contract
+
     collect_training_contract(
         Path(args.output_dir),
         required,

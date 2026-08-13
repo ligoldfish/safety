@@ -13,7 +13,12 @@ from .artifacts import canonical_hash, sha256_file
 from .efficiency import StageProfiler
 from .ledger import ExperimentLedger, LedgerError, RunState
 from .schema import ExecutionKind, ExperimentCatalog, ExperimentCell
-from .preflight import requirements_from_manifest, run_preflight, training_model_requirements
+from .preflight import (
+    _expand_manifest_path,
+    requirements_from_manifest,
+    run_preflight,
+    training_model_requirements,
+)
 
 
 class RunnerError(RuntimeError):
@@ -202,7 +207,9 @@ def _train_command(
         if requirement not in assets:
             continue
         raw = assets[requirement]
-        path_text = str(raw.get("path", "")) if isinstance(raw, Mapping) else str(raw)
+        path_text = _expand_manifest_path(
+            str(raw.get("path", "")) if isinstance(raw, Mapping) else str(raw)
+        )
         path = Path(path_text).expanduser()
         if not path.is_absolute() and context.asset_manifest is not None:
             path = context.asset_manifest.parent / path
@@ -275,7 +282,9 @@ def _worker_command(definition, cell: ExperimentCell, context: RunnerContext) ->
     for requirement in definition.requires:
         if requirement in assets:
             raw = assets[requirement]
-            path_text = str(raw.get("path", "")) if isinstance(raw, Mapping) else str(raw)
+            path_text = _expand_manifest_path(
+                str(raw.get("path", "")) if isinstance(raw, Mapping) else str(raw)
+            )
             path = Path(path_text).expanduser()
             if not path.is_absolute() and context.asset_manifest is not None:
                 path = context.asset_manifest.parent / path
@@ -463,6 +472,7 @@ class AblationRunner:
                     manifest,
                     cell_id=cell.cell_id,
                     base_dir=self.context.asset_manifest.parent,
+                    selectors={**dict(cell.overrides), **dict(cell.axes)},
                 )
                 if missing:
                     return ledger.transition(

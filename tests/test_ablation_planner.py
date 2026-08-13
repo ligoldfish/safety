@@ -38,6 +38,17 @@ class AblationPlannerTests(unittest.TestCase):
         self.assertTrue(
             all(cell.axes["rank_cap"] == 32 or cell.axes["energy_threshold"] == 0.8 for cell in p115)
         )
+        p006 = [cell for cell in plan.cells if cell.experiment_id == "P0-06"]
+        self.assertEqual(len(p006), 90)
+        self.assertEqual({cell.axes["pair"] for cell in p006}, set(catalog.formal_pairs))
+        self.assertEqual(len(plan.cells), 424)
+        counts = {kind.value: 0 for kind in {item.execution_kind for item in catalog.experiments.values()}}
+        for cell in plan.cells:
+            counts[catalog.experiments[cell.experiment_id].execution_kind.value] += 1
+        self.assertEqual(
+            counts,
+            {"train": 204, "evaluate": 31, "analyze": 186, "manual": 3},
+        )
 
     def test_main_table_is_exactly_150_unique_cells(self) -> None:
         plan = build_main_table_plan(load_catalog(CATALOG_PATH), output_root="/persistent/outputs")

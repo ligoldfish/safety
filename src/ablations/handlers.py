@@ -25,7 +25,7 @@ class HandlerContract:
 
 
 _INPUTS = {
-    "provenance_matrix": ("model_registry", "dataset_registry"),
+    "provenance_matrix": ("model_registry",),
     "matched_controls": ("phase1_data", "phasef_data"),
     "judge_agreement_audit": ("wildguard_model", "human_annotations"),
     "seed_and_paired_bootstrap": ("aligned_sample_predictions",),

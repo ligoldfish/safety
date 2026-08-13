@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from src.ablations.preflight import (
     AssetRequirement,
@@ -160,6 +161,78 @@ class AblationPreflightTests(unittest.TestCase):
         self.assertEqual(report.status, "BLOCKED")
         self.assertIn("SEARCH_LEDGER_INVALID", {issue.code for issue in report.issues})
 
+    def test_model_registry_rejects_placeholder_or_missing_provenance(self) -> None:
+        required = {
+            "cell_id": "abc",
+            "pair": "qwen35_9b_to_08b",
+            "dataset": "pan",
+            "method": "ours",
+            "model_hash": "a" * 64,
+            "dataset_hash": "b" * 64,
+            "config_hash": "c" * 64,
+            "checkpoint_hash": "d" * 64,
+            "commit": "e" * 40,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            registry = Path(td) / "models.jsonl"
+            registry.write_text(json.dumps(required) + "\n", encoding="utf-8")
+            ready = run_preflight(
+                [AssetRequirement("model_registry", registry, "file", "p0-01")]
+            )
+            registry.write_text(
+                json.dumps({**required, "checkpoint_hash": "REPLACE_ME"}) + "\n",
+                encoding="utf-8",
+            )
+            blocked = run_preflight(
+                [AssetRequirement("model_registry", registry, "file", "p0-01")]
+            )
+        self.assertEqual(ready.status, "READY")
+        self.assertEqual(blocked.status, "BLOCKED")
+        self.assertIn("MODEL_REGISTRY_INVALID", {issue.code for issue in blocked.issues})
+
+    def test_structured_registry_preflight_is_scoped_to_the_requesting_cell_axes(self) -> None:
+        provenance = {
+            "cell_id": "abc",
+            "pair": "qwen35_9b_to_08b",
+            "dataset": "pan",
+            "method": "ours",
+            "model_hash": "a" * 64,
+            "dataset_hash": "b" * 64,
+            "config_hash": "c" * 64,
+            "checkpoint_hash": "d" * 64,
+            "commit": "e" * 40,
+        }
+        search_rows = [
+            {"trial_id": "a1", "dataset": "pan", "config": "global", "method": "ours", "selection_split": "validation", "selected": False, "validation_metric": 0.8},
+            {"trial_id": "b1", "dataset": "pan", "config": "global", "method": "sft", "selection_split": "validation", "selected": False, "validation_metric": 0.7},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model_registry = root / "models.jsonl"
+            model_registry.write_text(json.dumps(provenance) + "\n", encoding="utf-8")
+            search_ledger = root / "search.jsonl"
+            search_ledger.write_text(
+                "".join(json.dumps(row) + "\n" for row in search_rows), encoding="utf-8"
+            )
+            model_requirements, _ = requirements_from_manifest(
+                ["model_registry"],
+                {"model_registry": {"path": str(model_registry), "kind": "file"}},
+                cell_id="missing-model-cell",
+                selectors={"pair": "llama31_8b_to_1b", "dataset": "pan", "method": "ours"},
+            )
+            search_requirements, _ = requirements_from_manifest(
+                ["search_ledger"],
+                {"search_ledger": {"path": str(search_ledger), "kind": "file"}},
+                cell_id="missing-search-cell",
+                selectors={"dataset": "c5", "config": "global"},
+            )
+            model_report = run_preflight(model_requirements)
+            search_report = run_preflight(search_requirements)
+        self.assertEqual(model_report.status, "BLOCKED")
+        self.assertEqual(search_report.status, "BLOCKED")
+        self.assertIn("MODEL_REGISTRY_INVALID", {issue.code for issue in model_report.issues})
+        self.assertIn("SEARCH_LEDGER_INVALID", {issue.code for issue in search_report.issues})
+
     def test_manifest_requirements_are_exact_and_support_explicit_kinds(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -198,6 +271,25 @@ class AblationPreflightTests(unittest.TestCase):
         self.assertEqual(missing, ())
         self.assertEqual(report.status, "READY")
         self.assertEqual(requirements[0].path, (root / "assets" / "phasef").resolve())
+
+    def test_manifest_expands_only_declared_platform_root_environment_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "processed").mkdir()
+            with patch.dict("os.environ", {"SAFETY_DATA_ROOT": str(root)}, clear=False):
+                requirements, missing = requirements_from_manifest(
+                    ["phase1_data"],
+                    {
+                        "phase1_data": {
+                            "path": "${SAFETY_DATA_ROOT}/processed",
+                            "kind": "directory",
+                        }
+                    },
+                    cell_id="cell-env",
+                    base_dir=root / "manifest-dir",
+                )
+        self.assertEqual(missing, ())
+        self.assertEqual(requirements[0].path, (root / "processed").resolve())
 
     def test_manifest_rejects_unknown_kind_and_non_path_payload(self) -> None:
         with self.assertRaisesRegex(ValueError, "kind"):

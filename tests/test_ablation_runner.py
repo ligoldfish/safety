@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import yaml
+
 from src.ablations.benchmarks import BenchmarkRequest, DecodeConfig, preflight_benchmark
 from src.ablations.catalog import load_catalog
 from src.ablations.planner import build_catalog_plan
@@ -67,6 +69,41 @@ class AblationCompileTests(unittest.TestCase):
             command = compile_cell_commands(CATALOG, _cell("P0-04", seed=42), context)[0]
         spec = json.loads(next(x for x in command.argv if x.startswith("--cell-spec=")).split("=", 1)[1])
         self.assertEqual(spec["inputs"]["aligned_sample_predictions"], str(data.resolve()))
+
+    def test_compiled_cell_uses_the_same_expanded_manifest_path_as_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = root / "phasef"
+            data.mkdir()
+            manifest = root / "assets.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "phasef_data": {
+                            "path": "${SAFETY_DATA_ROOT}/phasef",
+                            "kind": "directory",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {"SAFETY_DATA_ROOT": str(root)}, clear=False):
+                command = compile_cell_commands(
+                    CATALOG,
+                    _cell("P1-11", layer_loss_weight=0.25),
+                    RunnerContext(
+                        ROOT,
+                        root / "state",
+                        "python",
+                        "npu",
+                        0,
+                        asset_manifest=manifest,
+                    ),
+                )[0]
+            spec = json.loads(
+                next(x for x in command.argv if x.startswith("--cell-spec=")).split("=", 1)[1]
+            )
+        self.assertEqual(spec["inputs"]["phasef_data"], str(data.resolve()))
 
     def test_worker_extracts_paths_from_strict_asset_manifest_entries(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -243,6 +280,121 @@ class AblationCompileTests(unittest.TestCase):
                 )
                 self.assertEqual({key: updates[key] for key in subset}, subset)
 
+    def test_wildjailbreak_pair_axis_selects_every_declared_backend_pair(self) -> None:
+        context = RunnerContext(ROOT, Path("/state"), "python", "npu", 0)
+        for pair in CATALOG.formal_pairs:
+            with self.subTest(pair=pair):
+                command = compile_cell_commands(
+                    CATALOG,
+                    _cell(
+                        "P0-06",
+                        pair=pair,
+                        config="override",
+                        curation="strict",
+                        method="ours",
+                    ),
+                    context,
+                )[0]
+                self.assertEqual(command.argv[command.argv.index("--pair") + 1], pair)
+
+    def test_wildjailbreak_curation_axis_reaches_curation_script(self) -> None:
+        path = ROOT / "scripts" / "15_run_oneclick.py"
+        spec = importlib.util.spec_from_file_location("oneclick_wjb_curation_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        calls = []
+        module._run_script = lambda script, argv, **kwargs: calls.append((script, list(argv)))
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            phase1 = root / "phase1.yaml"
+            phase1.write_text(
+                "dataset:\n  curation_mode: minimal\nmodels:\n  teacher:\n    path: /models/teacher\n",
+                encoding="utf-8",
+            )
+            module._invoke_phase1_curation(
+                baseline_name="wildjailbreak",
+                processed_dir=root / "processed",
+                phase1_yaml=phase1,
+                dry_run=True,
+                env_overrides={},
+            )
+        command = calls[0][1]
+        self.assertEqual(command[command.index("--mode") + 1], "minimal")
+
+    def test_safety_training_cells_use_cell_owned_derived_data_directories(self) -> None:
+        path = ROOT / "scripts" / "15_run_oneclick.py"
+        spec = importlib.util.spec_from_file_location("oneclick_cell_data_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first_config = root / "first" / "phase1.yaml"
+            second_config = root / "second" / "phase1.yaml"
+            for config in (first_config, second_config):
+                config.parent.mkdir(parents=True)
+                config.write_text(
+                    yaml.safe_dump(
+                        {"extraction": {"output_root": str(config.parent / "pipeline" / "phase1")}}
+                    ),
+                    encoding="utf-8",
+                )
+            first = module._resolve_safety_full_roots(
+                baseline_name="wildjailbreak",
+                device="npu",
+                cell_id="cell-one",
+                phase1_config_path=str(first_config),
+                phasef_config_path="",
+            )
+            second = module._resolve_safety_full_roots(
+                baseline_name="wildjailbreak",
+                device="npu",
+                cell_id="cell-two",
+                phase1_config_path=str(second_config),
+                phasef_config_path="",
+            )
+        self.assertNotEqual(first[0], second[0])
+        self.assertEqual(first[0], first[2].parent / "processed")
+        self.assertEqual(second[0], second[2].parent / "processed")
+
+    def test_matched_control_updates_survive_into_the_staged_backend_yaml(self) -> None:
+        path = ROOT / "scripts" / "30_run_ablation_cell.py"
+        spec = importlib.util.spec_from_file_location("ablation_cell_staging_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        signatures = {}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for method in ("sft1", "random", "ours"):
+                cell = _cell("P0-02", method=method, seed=42)
+                args = SimpleNamespace(
+                    output_dir=str(root / method),
+                    pair="qwen35_9b_to_08b",
+                    device="npu",
+                    teacher_variant="",
+                )
+                _, phasef_path = module._stage_configs(
+                    args, {}, phasef_updates_for_cell(cell)
+                )
+                import yaml
+
+                payload = yaml.safe_load(phasef_path.read_text(encoding="utf-8"))
+                signatures[method] = (
+                    payload["target"]["mode"],
+                    payload["optim"]["layer_loss_weight"],
+                    payload["seed"],
+                )
+        self.assertEqual(
+            signatures,
+            {
+                "sft1": ("semantic", 0.0, 42),
+                "random": ("random_same_norm", 0.25, 42),
+                "ours": ("semantic", 0.25, 42),
+            },
+        )
+
     def test_no_projection_control_keeps_bridge_mapped_semantic_targets(self) -> None:
         updates = phasef_updates_for_cell(_cell("P1-02", subspace_mode="none"))
         self.assertEqual(updates.get("target.mode", "semantic"), "semantic")
@@ -293,7 +445,7 @@ class AblationCompileTests(unittest.TestCase):
         self.assertIn("32", by_script["07_decompose_teacher_semantics.py"][0])
         self.assertIn("ridge", by_script["08_recompose_student_targets.py"][0])
 
-    def test_safety_full_explicit_configs_preserve_cell_outputs_and_persistent_data(self) -> None:
+    def test_safety_full_explicit_configs_preserve_cell_outputs_and_shared_source_data(self) -> None:
         path = ROOT / "scripts" / "15_run_oneclick.py"
         spec = importlib.util.spec_from_file_location("oneclick_safety_roots_test", path)
         module = importlib.util.module_from_spec(spec)
@@ -322,7 +474,7 @@ class AblationCompileTests(unittest.TestCase):
                     phase1_config_path=str(phase1_path),
                     phasef_config_path=str(phasef_path),
                 )
-        self.assertEqual(processed, (data_root / "processed" / "safety_full_c5").resolve())
+        self.assertEqual(processed, (cell_phase1.parent / "processed").resolve())
         self.assertEqual(pan, (data_root / "processed").resolve())
         self.assertEqual(phase1_root, cell_phase1.resolve())
         self.assertEqual(phasef_root, cell_phasef.resolve())

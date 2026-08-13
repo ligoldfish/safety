@@ -35,7 +35,7 @@ experiments:
     execution_kind: analyze
     handler: provenance_matrix
     axes: {scope: [main_table]}
-    requires: [model_registry, dataset_registry]
+    requires: [model_registry]
     metrics: [coverage_rate, missing_cells]
     completion_artifacts: [provenance_matrix.jsonl, coverage_summary.json]
   - id: P0-02
@@ -85,10 +85,16 @@ experiments:
     execution_kind: train
     handler: wjb_failure_analysis
     axes:
+      pair:
+        - qwen35_9b_to_08b
+        - llama31_8b_to_1b
+        - qwen3_8b_to_06b
+        - qwen3_8b_to_4b
+        - qwen3_4b_to_06b
       config: [global, override]
       curation: ["off", minimal, strict]
       method: [sft1, random, ours]
-    requires: [wildjailbreak_data, common_test]
+    requires: [common_test, wildguard_model]
     metrics: [target_refusal_rate, template_diversity, common_test_asr]
     completion_artifacts: [failure_analysis.json, eval_predictions.jsonl]
   - id: P0-07
