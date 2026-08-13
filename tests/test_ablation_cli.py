@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -72,7 +73,28 @@ class AblationCliTests(unittest.TestCase):
                 for line in plan_path.read_text(encoding="utf-8").splitlines()
             ]
         self.assertEqual({row["experiment_id"] for row in rows}, {"P0-02", "P2-03"})
-        self.assertEqual(len(rows), 13)
+        self.assertEqual(len(rows), 58)
+
+    def test_plan_can_exclude_special_training_waves(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "core-train.jsonl"
+            result = self._run(
+                "plan",
+                "--scope",
+                "all",
+                "--execution-kind",
+                "train",
+                "--exclude-experiment-id",
+                "P0-06",
+                "--exclude-experiment-id",
+                "P0-07",
+                "--output",
+                str(output),
+            )
+            rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(rows), 175)
+        self.assertFalse({"P0-06", "P0-07"} & {row["experiment_id"] for row in rows})
 
     def test_plan_rejects_unknown_experiment_and_empty_filter_intersection(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -167,6 +189,107 @@ class AblationCliTests(unittest.TestCase):
             {issue["asset_id"] for issue in payload["issues"]},
             {"model_registry"},
         )
+
+    def test_preflight_can_be_limited_to_the_exact_bounded_job_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plan_path = root / "mixed.jsonl"
+            made = self._run(
+                "plan",
+                "--experiment-id",
+                "P0-04",
+                "--experiment-id",
+                "P1-18",
+                "--output",
+                str(plan_path),
+            )
+            self.assertEqual(made.returncode, 0, made.stderr)
+            rows = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines()]
+            ordered = sorted(rows, key=lambda row: row["cell_id"])
+            target_index = next(
+                index for index, row in enumerate(ordered) if row["experiment_id"] == "P0-04"
+            )
+            predictions = root / "predictions.jsonl"
+            predictions.write_text("{}\n", encoding="utf-8")
+            manifest = root / "assets.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "aligned_sample_predictions": {
+                            "path": str(predictions),
+                            "kind": "file",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            full = self._run(
+                "preflight", "--plan", str(plan_path), "--asset-manifest", str(manifest)
+            )
+            bounded = self._run(
+                "preflight",
+                "--plan",
+                str(plan_path),
+                "--asset-manifest",
+                str(manifest),
+                "--shard-index",
+                str(target_index),
+                "--shard-count",
+                str(len(ordered)),
+                "--max-cells",
+                "1",
+            )
+        self.assertEqual(full.returncode, 3)
+        self.assertEqual(bounded.returncode, 0, bounded.stderr)
+        self.assertEqual(json.loads(bounded.stdout)["status"], "READY")
+
+    def test_preflight_resolves_training_configs_for_the_requested_device(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("ablation_cli_device_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        cell = {
+            "cell_id": "training-cell",
+            "experiment_id": "P0-02",
+            "axes": {"dataset": "pan", "method": "ours", "seed": 42},
+            "overrides": {},
+            "output_dir": "/persistent/output/training-cell",
+            "depends_on": [],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plan = root / "plan.jsonl"
+            plan.write_text(json.dumps(cell) + "\n", encoding="utf-8")
+            manifest = root / "assets.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            report = type(
+                "Report",
+                (),
+                {
+                    "status": "READY",
+                    "issues": (),
+                    "checked": (),
+                    "to_dict": lambda self: {
+                        "status": "READY", "issues": [], "checked_assets": []
+                    },
+                },
+            )()
+            with (
+                patch.object(module, "training_model_requirements", return_value=()) as models,
+                patch.object(module, "training_data_requirements", return_value=()) as data,
+                patch.object(module, "run_preflight", return_value=report),
+            ):
+                code = module.main(
+                    [
+                        "preflight", "--plan", str(plan), "--asset-manifest", str(manifest),
+                        "--device", "cpu",
+                    ]
+                )
+        self.assertEqual(code, 0)
+        self.assertEqual(models.call_args.kwargs["device"], "cpu")
+        self.assertEqual(data.call_args.kwargs["device"], "cpu")
 
     def test_bounded_shard_dry_run_is_stable_and_status_is_readable(self) -> None:
         with tempfile.TemporaryDirectory() as td:

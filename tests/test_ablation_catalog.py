@@ -79,6 +79,32 @@ class AblationCatalogTests(unittest.TestCase):
             ("common_test", "wildguard_model"),
         )
 
+    def test_recommended_baselines_cover_all_six_formal_datasets(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        experiment = catalog.experiments["P0-02"]
+        self.assertEqual(experiment.axes["dataset"], catalog.formal_datasets)
+        self.assertEqual(experiment.axes["method"], ("sft1", "random", "ours"))
+        self.assertEqual(experiment.axes["seed"], (42, 43, 44))
+
+    def test_mechanism_dataset_scopes_match_the_html_execution_tiers(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        main_table_components = ("pan", "wildguardmix", "wildjailbreak")
+        for index in range(1, 5):
+            experiment_id = f"P1-{index:02d}"
+            with self.subTest(experiment=experiment_id):
+                self.assertEqual(
+                    catalog.experiments[experiment_id].axes["dataset"],
+                    main_table_components,
+                )
+        self.assertEqual(
+            catalog.experiments["P1-05"].axes["dataset"],
+            ("pan", "wildjailbreak"),
+        )
+        for index in range(6, 18):
+            experiment_id = f"P1-{index:02d}"
+            with self.subTest(experiment=experiment_id):
+                self.assertEqual(catalog.experiments[experiment_id].axes["dataset"], ("pan",))
+
     def test_train_cells_only_declare_external_inputs_consumed_by_the_worker(self) -> None:
         catalog = load_catalog(CATALOG_PATH)
         expected = {

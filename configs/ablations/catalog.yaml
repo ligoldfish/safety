@@ -44,7 +44,10 @@ experiments:
     question: Does Full beat matched SFT and random targets under an identical budget?
     execution_kind: train
     handler: matched_controls
-    axes: {method: [sft1, random, ours], seed: [42, 43, 44]}
+    axes:
+      dataset: [pan, safety_tuned_llamas, coconot, c5, wildjailbreak, wildguardmix]
+      method: [sft1, random, ours]
+      seed: [42, 43, 44]
     requires: []
     metrics: [wildguard_asr, harmful_refusal, over_refusal]
     completion_artifacts: [run_manifest.json, eval_predictions.jsonl]
@@ -126,7 +129,9 @@ experiments:
     question: Is instance-level target correspondence necessary?
     execution_kind: train
     handler: target_control
-    axes: {target_mode: [within_label_permutation, cross_label_permutation]}
+    axes:
+      dataset: [pan, wildguardmix, wildjailbreak]
+      target_mode: [within_label_permutation, cross_label_permutation]
     overrides: {target.mode: within_label_permutation}
     requires: []
     metrics: [wildguard_asr, over_refusal]
@@ -137,7 +142,9 @@ experiments:
     question: Is projecting into the learned safety subspace necessary?
     execution_kind: train
     handler: subspace_control
-    axes: {subspace_mode: [none]}
+    axes:
+      dataset: [pan, wildguardmix, wildjailbreak]
+      subspace_mode: [none]
     overrides: {subspace.mode: none, target.mode: raw_teacher}
     requires: []
     metrics: [wildguard_asr, over_refusal]
@@ -148,7 +155,9 @@ experiments:
     question: Does any rank-matched random subspace provide the same regularization?
     execution_kind: train
     handler: subspace_control
-    axes: {draw: [0, 1, 2, 3, 4]}
+    axes:
+      dataset: [pan, wildguardmix, wildjailbreak]
+      draw: [0, 1, 2, 3, 4]
     overrides: {subspace.mode: random_orthogonal}
     requires: []
     metrics: [orthogonality_error, wildguard_asr, over_refusal]
@@ -159,7 +168,9 @@ experiments:
     question: Does the vocabulary bridge beat direct teacher-to-student mappings?
     execution_kind: train
     handler: bridge_control
-    axes: {bridge_mode: [ridge, orthogonal_procrustes]}
+    axes:
+      dataset: [pan, wildguardmix, wildjailbreak]
+      bridge_mode: [ridge, orthogonal_procrustes]
     overrides: {bridge.mode: ridge}
     requires: []
     metrics: [mapping_error, wildguard_asr, over_refusal]
@@ -170,7 +181,10 @@ experiments:
     question: Are selected key layers better than rank-matched alternative placements?
     execution_kind: train
     handler: layer_selection_control
-    axes: {mode: [effect_probe_sum, random_k, evenly_spaced, last_k], draw: [0, 1, 2, 3, 4]}
+    axes:
+      dataset: [pan, wildjailbreak]
+      mode: [effect_probe_sum, random_k, evenly_spaced, last_k]
+      draw: [0, 1, 2, 3, 4]
     requires: []
     metrics: [trainable_parameters, wildguard_asr, over_refusal]
     completion_artifacts: [layer_selection.json, eval_predictions.jsonl]
@@ -180,7 +194,9 @@ experiments:
     question: Are both effect size and probe accuracy needed for layer scoring?
     execution_kind: train
     handler: layer_score_control
-    axes: {mode: [effect_only, probe_only, effect_probe_sum, random_k]}
+    axes:
+      dataset: [pan]
+      mode: [effect_only, probe_only, effect_probe_sum, random_k]
     requires: []
     metrics: [selected_layers, wildguard_asr, over_refusal]
     completion_artifacts: [layer_selection.json, eval_predictions.jsonl]
@@ -190,7 +206,9 @@ experiments:
     question: Is relative-depth pairing preferable to representation-based and random alternatives?
     execution_kind: train
     handler: pairing_control
-    axes: {mode: [relative_depth, cka_nearest, random_permutation, same_index_clamped]}
+    axes:
+      dataset: [pan]
+      mode: [relative_depth, cka_nearest, random_permutation, same_index_clamped]
     requires: []
     metrics: [pairing_score, wildguard_asr, over_refusal]
     completion_artifacts: [pairing_manifest.json, eval_predictions.jsonl]
@@ -200,7 +218,9 @@ experiments:
     question: Is the first-assistant prediction position the right representation location?
     execution_kind: train
     handler: representation_position_control
-    axes: {mode: [last_prompt, mean_prompt, first_generated, first_4_generated_mean]}
+    axes:
+      dataset: [pan]
+      mode: [last_prompt, mean_prompt, first_generated, first_4_generated_mean]
     requires: []
     metrics: [representation_coverage, wildguard_asr, over_refusal]
     completion_artifacts: [position_manifest.json, eval_predictions.jsonl]
@@ -210,7 +230,9 @@ experiments:
     question: Is semantic top-M selection sensitive to the retained vocabulary size?
     execution_kind: train
     handler: semantic_top_m_sweep
-    axes: {top_m: [32, 64, 128, 256, 512, 1024]}
+    axes:
+      dataset: [pan]
+      top_m: [32, 64, 128, 256, 512, 1024]
     requires: []
     metrics: [retained_coefficient_energy, wildguard_asr, over_refusal]
     completion_artifacts: [semantic_manifest.json, eval_predictions.jsonl]
@@ -220,7 +242,10 @@ experiments:
     question: Do coefficient sign and token filtering affect transfer?
     execution_kind: train
     handler: semantic_selection_control
-    axes: {selection_mode: [abs, positive, negative], token_filter: [true, false]}
+    axes:
+      dataset: [pan]
+      selection_mode: [abs, positive, negative]
+      token_filter: [true, false]
     requires: []
     metrics: [retained_coefficient_energy, wildguard_asr, over_refusal]
     completion_artifacts: [semantic_manifest.json, eval_predictions.jsonl]
@@ -230,7 +255,9 @@ experiments:
     question: Is performance sensitive to the exact layer-loss weight?
     execution_kind: train
     handler: layer_loss_weight_sweep
-    axes: {layer_loss_weight: [0.0, 0.05, 0.1, 0.25, 0.5, 1.0]}
+    axes:
+      dataset: [pan]
+      layer_loss_weight: [0.0, 0.05, 0.1, 0.25, 0.5, 1.0]
     requires: []
     metrics: [validation_safety_f1, wildguard_asr, over_refusal]
     completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
@@ -240,7 +267,9 @@ experiments:
     question: Which harmful and harmless supervision policy gives the best trade-off?
     execution_kind: train
     handler: supervision_policy_control
-    axes: {mode: [harmful_only, all, label_weighted_1_05, label_weighted_1_1, harmless_anchor]}
+    axes:
+      dataset: [pan]
+      mode: [harmful_only, all, label_weighted_1_05, label_weighted_1_1, harmless_anchor]
     requires: []
     metrics: [harmful_cosine, harmless_cosine, wildguard_asr, over_refusal]
     completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
@@ -250,7 +279,9 @@ experiments:
     question: Is cosine loss preferable to MSE and contrastive alternatives?
     execution_kind: train
     handler: layer_loss_kind_control
-    axes: {loss_kind: [cosine, normalized_mse, raw_mse, margin_contrastive]}
+    axes:
+      dataset: [pan]
+      loss_kind: [cosine, normalized_mse, raw_mse, margin_contrastive]
     requires: []
     metrics: [layer_loss, wildguard_asr, over_refusal]
     completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
@@ -260,7 +291,10 @@ experiments:
     question: Is the gain explained by LoRA capacity or placement?
     execution_kind: train
     handler: lora_capacity_control
-    axes: {rank: [8, 16, 32], placement: [selected, all_layers_parameter_matched]}
+    axes:
+      dataset: [pan]
+      rank: [8, 16, 32]
+      placement: [selected, all_layers_parameter_matched]
     requires: []
     metrics: [trainable_parameters, wildguard_asr, over_refusal]
     completion_artifacts: [parameter_budget.json, eval_predictions.jsonl]
@@ -270,7 +304,10 @@ experiments:
     question: Are energy threshold and rank cap fragile engineering choices?
     execution_kind: train
     handler: subspace_hyperparameter_sweep
-    axes: {energy_threshold: [0.6, 0.7, 0.8, 0.9, 0.95], rank_cap: [8, 16, 32, 64]}
+    axes:
+      dataset: [pan]
+      energy_threshold: [0.6, 0.7, 0.8, 0.9, 0.95]
+      rank_cap: [8, 16, 32, 64]
     requires: []
     metrics: [effective_rank, retained_energy, wildguard_asr, over_refusal]
     completion_artifacts: [subspace_manifest.json, eval_predictions.jsonl]
@@ -280,7 +317,10 @@ experiments:
     question: How much Phase1 and PhaseF data does the method need?
     execution_kind: train
     handler: data_efficiency_sweep
-    axes: {phase: [phase1, phasef], samples_per_label: [100, 250, 500, 1000, all]}
+    axes:
+      dataset: [pan]
+      phase: [phase1, phasef]
+      samples_per_label: [100, 250, 500, 1000, all]
     requires: []
     metrics: [sample_count, wildguard_asr, over_refusal]
     completion_artifacts: [sampling_manifest.json, eval_predictions.jsonl]
@@ -290,7 +330,10 @@ experiments:
     question: Do class balance and curation determine the result?
     execution_kind: train
     handler: curation_control
-    axes: {balance: [true, false], curation: ["off", minimal, strict]}
+    axes:
+      dataset: [pan]
+      balance: [true, false]
+      curation: ["off", minimal, strict]
     requires: []
     metrics: [drop_reasons, label_counts, wildguard_asr, over_refusal]
     completion_artifacts: [curation_manifest.json, eval_predictions.jsonl]

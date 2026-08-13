@@ -1,0 +1,23 @@
+{
+  "aligned_predictions": {"path": "${SAFETY_OUTPUT_ROOT}/registries/aligned_predictions.jsonl", "kind": "file"},
+  "aligned_sample_predictions": {"path": "${SAFETY_OUTPUT_ROOT}/registries/aligned_sample_predictions.jsonl", "kind": "file"},
+  "alignment_hidden_states": {"path": "${SAFETY_OUTPUT_ROOT}/registries/alignment_hidden_states", "kind": "directory"},
+  "benchmark_assets": {"path": "${SAFETY_DATA_ROOT}/benchmarks/opencompass", "kind": "directory"},
+  "checkpoint_registry": {"path": "${SAFETY_OUTPUT_ROOT}/registries/checkpoint_registry.jsonl", "kind": "file"},
+  "common_test": {"path": "${SAFETY_DATA_ROOT}/common_test", "kind": "directory"},
+  "dataset_registry": {"path": "${SAFETY_DATA_ROOT}/manifests/dataset_registry.json", "kind": "file"},
+  "evaluation_data": {"path": "${SAFETY_DATA_ROOT}/common_test/common_safety.jsonl", "kind": "file"},
+  "human_annotations": {"path": "${SAFETY_DATA_ROOT}/ablations/manual/human_annotations", "kind": "directory"},
+  "intervention_data": {"path": "${SAFETY_DATA_ROOT}/ablations/intervention", "kind": "directory"},
+  "intervention_model": {"path": "${SAFETY_MODEL_ROOT}/Qwen3.5-0.8B", "kind": "model"},
+  "model_registry": {"path": "${SAFETY_OUTPUT_ROOT}/registries/model_registry.jsonl", "kind": "file"},
+  "pan_predictions": {"path": "${SAFETY_OUTPUT_ROOT}/registries/pan_predictions.jsonl", "kind": "file"},
+  "phase_runtime_logs": {"path": "${SAFETY_OUTPUT_ROOT}/registries/phase_runtime_logs.jsonl", "kind": "file"},
+  "search_ledger": {"path": "${SAFETY_OUTPUT_ROOT}/registries/search_ledger.jsonl", "kind": "file"},
+  "split_manifests": {"path": "${SAFETY_DATA_ROOT}/manifests/split_manifests.json", "kind": "file"},
+  "subspace_artifact": {"path": "${SAFETY_OUTPUT_ROOT}/registries/subspace_artifacts.pt", "kind": "file"},
+  "test_predictions": {"path": "${SAFETY_OUTPUT_ROOT}/registries/test_predictions.jsonl", "kind": "file"},
+  "trained_checkpoints": {"path": "${SAFETY_OUTPUT_ROOT}/reference_checkpoint", "kind": "directory"},
+  "validation_predictions": {"path": "${SAFETY_OUTPUT_ROOT}/registries/validation_predictions.jsonl", "kind": "file"},
+  "wildguard_model": {"path": "${SAFETY_MODEL_ROOT}/wildguard", "kind": "model"}
+}

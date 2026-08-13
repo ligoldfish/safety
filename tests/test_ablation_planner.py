@@ -31,8 +31,8 @@ class AblationPlannerTests(unittest.TestCase):
         self.assertEqual(len({cell.cell_id for cell in plan.cells}), len(plan.cells))
         self.assertEqual(len({cell.output_dir for cell in plan.cells}), len(plan.cells))
         p105 = [cell for cell in plan.cells if cell.experiment_id == "P1-05"]
-        self.assertEqual(len(p105), 8)
-        self.assertEqual(sum(cell.axes["mode"] == "random_k" for cell in p105), 5)
+        self.assertEqual(len(p105), 16)
+        self.assertEqual(sum(cell.axes["mode"] == "random_k" for cell in p105), 10)
         p115 = [cell for cell in plan.cells if cell.experiment_id == "P1-15"]
         self.assertEqual(len(p115), 8)
         self.assertTrue(
@@ -41,13 +41,13 @@ class AblationPlannerTests(unittest.TestCase):
         p006 = [cell for cell in plan.cells if cell.experiment_id == "P0-06"]
         self.assertEqual(len(p006), 90)
         self.assertEqual({cell.axes["pair"] for cell in p006}, set(catalog.formal_pairs))
-        self.assertEqual(len(plan.cells), 424)
+        self.assertEqual(len(plan.cells), 497)
         counts = {kind.value: 0 for kind in {item.execution_kind for item in catalog.experiments.values()}}
         for cell in plan.cells:
             counts[catalog.experiments[cell.experiment_id].execution_kind.value] += 1
         self.assertEqual(
             counts,
-            {"train": 204, "evaluate": 31, "analyze": 186, "manual": 3},
+            {"train": 277, "evaluate": 31, "analyze": 186, "manual": 3},
         )
 
     def test_main_table_is_exactly_150_unique_cells(self) -> None:

@@ -73,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser("plan")
     plan.add_argument("--scope", choices=["main-table", "all", "p0", "p1", "p2"], default="all")
     plan.add_argument("--experiment-id", action="append", default=[])
+    plan.add_argument("--exclude-experiment-id", action="append", default=[])
     plan.add_argument(
         "--execution-kind",
         action="append",
@@ -91,6 +92,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Legacy layout: every asset is a directory named <asset-root>/<asset-id>.",
     )
     preflight.add_argument("--output", default="")
+    preflight.add_argument("--shard-index", type=int)
+    preflight.add_argument("--shard-count", type=int)
+    preflight.add_argument("--max-cells", type=int)
+    preflight.add_argument(
+        "--device",
+        choices=["npu", "ppu", "cuda", "cpu"],
+        default="npu",
+        help="Resolve the same backend-specific training configs that run will use.",
+    )
 
     for name in ("status", "summarize"):
         command = subparsers.add_parser(name)
@@ -157,6 +167,26 @@ def _bounded_run_cells(args, plan: ExperimentPlan) -> tuple[ExperimentCell, ...]
     return selected
 
 
+def _preflight_cells(args, plan: ExperimentPlan) -> tuple[ExperimentCell, ...]:
+    values = (args.shard_index, args.shard_count, args.max_cells)
+    if not any(value is not None for value in values):
+        return plan.cells
+    if any(value is None for value in values):
+        raise RunnerError("bounded preflight requires shard-index, shard-count, and max-cells")
+    if args.shard_count <= 0 or not 0 <= args.shard_index < args.shard_count:
+        raise RunnerError("shard-index must be in [0, shard-count) and shard-count must be positive")
+    if args.max_cells <= 0:
+        raise RunnerError("max-cells must be positive")
+    selected = tuple(
+        cell
+        for index, cell in enumerate(sorted(plan.cells, key=lambda item: item.cell_id))
+        if index % args.shard_count == args.shard_index
+    )[: args.max_cells]
+    if not selected:
+        raise RunnerError("bounded preflight selected no cells")
+    return selected
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     catalog = load_catalog(args.catalog)
@@ -173,15 +203,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "plan":
         plan = build_catalog_plan(catalog, output_root=args.output_root, scope=args.scope)
         requested_ids = set(args.experiment_id)
-        unknown = requested_ids - set(catalog.experiments)
+        excluded_ids = set(args.exclude_experiment_id)
+        unknown = (requested_ids | excluded_ids) - set(catalog.experiments)
         if unknown:
             raise RunnerError(f"unknown experiment ids: {sorted(unknown)}")
         requested_kinds = set(args.execution_kind)
-        if requested_ids or requested_kinds:
+        if requested_ids or requested_kinds or excluded_ids:
             filtered = tuple(
                 cell
                 for cell in plan.cells
                 if (not requested_ids or cell.experiment_id in requested_ids)
+                and cell.experiment_id not in excluded_ids
                 and (
                     not requested_kinds
                     or catalog.experiments[cell.experiment_id].execution_kind.value
@@ -199,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = _read_plan(args.plan)
     if args.command == "preflight":
+        selected_cells = _preflight_cells(args, plan)
         requirements: list[AssetRequirement] = []
         missing_issues: list[PreflightIssue] = []
         if args.asset_manifest:
@@ -209,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise RunnerError(f"invalid asset manifest: {manifest_path}") from exc
             if not isinstance(manifest, dict):
                 raise RunnerError("asset manifest must be a JSON object")
-            for cell in plan.cells:
+            for cell in selected_cells:
                 definition = catalog.experiments[cell.experiment_id]
                 cell_requirements, missing = requirements_from_manifest(
                     definition.requires,
@@ -235,19 +268,19 @@ def main(argv: list[str] | None = None) -> int:
                         training_model_requirements(
                             cell,
                             project_root=PROJECT_ROOT,
-                            device="npu",
+                            device=args.device,
                         )
                     )
                     requirements.extend(
                         training_data_requirements(
                             cell,
                             project_root=PROJECT_ROOT,
-                            device="npu",
+                            device=args.device,
                         )
                     )
         else:
             root = Path(args.asset_root).expanduser().resolve()
-            for cell in plan.cells:
+            for cell in selected_cells:
                 definition = catalog.experiments[cell.experiment_id]
                 for asset_id in definition.requires:
                     requirements.append(
@@ -258,14 +291,14 @@ def main(argv: list[str] | None = None) -> int:
                         training_model_requirements(
                             cell,
                             project_root=PROJECT_ROOT,
-                            device="npu",
+                            device=args.device,
                         )
                     )
                     requirements.extend(
                         training_data_requirements(
                             cell,
                             project_root=PROJECT_ROOT,
-                            device="npu",
+                            device=args.device,
                         )
                     )
         checked = run_preflight(requirements)

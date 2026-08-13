@@ -151,10 +151,19 @@ class AblationE2ETests(unittest.TestCase):
             ]
             common = root / "scores.jsonl"
             common.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            wildguard = root / "wildguard"
+            wildguard.mkdir()
             output = root / "out"
             execute_handler(
                 "cross_corpus_matrix",
-                {"axes": {"test_suite": "common_safety"}, "inputs": {"checkpoint_registry": str(checkpoints), "common_test": str(common)}},
+                {
+                    "axes": {"test_suite": "common_safety"},
+                    "inputs": {
+                        "checkpoint_registry": str(checkpoints),
+                        "common_test": str(common),
+                        "wildguard_model": str(wildguard),
+                    },
+                },
                 output_dir=output,
                 required_artifacts=["cross_corpus_matrix.json"],
             )
