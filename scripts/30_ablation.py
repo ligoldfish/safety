@@ -71,6 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = subparsers.add_parser("plan")
     plan.add_argument("--scope", choices=["main-table", "all", "p0", "p1", "p2"], default="all")
+    plan.add_argument("--experiment-id", action="append", default=[])
+    plan.add_argument(
+        "--execution-kind",
+        action="append",
+        choices=["train", "evaluate", "analyze", "manual"],
+        default=[],
+    )
     plan.add_argument("--output-root", default="../outputs/ablations")
     plan.add_argument("--output", required=True)
 
@@ -164,6 +171,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "plan":
         plan = build_catalog_plan(catalog, output_root=args.output_root, scope=args.scope)
+        requested_ids = set(args.experiment_id)
+        unknown = requested_ids - set(catalog.experiments)
+        if unknown:
+            raise RunnerError(f"unknown experiment ids: {sorted(unknown)}")
+        requested_kinds = set(args.execution_kind)
+        if requested_ids or requested_kinds:
+            filtered = tuple(
+                cell
+                for cell in plan.cells
+                if (not requested_ids or cell.experiment_id in requested_ids)
+                and (
+                    not requested_kinds
+                    or catalog.experiments[cell.experiment_id].execution_kind.value
+                    in requested_kinds
+                )
+            )
+            if not filtered:
+                raise RunnerError("plan filters selected no cells")
+            plan = validate_plan(
+                ExperimentPlan(schema_version=plan.schema_version, cells=filtered)
+            )
         _write_jsonl(Path(args.output), (asdict(cell) for cell in plan.cells))
         print(json.dumps({"status": "PLANNED", "cells": len(plan.cells), "output": args.output}))
         return 0

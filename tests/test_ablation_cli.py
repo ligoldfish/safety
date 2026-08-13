@@ -50,6 +50,49 @@ class AblationCliTests(unittest.TestCase):
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("--cell-id", rejected.stderr)
 
+    def test_plan_filters_exact_experiments_and_execution_kinds_for_job_waves(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            plan_path = Path(td) / "train-wave.jsonl"
+            result = self._run(
+                "plan",
+                "--scope",
+                "all",
+                "--experiment-id",
+                "P0-02",
+                "--experiment-id",
+                "P2-03",
+                "--execution-kind",
+                "train",
+                "--output",
+                str(plan_path),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = [
+                json.loads(line)
+                for line in plan_path.read_text(encoding="utf-8").splitlines()
+            ]
+        self.assertEqual({row["experiment_id"] for row in rows}, {"P0-02", "P2-03"})
+        self.assertEqual(len(rows), 13)
+
+    def test_plan_rejects_unknown_experiment_and_empty_filter_intersection(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            unknown = self._run(
+                "plan", "--experiment-id", "P9-99", "--output", str(Path(td) / "x")
+            )
+            empty = self._run(
+                "plan",
+                "--experiment-id",
+                "P0-03",
+                "--execution-kind",
+                "train",
+                "--output",
+                str(Path(td) / "y"),
+            )
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertIn("unknown experiment", unknown.stderr)
+        self.assertNotEqual(empty.returncode, 0)
+        self.assertIn("selected no cells", empty.stderr)
+
     def test_preflight_uses_the_same_typed_asset_manifest_as_run(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
