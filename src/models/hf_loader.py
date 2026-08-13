@@ -6,6 +6,8 @@ from typing import Any, Dict, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.ablations.platform import resolve_portable_path
+
 
 def _resolve_dtype(torch_dtype: str):
     if torch_dtype == "auto":
@@ -91,7 +93,8 @@ def load_hf_model(
     local_files_only: bool = True,
     attn_implementation: str = "",
 ) -> Tuple[Any, Any, Dict[str, Any]]:
-    resolved = Path(model_path)
+    portable_model_path = resolve_portable_path(model_path, Path.cwd(), category="model")
+    resolved = Path(portable_model_path)
     model_ref = str(resolved if resolved.exists() else model_path)
     thinking_enabled = bool(chat_template_enable_thinking)
 

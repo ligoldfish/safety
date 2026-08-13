@@ -110,6 +110,15 @@ PAIRS: Dict[str, dict] = {
         "family": "qwen3",
         "target_modules": _DENSE_TARGET_MODULES,
     },
+    "qwen3_8b_to_llama32_1b": {
+        "pair_id": "qwen3_8b_to_llama32_1b",
+        "teacher": {"name": "Qwen3-8B", "path": "../models/Qwen3-8B", "tag": "qwen3_8b"},
+        "student": {"name": "Llama-3.2-1B-Instruct", "path": "../models/Llama-3.2-1B-Instruct", "tag": "llama32_1b"},
+        "family": "qwen3_to_llama3",
+        "target_modules": _DENSE_TARGET_MODULES,
+        "device_map": "auto",
+        "device_map_only": ["baseline_distill_"],
+    },
 }
 
 DEFAULT_PAIR = "qwen35_9b_to_08b"

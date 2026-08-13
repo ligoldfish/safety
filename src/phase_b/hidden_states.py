@@ -38,6 +38,7 @@ class HiddenStateSplit:
     # split carried the legacy feature_type tag. Consumers that care about
     # reproducibility (manifests, analysis reports) should surface this flag.
     legacy_final_response_prefix: bool = False
+    representation_mode: str = "last_prompt"
 
     @property
     def num_samples(self) -> int:
@@ -86,10 +87,19 @@ def load_hidden_state_split(
     counts: Counter[str] = Counter()
     layer_buffers: Dict[int, List[torch.Tensor]] = {}
     saw_legacy = False
+    representation_mode: str | None = None
 
     for part_path in part_paths:
         payload = torch.load(part_path, map_location="cpu", weights_only=True)
         feature_type = str(payload.get("feature_type", ""))
+        shard_mode = str(payload.get("representation_mode", "last_prompt"))
+        if representation_mode is None:
+            representation_mode = shard_mode
+        elif shard_mode != representation_mode:
+            raise ValueError(
+                f"Mixed representation modes under {split_path}: "
+                f"'{representation_mode}' and '{shard_mode}'. Rebuild the split."
+            )
         if feature_type not in supported:
             if feature_type == LEGACY_FEATURE_TYPE:
                 raise ValueError(
@@ -144,4 +154,5 @@ def load_hidden_state_split(
         labels=kept_labels,
         sample_ids=kept_sample_ids,
         legacy_final_response_prefix=saw_legacy,
+        representation_mode=representation_mode or "last_prompt",
     )

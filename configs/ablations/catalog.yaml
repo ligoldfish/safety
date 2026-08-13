@@ -1,0 +1,443 @@
+schema_version: 1
+
+formal_pairs:
+  - qwen35_9b_to_08b
+  - llama31_8b_to_1b
+  - qwen3_8b_to_06b
+  - qwen3_8b_to_4b
+  - qwen3_4b_to_06b
+
+formal_datasets:
+  - pan
+  - safety_tuned_llamas
+  - coconot
+  - c5
+  - wildjailbreak
+  - wildguardmix
+
+main_methods: [ours, sft1, sft, distill, nosft]
+
+strategies:
+  representation.mode: [last_prompt, mean_prompt, first_generated, first_4_generated_mean]
+  layer_selection.mode: [effect_probe_sum, effect_only, probe_only, random_k, evenly_spaced, last_k]
+  subspace.mode: [learned, none, random_orthogonal, bootstrap]
+  bridge.mode: [vocabulary, token_string, embedding_nearest, ridge, orthogonal_procrustes]
+  pairing.mode: [relative_depth, cka_nearest, random_permutation, same_index_clamped]
+  target.mode: [semantic, random_same_norm, within_label_permutation, cross_label_permutation, raw_teacher]
+  loss.kind: [cosine, normalized_mse, raw_mse, margin_contrastive]
+  supervision.mode: [harmful_only, all, label_weighted, harmless_anchor]
+
+experiments:
+  - id: P0-01
+    priority: P0
+    family: reproducibility
+    question: Can every one of the 150 main-table cells be traced to immutable inputs and outputs?
+    execution_kind: analyze
+    handler: provenance_matrix
+    axes: {scope: [main_table]}
+    requires: [model_registry]
+    metrics: [coverage_rate, missing_cells]
+    completion_artifacts: [provenance_matrix.jsonl, coverage_summary.json]
+  - id: P0-02
+    priority: P0
+    family: core_contribution
+    question: Does Full beat matched SFT and random targets under an identical budget?
+    execution_kind: train
+    handler: matched_controls
+    axes:
+      dataset: [pan, safety_tuned_llamas, coconot, c5, wildjailbreak, wildguardmix]
+      method: [sft1, random, ours]
+      seed: [42, 43, 44]
+    requires: []
+    metrics: [wildguard_asr, harmful_refusal, over_refusal]
+    completion_artifacts: [run_manifest.json, eval_predictions.jsonl]
+  - id: P0-03
+    priority: P0
+    family: evaluation
+    question: Do independent WildGuard and human judgments support the keyword-based conclusions?
+    execution_kind: manual
+    handler: judge_agreement_audit
+    axes: {stratum: [harmful, benign, disagreement]}
+    requires: [wildguard_model, human_annotations]
+    metrics: [parse_rate, cohens_kappa, agreement]
+    completion_artifacts: [judge_predictions.jsonl, manual_audit_summary.json]
+  - id: P0-04
+    priority: P0
+    family: statistics
+    question: Are small differences larger than training and test sampling noise?
+    execution_kind: analyze
+    handler: seed_and_paired_bootstrap
+    axes: {seed: [42, 43, 44], bootstrap_draws: [10000]}
+    requires: [aligned_sample_predictions]
+    metrics: [mean, standard_deviation, ci95]
+    completion_artifacts: [paired_bootstrap.json, seed_summary.json]
+  - id: P0-05
+    priority: P0
+    family: safety_utility
+    question: Is the gain present at a matched harmful-refusal operating point?
+    execution_kind: analyze
+    handler: validation_iso_hr
+    axes: {selection_split: [validation]}
+    requires: [validation_predictions, test_predictions]
+    metrics: [matched_hr_gap, test_over_refusal]
+    completion_artifacts: [iso_hr_comparison.json]
+  - id: P0-06
+    priority: P0
+    family: failure_boundary
+    question: Why does layer supervision hurt WildJailbreak across model pairs?
+    execution_kind: train
+    handler: wjb_failure_analysis
+    axes:
+      pair:
+        - qwen35_9b_to_08b
+        - llama31_8b_to_1b
+        - qwen3_8b_to_06b
+        - qwen3_8b_to_4b
+        - qwen3_4b_to_06b
+      config: [global, override]
+      curation: ["off", minimal, strict]
+      method: [sft1, random, ours]
+    requires: [common_test, wildguard_model]
+    metrics: [target_refusal_rate, template_diversity, common_test_asr]
+    completion_artifacts: [failure_analysis.json, eval_predictions.jsonl]
+  - id: P0-07
+    priority: P0
+    family: fairness
+    question: Do dataset-specific hyperparameters create unfair budgets or test tuning?
+    execution_kind: train
+    handler: global_default_budget
+    axes:
+      dataset: [pan, safety_tuned_llamas, coconot, c5, wildjailbreak, wildguardmix]
+      config: [global, validation_selected]
+      method: [sft1, random, ours]
+    requires: [search_ledger]
+    metrics: [search_count, training_budget, validation_metric]
+    completion_artifacts: [search_ledger.jsonl, budget_summary.json]
+  - id: P0-08
+    priority: P0
+    family: generalization
+    question: Do conclusions transfer to a shared out-of-domain evaluation suite?
+    execution_kind: evaluate
+    handler: cross_corpus_matrix
+    axes: {test_suite: [pan_heldout, common_safety]}
+    requires: [checkpoint_registry, common_test, wildguard_model]
+    metrics: [wildguard_asr, harmful_refusal, over_refusal]
+    completion_artifacts: [cross_corpus_matrix.json]
+
+  - id: P1-01
+    priority: P1
+    family: semantic_target
+    question: Is instance-level target correspondence necessary?
+    execution_kind: train
+    handler: target_control
+    axes:
+      dataset: [pan, wildguardmix, wildjailbreak]
+      target_mode: [within_label_permutation, cross_label_permutation]
+    overrides: {target.mode: within_label_permutation}
+    requires: []
+    metrics: [wildguard_asr, over_refusal]
+    completion_artifacts: [permutation_manifest.json, eval_predictions.jsonl]
+  - id: P1-02
+    priority: P1
+    family: subspace
+    question: Is projecting into the learned safety subspace necessary?
+    execution_kind: train
+    handler: subspace_control
+    axes:
+      dataset: [pan, wildguardmix, wildjailbreak]
+      subspace_mode: [none]
+    overrides: {subspace.mode: none, target.mode: raw_teacher}
+    requires: []
+    metrics: [wildguard_asr, over_refusal]
+    completion_artifacts: [subspace_manifest.json, eval_predictions.jsonl]
+  - id: P1-03
+    priority: P1
+    family: subspace
+    question: Does any rank-matched random subspace provide the same regularization?
+    execution_kind: train
+    handler: subspace_control
+    axes:
+      dataset: [pan, wildguardmix, wildjailbreak]
+      draw: [0, 1, 2, 3, 4]
+    overrides: {subspace.mode: random_orthogonal}
+    requires: []
+    metrics: [orthogonality_error, wildguard_asr, over_refusal]
+    completion_artifacts: [subspace_manifest.json, eval_predictions.jsonl]
+  - id: P1-04
+    priority: P1
+    family: semantic_bridge
+    question: Does the vocabulary bridge beat direct teacher-to-student mappings?
+    execution_kind: train
+    handler: bridge_control
+    axes:
+      dataset: [pan, wildguardmix, wildjailbreak]
+      bridge_mode: [ridge, orthogonal_procrustes]
+    overrides: {bridge.mode: ridge}
+    requires: []
+    metrics: [mapping_error, wildguard_asr, over_refusal]
+    completion_artifacts: [bridge_artifact.pt, eval_predictions.jsonl]
+  - id: P1-05
+    priority: P1
+    family: layer_selection
+    question: Are selected key layers better than rank-matched alternative placements?
+    execution_kind: train
+    handler: layer_selection_control
+    axes:
+      dataset: [pan, wildjailbreak]
+      mode: [effect_probe_sum, random_k, evenly_spaced, last_k]
+      draw: [0, 1, 2, 3, 4]
+    requires: []
+    metrics: [trainable_parameters, wildguard_asr, over_refusal]
+    completion_artifacts: [layer_selection.json, eval_predictions.jsonl]
+  - id: P1-06
+    priority: P1
+    family: layer_selection
+    question: Are both effect size and probe accuracy needed for layer scoring?
+    execution_kind: train
+    handler: layer_score_control
+    axes:
+      dataset: [pan]
+      mode: [effect_only, probe_only, effect_probe_sum, random_k]
+    requires: []
+    metrics: [selected_layers, wildguard_asr, over_refusal]
+    completion_artifacts: [layer_selection.json, eval_predictions.jsonl]
+  - id: P1-07
+    priority: P1
+    family: layer_pairing
+    question: Is relative-depth pairing preferable to representation-based and random alternatives?
+    execution_kind: train
+    handler: pairing_control
+    axes:
+      dataset: [pan]
+      mode: [relative_depth, cka_nearest, random_permutation, same_index_clamped]
+    requires: []
+    metrics: [pairing_score, wildguard_asr, over_refusal]
+    completion_artifacts: [pairing_manifest.json, eval_predictions.jsonl]
+  - id: P1-08
+    priority: P1
+    family: representation
+    question: Is the first-assistant prediction position the right representation location?
+    execution_kind: train
+    handler: representation_position_control
+    axes:
+      dataset: [pan]
+      mode: [last_prompt, mean_prompt, first_generated, first_4_generated_mean]
+    requires: []
+    metrics: [representation_coverage, wildguard_asr, over_refusal]
+    completion_artifacts: [position_manifest.json, eval_predictions.jsonl]
+  - id: P1-09
+    priority: P1
+    family: semantic_bridge
+    question: Is semantic top-M selection sensitive to the retained vocabulary size?
+    execution_kind: train
+    handler: semantic_top_m_sweep
+    axes:
+      dataset: [pan]
+      top_m: [32, 64, 128, 256, 512, 1024]
+    requires: []
+    metrics: [retained_coefficient_energy, wildguard_asr, over_refusal]
+    completion_artifacts: [semantic_manifest.json, eval_predictions.jsonl]
+  - id: P1-10
+    priority: P1
+    family: semantic_bridge
+    question: Do coefficient sign and token filtering affect transfer?
+    execution_kind: train
+    handler: semantic_selection_control
+    axes:
+      dataset: [pan]
+      selection_mode: [abs, positive, negative]
+      token_filter: [true, false]
+    requires: []
+    metrics: [retained_coefficient_energy, wildguard_asr, over_refusal]
+    completion_artifacts: [semantic_manifest.json, eval_predictions.jsonl]
+  - id: P1-11
+    priority: P1
+    family: loss
+    question: Is performance sensitive to the exact layer-loss weight?
+    execution_kind: train
+    handler: layer_loss_weight_sweep
+    axes:
+      dataset: [pan]
+      layer_loss_weight: [0.0, 0.05, 0.1, 0.25, 0.5, 1.0]
+    requires: []
+    metrics: [validation_safety_f1, wildguard_asr, over_refusal]
+    completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
+  - id: P1-12
+    priority: P1
+    family: supervision
+    question: Which harmful and harmless supervision policy gives the best trade-off?
+    execution_kind: train
+    handler: supervision_policy_control
+    axes:
+      dataset: [pan]
+      mode: [harmful_only, all, label_weighted_1_05, label_weighted_1_1, harmless_anchor]
+    requires: []
+    metrics: [harmful_cosine, harmless_cosine, wildguard_asr, over_refusal]
+    completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
+  - id: P1-13
+    priority: P1
+    family: loss
+    question: Is cosine loss preferable to MSE and contrastive alternatives?
+    execution_kind: train
+    handler: layer_loss_kind_control
+    axes:
+      dataset: [pan]
+      loss_kind: [cosine, normalized_mse, raw_mse, margin_contrastive]
+    requires: []
+    metrics: [layer_loss, wildguard_asr, over_refusal]
+    completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
+  - id: P1-14
+    priority: P1
+    family: capacity
+    question: Is the gain explained by LoRA capacity or placement?
+    execution_kind: train
+    handler: lora_capacity_control
+    axes:
+      dataset: [pan]
+      rank: [8, 16, 32]
+      placement: [selected, all_layers_parameter_matched]
+    requires: []
+    metrics: [trainable_parameters, wildguard_asr, over_refusal]
+    completion_artifacts: [parameter_budget.json, eval_predictions.jsonl]
+  - id: P1-15
+    priority: P1
+    family: subspace
+    question: Are energy threshold and rank cap fragile engineering choices?
+    execution_kind: train
+    handler: subspace_hyperparameter_sweep
+    axes:
+      dataset: [pan]
+      energy_threshold: [0.6, 0.7, 0.8, 0.9, 0.95]
+      rank_cap: [8, 16, 32, 64]
+    requires: []
+    metrics: [effective_rank, retained_energy, wildguard_asr, over_refusal]
+    completion_artifacts: [subspace_manifest.json, eval_predictions.jsonl]
+  - id: P1-16
+    priority: P1
+    family: data_efficiency
+    question: How much Phase1 and PhaseF data does the method need?
+    execution_kind: train
+    handler: data_efficiency_sweep
+    axes:
+      dataset: [pan]
+      phase: [phase1, phasef]
+      samples_per_label: [100, 250, 500, 1000, all]
+    requires: []
+    metrics: [sample_count, wildguard_asr, over_refusal]
+    completion_artifacts: [sampling_manifest.json, eval_predictions.jsonl]
+  - id: P1-17
+    priority: P1
+    family: curation
+    question: Do class balance and curation determine the result?
+    execution_kind: train
+    handler: curation_control
+    axes:
+      dataset: [pan]
+      balance: [true, false]
+      curation: ["off", minimal, strict]
+    requires: []
+    metrics: [drop_reasons, label_counts, wildguard_asr, over_refusal]
+    completion_artifacts: [curation_manifest.json, eval_predictions.jsonl]
+  - id: P1-18
+    priority: P1
+    family: subgroup_analysis
+    question: Does the aggregate PAN result hide jailbreak-category failures?
+    execution_kind: analyze
+    handler: pan_subgroup_analysis
+    axes: {grouping: [attack_family, benign_length, benign_topic]}
+    requires: [pan_predictions]
+    metrics: [subgroup_asr, subgroup_hr, subgroup_over_refusal]
+    completion_artifacts: [pan_subgroups.json]
+  - id: P1-19
+    priority: P1
+    family: utility
+    question: Is lower over-refusal purchased at the cost of general capability?
+    execution_kind: evaluate
+    handler: general_capability_suite
+    axes: {benchmark: [mmlu, gsm8k, ifeval, humaneval, mbpp]}
+    requires: [trained_checkpoints, benchmark_assets]
+    metrics: [accuracy, pass_at_1, instruction_following]
+    completion_artifacts: [general_capability.json]
+  - id: P1-20
+    priority: P1
+    family: mechanism
+    question: Does training move student representations toward targets and behavior?
+    execution_kind: analyze
+    handler: representation_behavior_analysis
+    axes: {label: [harmful, harmless]}
+    requires: [aligned_predictions]
+    metrics: [layer_cosine_change, behavior_correlation]
+    completion_artifacts: [representation_behavior.json]
+
+  - id: P2-01
+    priority: P2
+    family: mechanism
+    question: Is the learned safety subspace stable under data bootstrap?
+    execution_kind: analyze
+    handler: subspace_bootstrap
+    axes: {draw: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]}
+    overrides: {subspace.mode: bootstrap}
+    requires: [alignment_hidden_states]
+    metrics: [layer_jaccard, principal_angles, projection_overlap]
+    completion_artifacts: [bootstrap_stability.json]
+  - id: P2-02
+    priority: P2
+    family: mechanism
+    question: Do selected subspace directions causally affect harmful and benign behavior?
+    execution_kind: evaluate
+    handler: causal_intervention
+    axes: {layers: [key, random], sign: [-1, 1], strength: [0.25, 0.5, 1.0, 2.0]}
+    requires: [subspace_artifact, intervention_data, intervention_model]
+    metrics: [behavior_delta, hidden_projection_delta]
+    completion_artifacts: [intervention_results.json]
+  - id: P2-03
+    priority: P2
+    family: teacher_scale
+    question: Is performance driven by teacher size or teacher safety quality?
+    execution_kind: train
+    handler: teacher_quality_control
+    axes: {teacher: [same_size_base, safety_tuned, qwen3_4b, qwen3_8b]}
+    requires: []
+    metrics: [target_quality, student_gain, correlation]
+    completion_artifacts: [teacher_quality.json, eval_predictions.jsonl]
+  - id: P2-04
+    priority: P2
+    family: cross_architecture
+    question: Can semantic transfer cross tokenizer and model-family boundaries?
+    execution_kind: train
+    handler: cross_tokenizer_bridge
+    axes: {bridge_mode: [token_string, embedding_nearest]}
+    overrides: {bridge.mode: token_string}
+    requires: []
+    metrics: [match_coverage, conflict_rate, wildguard_asr, over_refusal]
+    completion_artifacts: [bridge_audit.json, eval_predictions.jsonl]
+  - id: P2-05
+    priority: P2
+    family: generation
+    question: Are conclusions robust to decoding and generation length?
+    execution_kind: evaluate
+    handler: decoding_robustness
+    axes: {temperature: [0.0, 0.7], top_p: [1.0, 0.9], max_new_tokens: [256, 1024]}
+    requires: [trained_checkpoints, evaluation_data]
+    metrics: [wildguard_asr, harmful_refusal, over_refusal]
+    completion_artifacts: [decoding_robustness.json]
+  - id: P2-06
+    priority: P2
+    family: efficiency
+    question: What time, memory, storage, and accelerator cost does each phase add?
+    execution_kind: analyze
+    handler: efficiency_profile
+    axes: {phase: [extract, subspace, semantic_basis, decompose, recompose, train]}
+    requires: [phase_runtime_logs]
+    metrics: [wall_seconds, peak_memory_bytes, disk_bytes, device_hours]
+    completion_artifacts: [efficiency_profile.json]
+  - id: P2-07
+    priority: P2
+    family: ethics_data
+    question: Are licenses, deduplication, overlap, sources, and harmful-content handling auditable?
+    execution_kind: analyze
+    handler: ethics_data_audit
+    axes: {scope: [formal_datasets]}
+    requires: [dataset_registry, split_manifests]
+    metrics: [overlap_count, duplicate_count, source_distribution, template_diversity]
+    completion_artifacts: [ethics_data_audit.json]

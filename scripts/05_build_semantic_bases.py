@@ -13,6 +13,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.semantic_basis import build_semantic_basis_from_lm_head
+from src.ablations.strategies.bridge import (
+    fit_orthogonal_procrustes,
+    fit_ridge,
+    match_embedding_nearest,
+    match_token_strings,
+    validate_bridge_mode,
+    vocabularies_identical,
+)
+from src.phase_b.hidden_states import load_hidden_state_split
 from src.models.hf_loader import load_hf_model
 from src.utils.config import Phase1ModelConfig, load_phase1_config
 from src.utils.io import ensure_dir, write_json
@@ -42,6 +51,13 @@ def parse_args() -> argparse.Namespace:
         default="float16",
         help="On-disk dtype for the semantic basis tensor.",
     )
+    parser.add_argument(
+        "--bridge-mode",
+        choices=["vocabulary", "token_string", "embedding_nearest", "ridge", "orthogonal_procrustes"],
+        default="vocabulary",
+    )
+    parser.add_argument("--ridge-alpha", type=float, default=1e-4)
+    parser.add_argument("--min-match-coverage", type=float, default=0.8)
     return parser.parse_args()
 
 
@@ -91,7 +107,7 @@ def main() -> None:
         log_path=str(log_path),
     )
 
-    tokenizer, model, meta = load_hf_model(
+    teacher_tokenizer, model, meta = load_hf_model(
         model_path=cfg.teacher.path,
         device_map=cfg.teacher.device_map,
         torch_dtype=cfg.teacher.torch_dtype,
@@ -102,11 +118,15 @@ def main() -> None:
         local_files_only=cfg.teacher.local_files_only,
         attn_implementation=cfg.teacher.attn_implementation,
     )
-    _ = tokenizer
     basis_result = build_semantic_basis_from_lm_head(
         model.lm_head.weight,
         chunk_size=args.chunk_size,
         storage_dtype=args.storage_dtype,
+    )
+    teacher_embeddings = (
+        model.get_input_embeddings().weight.detach().cpu()
+        if args.bridge_mode == "embedding_nearest"
+        else None
     )
     teacher_payload = _build_payload(
         model_cfg=cfg.teacher,
@@ -129,7 +149,7 @@ def main() -> None:
         _save_basis(student_path, student_payload)
     else:
         del model
-        _, student_model, _ = load_hf_model(
+        student_tokenizer, student_model, _ = load_hf_model(
             model_path=cfg.student.path,
             device_map=cfg.student.device_map,
             torch_dtype=cfg.student.torch_dtype,
@@ -145,6 +165,11 @@ def main() -> None:
             chunk_size=args.chunk_size,
             storage_dtype=args.storage_dtype,
         )
+        student_embeddings = (
+            student_model.get_input_embeddings().weight.detach().cpu()
+            if args.bridge_mode == "embedding_nearest"
+            else None
+        )
         student_payload = _build_payload(
             model_cfg=cfg.student,
             model_tag="student",
@@ -152,6 +177,92 @@ def main() -> None:
             source_path=cfg.student.path,
         )
         _save_basis(student_path, student_payload)
+
+    if same_model:
+        student_tokenizer = teacher_tokenizer
+        student_model = model
+        student_embeddings = teacher_embeddings
+
+    teacher_vocab = teacher_tokenizer.get_vocab()
+    student_vocab = student_tokenizer.get_vocab()
+    tokenizer_shared = vocabularies_identical(teacher_vocab, student_vocab)
+    bridge_mode = validate_bridge_mode(args.bridge_mode, tokenizer_shared=tokenizer_shared)
+    bridge_payload: Dict[str, object] = {
+        "bridge_mode": bridge_mode,
+        "tokenizer_shared": tokenizer_shared,
+        "teacher_model": cfg.teacher.name,
+        "student_model": cfg.student.name,
+    }
+    if bridge_mode in {"vocabulary", "token_string", "embedding_nearest"}:
+        if bridge_mode == "vocabulary":
+            token_result = match_token_strings(teacher_vocab, student_vocab)
+            if not tokenizer_shared:
+                raise ValueError("vocabulary bridge requires exactly identical tokenizer vocabularies")
+        elif bridge_mode == "token_string":
+            token_result = match_token_strings(
+                teacher_vocab,
+                student_vocab,
+                teacher_special_ids=set(getattr(teacher_tokenizer, "all_special_ids", [])),
+                student_special_ids=set(getattr(student_tokenizer, "all_special_ids", [])),
+            )
+        else:
+            if teacher_embeddings is None or student_embeddings is None:
+                raise RuntimeError("embedding bridge weights were not retained during model loading")
+            if teacher_embeddings.size(1) != student_embeddings.size(1):
+                anchors = match_token_strings(teacher_vocab, student_vocab)
+                if anchors.coverage < args.min_match_coverage:
+                    raise ValueError("insufficient shared-token coverage to align cross-dimensional embeddings")
+                teacher_ids = torch.tensor(sorted(anchors.teacher_to_student), dtype=torch.long)
+                student_ids = torch.tensor([anchors.teacher_to_student[int(i)] for i in teacher_ids], dtype=torch.long)
+                align = fit_ridge(
+                    teacher_embeddings.index_select(0, teacher_ids),
+                    student_embeddings.index_select(0, student_ids),
+                    alpha=args.ridge_alpha,
+                )
+                teacher_embeddings = teacher_embeddings @ align
+            token_result = match_embedding_nearest(
+                teacher_embeddings,
+                student_embeddings,
+                min_cosine=0.0,
+                teacher_special_ids=set(getattr(teacher_tokenizer, "all_special_ids", [])),
+                student_special_ids=set(getattr(student_tokenizer, "all_special_ids", [])),
+            )
+        if token_result.coverage < args.min_match_coverage:
+            raise ValueError(
+                f"bridge match coverage {token_result.coverage:.4f} is below {args.min_match_coverage:.4f}"
+            )
+        bridge_payload.update(
+            teacher_to_student={str(k): int(v) for k, v in token_result.teacher_to_student.items()},
+            coverage=token_result.coverage,
+            conflicts=token_result.conflicts,
+            unmatched_teacher_ids=list(token_result.unmatched_teacher_ids),
+        )
+    else:
+        pairing = json.loads(
+            (Path(cfg.extraction.output_root) / "layer_pairing" / "teacher_student_layer_pairs.json").read_text(encoding="utf-8")
+        )["pairs"]
+        teacher_split = load_hidden_state_split(
+            Path(cfg.extraction.output_root) / "hidden_states" / "teacher_alignment"
+        )
+        student_split = load_hidden_state_split(
+            Path(cfg.extraction.output_root) / "hidden_states" / "student_alignment"
+        )
+        if teacher_split.sample_ids != student_split.sample_ids:
+            raise ValueError("teacher/student alignment sample IDs must match exactly for hidden bridge fitting")
+        mappings = {}
+        for pair_idx, pair in enumerate(pairing):
+            teacher_hidden = teacher_split.layer_tensors[int(pair["teacher_layer"])]
+            student_hidden = student_split.layer_tensors[int(pair["student_layer"])]
+            mapping = (
+                fit_ridge(teacher_hidden, student_hidden, alpha=args.ridge_alpha)
+                if bridge_mode == "ridge"
+                else fit_orthogonal_procrustes(teacher_hidden, student_hidden)
+            )
+            mappings[str(pair_idx)] = mapping
+        bridge_payload.update(pairing=pairing, mappings=mappings, alignment_sample_ids=teacher_split.sample_ids)
+
+    bridge_path = output_root / "bridge_artifact.pt"
+    torch.save(bridge_payload, bridge_path)
 
     write_json(
         output_root / "vocab_index_map.json",
@@ -162,8 +273,10 @@ def main() -> None:
             "teacher_basis_path": str(teacher_path),
             "student_basis_path": str(student_path),
             "vocab_size": basis_result.vocab_size,
-            "tokenizer_shared": same_model,
-            "note": "Token ids follow the tokenizer vocabulary indices directly.",
+            "tokenizer_shared": tokenizer_shared,
+            "bridge_mode": bridge_mode,
+            "bridge_artifact_path": str(bridge_path),
+            "note": "Token ids may be reused only when tokenizer vocabularies are exactly identical.",
         },
     )
     write_json(
@@ -177,6 +290,8 @@ def main() -> None:
             "storage_dtype": args.storage_dtype,
             "vocab_size": basis_result.vocab_size,
             "hidden_size": basis_result.hidden_size,
+            "bridge_mode": bridge_mode,
+            "bridge_artifact_path": str(bridge_path),
         },
     )
     log_kv(

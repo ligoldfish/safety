@@ -6,6 +6,8 @@ from typing import Any, Dict
 
 import yaml
 
+from src.ablations.platform import resolve_portable_path
+
 
 @dataclass
 class BaselineModelConfig:
@@ -38,6 +40,14 @@ class EvalTaskConfig:
     max_new_tokens: int = 128
     initial_max_new_tokens: int = 0
     exec_timeout_seconds: int = 3
+    temperature: float = 0.0
+    top_p: float = 1.0
+
+    def __post_init__(self) -> None:
+        if float(self.temperature) < 0.0:
+            raise ValueError("temperature must be non-negative")
+        if not 0.0 < float(self.top_p) <= 1.0:
+            raise ValueError("top_p must be in (0,1]")
 
 
 @dataclass
@@ -105,6 +115,7 @@ class SafetyDatasetConfig:
     max_eval_samples: int = 0
     max_eval_samples_per_label: int = 0
     eval_output_path: str = ""
+    eval_holdout_fraction: float = 0.1
 
 
 @dataclass
@@ -216,41 +227,36 @@ def _read_yaml(path: str | Path) -> Dict[str, Any]:
     return payload
 
 
-def _resolve_path(value: str, base_dir: Path) -> str:
-    if not value:
-        return value
-    if "://" in value:
-        return value
-    path = Path(value)
-    if path.is_absolute():
-        return str(path)
-    return str((base_dir / path).resolve())
+def _resolve_path(value: str, base_dir: Path, *, category: str) -> str:
+    return resolve_portable_path(value, base_dir, category=category)
 
 
-def _resolve_path_in_mapping(raw: Dict[str, Any], base_dir: Path, keys: list[str]) -> Dict[str, Any]:
+def _resolve_path_in_mapping(
+    raw: Dict[str, Any], base_dir: Path, keys: list[str], *, category: str
+) -> Dict[str, Any]:
     data = dict(raw)
     for key in keys:
         if key in data:
-            data[key] = _resolve_path(str(data[key]), base_dir)
+            data[key] = _resolve_path(str(data[key]), base_dir, category=category)
     return data
 
 
 def _to_model_config(raw: Dict[str, Any], base_dir: Path) -> BaselineModelConfig:
     data = dict(raw)
-    data["path"] = _resolve_path(str(data["path"]), base_dir)
+    data["path"] = _resolve_path(str(data["path"]), base_dir, category="model")
     return BaselineModelConfig(**data)
 
 
 def _to_eval_task_config(raw: Dict[str, Any], base_dir: Path) -> EvalTaskConfig:
     data = dict(raw)
     if "path" in data:
-        data["path"] = _resolve_path(str(data["path"]), base_dir)
+        data["path"] = _resolve_path(str(data["path"]), base_dir, category="data")
     return EvalTaskConfig(**data)
 
 
 def _to_output_config(raw: Dict[str, Any], base_dir: Path) -> BaselineOutputConfig:
     data = dict(raw)
-    data["output_root"] = _resolve_path(str(data["output_root"]), base_dir)
+    data["output_root"] = _resolve_path(str(data["output_root"]), base_dir, category="output")
     return BaselineOutputConfig(**data)
 
 
@@ -270,6 +276,7 @@ def load_eval_config(path: str | Path) -> BaselineEvalConfig:
         dict(raw.get("adapter", {})),
         base_dir,
         ["manifest_path", "checkpoint_path"],
+        category="output",
     )
 
     return BaselineEvalConfig(
@@ -279,7 +286,7 @@ def load_eval_config(path: str | Path) -> BaselineEvalConfig:
         datasets=datasets,
         runtime=EvalRuntimeConfig(**dict(raw.get("runtime", {}))),
         output=EvalOutputConfig(
-            output_root=_resolve_path(str(dict(raw["output"])["output_root"]), base_dir)
+            output_root=_resolve_path(str(dict(raw["output"])["output_root"]), base_dir, category="output")
         ),
     )
 
@@ -287,11 +294,11 @@ def load_eval_config(path: str | Path) -> BaselineEvalConfig:
 def _to_safety_dataset_config(raw: Dict[str, Any], base_dir: Path) -> SafetyDatasetConfig:
     data = dict(raw)
     if "repo_or_data_path" in data and data["repo_or_data_path"]:
-        data["repo_or_data_path"] = _resolve_path(str(data["repo_or_data_path"]), base_dir)
+        data["repo_or_data_path"] = _resolve_path(str(data["repo_or_data_path"]), base_dir, category="data")
     if "cache_dir" in data and data["cache_dir"]:
-        data["cache_dir"] = _resolve_path(str(data["cache_dir"]), base_dir)
+        data["cache_dir"] = _resolve_path(str(data["cache_dir"]), base_dir, category="data")
     if "eval_output_path" in data and data["eval_output_path"]:
-        data["eval_output_path"] = _resolve_path(str(data["eval_output_path"]), base_dir)
+        data["eval_output_path"] = _resolve_path(str(data["eval_output_path"]), base_dir, category="data")
     if "sources" in data and data["sources"] is not None:
         data["sources"] = [str(item) for item in data["sources"]]
     if "helpful_sources" in data and data["helpful_sources"] is not None:
@@ -305,6 +312,7 @@ def _to_supervised_data_config(raw: Dict[str, Any], base_dir: Path) -> Supervise
         raw,
         base_dir,
         ["train_split", "val_split", "test_split"],
+        category="data",
     )
     return SupervisedDataConfig(
         train_split=str(data.get("train_split", "")),

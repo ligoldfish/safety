@@ -318,6 +318,8 @@ def evaluate_pan(
     max_new_tokens: int,
     batch_size: int = 1,
     initial_max_new_tokens: int = 0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
 ) -> Dict[str, Any]:
     """Run PAN refusal-rate eval. ``initial_max_new_tokens`` (when >0 and <
     ``max_new_tokens``) is used for a budgeted first pass; samples whose
@@ -336,6 +338,8 @@ def evaluate_pan(
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
         initial_max_new_tokens=initial_max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
     )
     metrics["status"] = "ok"
     metrics["num_samples"] = len(records)

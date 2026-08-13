@@ -22,7 +22,7 @@ def _to_float(value: Any) -> Optional[float]:
 
 
 def select_iso_hr(
-    checkpoints: List[Dict[str, Any]], target_hr: float, epsilon: float
+    checkpoints: List[Dict[str, Any]], target_hr: float, epsilon: float, *, selection_split: str = "validation"
 ) -> Optional[Dict[str, Any]]:
     """Pick the checkpoint with val HR closest to ``target_hr``.
 
@@ -33,6 +33,8 @@ def select_iso_hr(
     same units as ``val_hr`` (fractions in [0,1]).
     """
 
+    if str(selection_split).strip().lower() not in {"validation", "val"}:
+        raise ValueError("ISO-HR checkpoint selection must use validation only")
     usable = [c for c in checkpoints if _to_float(c.get("val_hr")) is not None]
     if not usable:
         return None

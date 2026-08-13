@@ -104,6 +104,14 @@ def parse_args() -> argparse.Namespace:
             "none: trust the caller (skip injection even when no harmless rows)."
         ),
     )
+    parser.add_argument(
+        "--validation-only",
+        action="store_true",
+        help=(
+            "Do not read/copy the PAN transfer test set. Used only by upstream "
+            "validation model selection; formal result runs keep the default."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -283,15 +291,12 @@ def main() -> None:
         sanity_fraction=float(args.sanity_fraction),
     )
 
-    # Phase F SFT training reads train_set.jsonl (full data). Phase 1 reads
-    # alignment_set.jsonl, which is the SOLE responsibility of
-    # scripts/19b_curate_phase1_subset.py (even in mode=off, where 19b copies
-    # train_set.jsonl byte-for-byte). We deliberately do NOT write
-    # alignment_set.jsonl here: doing so created a race where a previous 19b
-    # crash left the full train set in place, and the next 19b run (without
-    # --force-rebuild) saw the existing file and silently treated it as
-    # already-curated.
+    # Phase F reads train_set.jsonl. Materialize an identical default
+    # alignment_set.jsonl so this standalone command satisfies its documented
+    # five-file contract. 19b may later replace it with a curated subset; its
+    # own manifest/hash remains the authority for whether curation completed.
     write_jsonl(output_dir / "train_set.jsonl", train_split)
+    write_jsonl(output_dir / "alignment_set.jsonl", train_split)
     write_jsonl(output_dir / "analysis_val_set.jsonl", val_split)
     write_jsonl(output_dir / "sanity_test_set.jsonl", sanity_split)
     # pan_train_set is the hidden-state extraction source; SemAlign uses the
@@ -300,13 +305,17 @@ def main() -> None:
 
     pan_test_src = pan_processed_dir / "pan_test_set.jsonl"
     pan_test_dst = output_dir / "pan_test_set.jsonl"
-    if pan_test_src.exists():
+    if args.validation_only:
+        pan_test_copied = False
+    elif pan_test_src.exists():
         shutil.copyfile(pan_test_src, pan_test_dst)
+        pan_test_copied = True
     else:
         # Fall back to the sanity split so downstream scripts still find a
         # readable file. Transfer-test numbers will then be on safety data,
         # which is recorded explicitly in the summary below.
         write_jsonl(pan_test_dst, sanity_split)
+        pan_test_copied = False
 
     label_counts = {"harmful": 0, "harmless": 0}
     for record in train_split:
@@ -330,7 +339,8 @@ def main() -> None:
         "safety_jsonl": str(safety_path),
         "output_dir": str(output_dir),
         "pan_processed_dir": str(pan_processed_dir),
-        "pan_test_copied": pan_test_src.exists(),
+        "pan_test_copied": pan_test_copied,
+        "validation_only": bool(args.validation_only),
         "total_records": len(safety_records),
         "train_size": len(train_split),
         "val_size": len(val_split),

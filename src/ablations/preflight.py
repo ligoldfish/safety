@@ -1,0 +1,654 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import shutil
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable, Mapping
+
+import yaml
+
+from .platform import resolve_portable_path
+from .schema import ExperimentCell
+from .data_audit import audit_train_eval_splits
+from src.data.dataset_io import PAN_REQUIRED_FILES
+from src.pairs import apply_tokens
+
+
+@dataclass(frozen=True)
+class AssetRequirement:
+    asset_id: str
+    path: Path
+    kind: str
+    cell_id: str = ""
+    min_free_bytes: int = 0
+    selectors: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class PreflightIssue:
+    cell_id: str
+    asset_id: str
+    code: str
+    category: str
+    message: str
+    suggestion: str
+
+
+@dataclass(frozen=True)
+class PreflightReport:
+    status: str
+    issues: tuple[PreflightIssue, ...]
+    checked: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "checked": list(self.checked),
+            "issues": [asdict(issue) for issue in self.issues],
+        }
+
+
+def _training_pair_and_teacher(cell: ExperimentCell) -> tuple[str, str]:
+    axes = {**dict(cell.overrides), **dict(cell.axes)}
+    pair = str(axes.get("pair", "qwen35_9b_to_08b"))
+    teacher_variant = ""
+    if cell.experiment_id == "P2-03":
+        teacher = str(axes.get("teacher", ""))
+        pair = "qwen3_8b_to_06b" if teacher == "qwen3_8b" else "qwen3_4b_to_06b"
+        if teacher in {"same_size_base", "safety_tuned"}:
+            teacher_variant = teacher
+    elif cell.experiment_id == "P2-04":
+        pair = "qwen3_8b_to_llama32_1b"
+    return pair, teacher_variant
+
+
+def training_model_requirements(
+    cell: ExperimentCell,
+    *,
+    project_root: str | Path,
+    environment: Mapping[str, str] | None = None,
+    device: str = "npu",
+) -> tuple[AssetRequirement, ...]:
+    """Resolve the effective teacher/student snapshots for one training cell."""
+
+    root = Path(project_root).resolve()
+    pair, teacher_variant = _training_pair_and_teacher(cell)
+    config_path = root / "configs" / f"{pair}_phase1_{device}.yaml"
+    if not config_path.is_file():
+        raise ValueError(f"training pair config is missing: {config_path}")
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    try:
+        teacher = dict(raw["models"]["teacher"])
+        student = dict(raw["models"]["student"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"training pair config has invalid model entries: {config_path}") from exc
+    if teacher_variant:
+        registry_path = root / "configs" / "ablations" / "teacher_registry.yaml"
+        registry = yaml.safe_load(registry_path.read_text(encoding="utf-8")) or {}
+        try:
+            teacher = dict(registry["teachers"][teacher_variant])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"teacher registry lacks {teacher_variant}") from exc
+        teacher_base = registry_path.parent
+    else:
+        teacher_base = config_path.parent
+    result = []
+    for asset_id, entry, base in (
+        ("training_teacher_model", teacher, teacher_base),
+        ("training_student_model", student, config_path.parent),
+    ):
+        value = str(entry.get("path", "")).strip()
+        if not value:
+            raise ValueError(f"{asset_id} path is missing from {config_path}")
+        path = Path(
+            resolve_portable_path(
+                value,
+                base,
+                category="model",
+                environment=environment,
+            )
+        ).resolve()
+        result.append(AssetRequirement(asset_id, path, "model", cell.cell_id))
+    return tuple(result)
+
+
+def _resolved_yaml_path(
+    value: object,
+    *,
+    base_dir: Path,
+    category: str,
+    environment: Mapping[str, str] | None,
+) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"training {category} path is missing")
+    return Path(
+        resolve_portable_path(
+            text,
+            base_dir,
+            category=category,
+            environment=environment,
+        )
+    ).resolve()
+
+
+def training_data_requirements(
+    cell: ExperimentCell,
+    *,
+    project_root: str | Path,
+    environment: Mapping[str, str] | None = None,
+    device: str = "npu",
+) -> tuple[AssetRequirement, ...]:
+    """Resolve only the source files the effective training pipeline reads."""
+
+    root = Path(project_root).resolve()
+    axes = {**dict(cell.overrides), **dict(cell.axes)}
+    dataset = str(
+        axes.get(
+            "dataset",
+            "wildjailbreak" if cell.experiment_id == "P0-06" else "pan",
+        )
+    )
+    pair, _ = _training_pair_and_teacher(cell)
+    phase1_path = root / "configs" / f"{pair}_phase1_{device}.yaml"
+    if not phase1_path.is_file():
+        raise ValueError(f"training pair config is missing: {phase1_path}")
+    phase1 = yaml.safe_load(phase1_path.read_text(encoding="utf-8")) or {}
+    try:
+        phase1_dataset = dict(phase1["dataset"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"training pair config has invalid dataset: {phase1_path}") from exc
+
+    if dataset == "pan":
+        pan_root = _resolved_yaml_path(
+            phase1_dataset.get("pan_repo_dir"),
+            base_dir=phase1_path.parent,
+            category="data",
+            environment=environment,
+        )
+        return tuple(
+            AssetRequirement(
+                "training_pan_" + Path(filename).stem,
+                pan_root / "data" / filename,
+                "file",
+                cell.cell_id,
+            )
+            for filename in PAN_REQUIRED_FILES
+        )
+
+    sft_name = apply_tokens(
+        f"baseline_sft_qwen35_08b_{dataset}_{device}.yaml",
+        pair,
+    )
+    sft_path = root / "configs" / sft_name
+    if not sft_path.is_file():
+        raise ValueError(f"training dataset config is missing: {sft_path}")
+    sft = yaml.safe_load(sft_path.read_text(encoding="utf-8")) or {}
+    try:
+        data = dict(sft["data"])
+        safety = dict(data.get("safety_dataset") or {})
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"training dataset config has invalid data block: {sft_path}") from exc
+    train = _resolved_yaml_path(
+        data.get("train_split"),
+        base_dir=sft_path.parent,
+        category="data",
+        environment=environment,
+    )
+    evaluation = _resolved_yaml_path(
+        safety.get("eval_output_path") or data.get("test_split"),
+        base_dir=sft_path.parent,
+        category="data",
+        environment=environment,
+    )
+    pan_processed = _resolved_yaml_path(
+        phase1_dataset.get("processed_dir"),
+        base_dir=phase1_path.parent,
+        category="data",
+        environment=environment,
+    )
+    return (
+        AssetRequirement("training_safety_train", train, "file", cell.cell_id),
+        AssetRequirement("training_safety_eval", evaluation, "file", cell.cell_id),
+        AssetRequirement(
+            "training_pan_test",
+            pan_processed / "pan_test_set.jsonl",
+            "file",
+            cell.cell_id,
+        ),
+    )
+
+
+def requirements_from_manifest(
+    asset_ids: Iterable[str],
+    manifest: Mapping[str, object],
+    *,
+    cell_id: str,
+    base_dir: str | Path | None = None,
+    selectors: Mapping[str, object] | None = None,
+) -> tuple[list[AssetRequirement], tuple[str, ...]]:
+    """Translate only explicitly declared cell requirements into checks."""
+
+    requirements: list[AssetRequirement] = []
+    missing: list[str] = []
+    for raw_id in asset_ids:
+        asset_id = str(raw_id)
+        if asset_id not in manifest:
+            missing.append(asset_id)
+            continue
+        raw = manifest[asset_id]
+        if isinstance(raw, str):
+            path_text = raw.strip()
+            kind = "directory" if Path(path_text).suffix == "" else "file"
+        elif isinstance(raw, Mapping):
+            path_text = str(raw.get("path", "")).strip()
+            kind = str(raw.get("kind", "directory")).strip().lower()
+        else:
+            raise ValueError(f"asset {asset_id} must declare a path string or object")
+        if not path_text:
+            raise ValueError(f"asset {asset_id} path must be non-empty")
+        if kind not in {"file", "directory", "model"}:
+            raise ValueError(f"asset {asset_id} has unsupported kind: {kind}")
+        path = Path(_expand_manifest_path(path_text)).expanduser()
+        if not path.is_absolute() and base_dir is not None:
+            path = Path(base_dir) / path
+        normalized_selectors = tuple(
+            sorted((str(key), str(value)) for key, value in dict(selectors or {}).items())
+        )
+        requirements.append(
+            AssetRequirement(
+                asset_id,
+                path.resolve(),
+                kind,
+                cell_id,
+                selectors=normalized_selectors,
+            )
+        )
+    return requirements, tuple(missing)
+
+
+def _expand_manifest_path(value: str) -> str:
+    """Expand only documented, non-secret platform root variables."""
+
+    result = str(value)
+    for name in ("SAFETY_MODEL_ROOT", "SAFETY_DATA_ROOT", "SAFETY_OUTPUT_ROOT"):
+        marker = "${" + name + "}"
+        if marker not in result:
+            continue
+        replacement = str(os.environ.get(name, "")).strip()
+        if not replacement:
+            raise ValueError(f"asset path requires environment variable {name}")
+        result = result.replace(marker, replacement)
+    if "${" in result:
+        raise ValueError("asset path contains an unsupported environment variable")
+    return result
+
+
+def _cell_id(asset_id: str, path: Path, explicit: str = "") -> str:
+    if explicit:
+        return explicit
+    digest = hashlib.sha256(f"{asset_id}:{path}".encode("utf-8")).hexdigest()[:12]
+    return f"preflight-{digest}"
+
+
+def _issue(requirement: AssetRequirement, code: str, message: str, suggestion: str) -> PreflightIssue:
+    return PreflightIssue(
+        cell_id=_cell_id(requirement.asset_id, requirement.path, requirement.cell_id),
+        asset_id=requirement.asset_id,
+        code=code,
+        category=requirement.kind,
+        message=message,
+        suggestion=suggestion,
+    )
+
+
+def _read_jsonl_objects(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError("JSONL rows must be objects")
+            rows.append(value)
+    if not rows:
+        raise ValueError("JSONL file is empty")
+    return rows
+
+
+def _registry_path(registry: Path, value: object) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("registry path is empty")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = registry.parent / path
+    return path.resolve()
+
+
+def _validate_checkpoint_registry(requirement: AssetRequirement) -> PreflightIssue | None:
+    registry = requirement.path
+    required = {
+        "checkpoint_id",
+        "pair",
+        "train_corpus",
+        "method",
+        "kind",
+        "checkpoint_hash",
+    }
+    try:
+        rows = _read_jsonl_objects(registry)
+        seen: set[str] = set()
+        for row in rows:
+            if not required <= set(row):
+                raise ValueError("immutable identity fields are missing")
+            checkpoint_id = str(row["checkpoint_id"]).strip()
+            if (
+                not checkpoint_id
+                or Path(checkpoint_id).name != checkpoint_id
+                or checkpoint_id in seen
+            ):
+                raise ValueError("checkpoint_id is invalid or duplicated")
+            seen.add(checkpoint_id)
+            if any(not str(row[key]).strip() for key in required - {"checkpoint_id", "kind"}):
+                raise ValueError("immutable identity field is empty")
+            kind = str(row["kind"]).strip().lower()
+            if kind == "merged":
+                model = _registry_path(registry, row.get("model_path"))
+                if inspect_model_directory(model).status != "READY":
+                    raise ValueError("merged model snapshot is incomplete")
+            elif kind == "adapter":
+                base_model = _registry_path(registry, row.get("base_model_path"))
+                manifest = _registry_path(registry, row.get("manifest_path"))
+                checkpoint = _registry_path(registry, row.get("checkpoint_path"))
+                if inspect_model_directory(base_model).status != "READY":
+                    raise ValueError("adapter base model snapshot is incomplete")
+                if not manifest.is_file() or not checkpoint.is_file():
+                    raise ValueError("adapter artifact is missing")
+                if manifest.stat().st_size == 0 or checkpoint.stat().st_size == 0:
+                    raise ValueError("adapter artifact is empty")
+            else:
+                raise ValueError("unsupported checkpoint kind")
+        selectors = dict(requirement.selectors)
+        if selectors:
+            comparable = {
+                key: value
+                for key, value in selectors.items()
+                if key in {"pair", "train_corpus", "method"}
+            }
+            if comparable and not any(
+                all(str(row.get(key, "")) == value for key, value in comparable.items())
+                for row in rows
+            ):
+                raise ValueError("checkpoint registry lacks the requested cell")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _issue(
+            requirement,
+            "CHECKPOINT_REGISTRY_INVALID",
+            "checkpoint registry is malformed or references incomplete artifacts",
+            "rebuild the immutable checkpoint registry from completed training outputs",
+        )
+    return None
+
+
+def _validate_search_ledger(requirement: AssetRequirement) -> PreflightIssue | None:
+    try:
+        from src.ablations.fairness import load_search_ledger_snapshot
+
+        rows, _ = load_search_ledger_snapshot(requirement.path)
+        selectors = dict(requirement.selectors)
+        requested = {
+            key: value
+            for key, value in selectors.items()
+            if key in {"dataset", "config", "method"}
+        }
+        if requested and not any(
+            all(str(row.get(key, "")) == value for key, value in requested.items())
+            for row in rows
+        ):
+            raise ValueError("search ledger lacks the requested cell")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _issue(
+            requirement,
+            "SEARCH_LEDGER_INVALID",
+            "search ledger is malformed, leaks test selection, has unsafe winners, or uses unequal budgets",
+            "export validation-only trials with equal counts and executable winner hyperparameters for sft1/random/ours",
+        )
+    return None
+
+
+def _validate_model_registry(requirement: AssetRequirement) -> PreflightIssue | None:
+    required = {
+        "cell_id",
+        "pair",
+        "dataset",
+        "method",
+        "model_hash",
+        "dataset_hash",
+        "config_hash",
+        "checkpoint_hash",
+        "commit",
+    }
+    try:
+        rows = _read_jsonl_objects(requirement.path)
+        identities: set[tuple[str, str, str]] = set()
+        cell_ids: set[str] = set()
+        for row in rows:
+            if not required <= set(row):
+                raise ValueError("provenance fields are missing")
+            values = {key: str(row[key]).strip() for key in required}
+            if any(not value or "REPLACE_ME" in value for value in values.values()):
+                raise ValueError("provenance field is empty or placeholder")
+            identity = (values["pair"], values["dataset"], values["method"])
+            if identity in identities or values["cell_id"] in cell_ids:
+                raise ValueError("provenance identity is duplicated")
+            identities.add(identity)
+            cell_ids.add(values["cell_id"])
+        selectors = dict(requirement.selectors)
+        requested = {
+            key: value
+            for key, value in selectors.items()
+            if key in {"pair", "dataset", "method"}
+        }
+        if requested and not any(
+            all(str(row.get(key, "")) == value for key, value in requested.items())
+            for row in rows
+        ):
+            raise ValueError("model registry lacks the requested cell")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _issue(
+            requirement,
+            "MODEL_REGISTRY_INVALID",
+            "main-table registry is malformed, duplicated, or contains placeholders",
+            "export one immutable provenance row for every completed pair/dataset/method cell",
+        )
+    return None
+
+
+def _validate_structured_asset(requirement: AssetRequirement) -> PreflightIssue | None:
+    if requirement.asset_id == "checkpoint_registry":
+        return _validate_checkpoint_registry(requirement)
+    if requirement.asset_id == "search_ledger":
+        return _validate_search_ledger(requirement)
+    if requirement.asset_id == "model_registry":
+        return _validate_model_registry(requirement)
+    return None
+
+
+def _validate_training_split_pairs(
+    requirements: Iterable[AssetRequirement],
+) -> list[PreflightIssue]:
+    grouped: dict[str, dict[str, AssetRequirement]] = {}
+    for requirement in requirements:
+        if requirement.asset_id not in {"training_safety_train", "training_safety_eval"}:
+            continue
+        grouped.setdefault(requirement.cell_id, {})[requirement.asset_id] = requirement
+
+    issues: list[PreflightIssue] = []
+    for pair in grouped.values():
+        train_requirement = pair.get("training_safety_train")
+        eval_requirement = pair.get("training_safety_eval")
+        if train_requirement is None or eval_requirement is None:
+            continue
+        train_path = train_requirement.path
+        eval_path = eval_requirement.path
+        if not train_path.is_file() or not eval_path.is_file():
+            continue
+        if train_path.stat().st_size <= 0 or eval_path.stat().st_size <= 0:
+            continue
+        try:
+            train = _read_jsonl_objects(train_path)
+            evaluation = _read_jsonl_objects(eval_path)
+            for name, rows in (("train", train), ("evaluation", evaluation)):
+                ids = [str(row.get("id", "")).strip() for row in rows]
+                labels = {str(row.get("label", "")).strip().lower() for row in rows}
+                if any(not sample_id for sample_id in ids) or len(ids) != len(set(ids)):
+                    raise ValueError(f"{name} sample ids are empty or duplicated")
+                if labels != {"harmful", "harmless"}:
+                    raise ValueError(f"{name} must contain harmful and harmless labels")
+            audit = audit_train_eval_splits(train, evaluation)
+            if (
+                audit["overlap_count"]
+                or audit["train_duplicate_count"]
+                or audit["eval_duplicate_count"]
+            ):
+                issues.append(
+                    _issue(
+                        train_requirement,
+                        "TRAINING_SPLIT_LEAKAGE",
+                        "training/evaluation prompts overlap or contain duplicates",
+                        "regenerate deduplicated prompt-disjoint train and evaluation JSONL files",
+                    )
+                )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            issues.append(
+                _issue(
+                    train_requirement,
+                    "TRAINING_SPLIT_INVALID",
+                    "training/evaluation JSONL lacks unique ids or both safety labels",
+                    "regenerate schema-valid harmful/harmless training and evaluation splits",
+                )
+            )
+    return issues
+
+
+def run_preflight(
+    requirements: Iterable[AssetRequirement],
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> PreflightReport:
+    # ``environment`` is accepted so callers can test scheduler state, but is
+    # deliberately never serialized: tokens and passwords must not enter logs.
+    del environment
+    requirements = tuple(requirements)
+    issues: list[PreflightIssue] = []
+    checked: list[str] = []
+    for requirement in requirements:
+        path = Path(requirement.path)
+        checked.append(requirement.asset_id)
+        if requirement.kind == "model":
+            model_report = inspect_model_directory(path, cell_id=requirement.cell_id)
+            issues.extend(model_report.issues)
+        elif requirement.kind == "directory":
+            if not path.is_dir():
+                issues.append(_issue(requirement, "ASSET_DIRECTORY_MISSING", "required directory is missing", "prepare or mount the directory before submitting"))
+        elif requirement.kind == "file":
+            if not path.is_file():
+                issues.append(_issue(requirement, "ASSET_FILE_MISSING", "required file is missing", "prepare or upload the file before submitting"))
+            elif path.stat().st_size <= 0:
+                issues.append(_issue(requirement, "ASSET_FILE_EMPTY", "required file is empty", "regenerate or re-upload the complete file"))
+            else:
+                issue = _validate_structured_asset(requirement)
+                if issue is not None:
+                    issues.append(issue)
+        elif requirement.kind == "output":
+            probe = path if path.exists() else path.parent
+            if not probe.exists() or not probe.is_dir():
+                issues.append(_issue(requirement, "OUTPUT_PARENT_MISSING", "output parent directory is missing", "create or mount the persistent output directory"))
+            else:
+                free_bytes = shutil.disk_usage(probe).free
+                if free_bytes < int(requirement.min_free_bytes):
+                    issues.append(_issue(requirement, "OUTPUT_DISK_INSUFFICIENT", "output volume has insufficient free space", "reduce the plan or provision more persistent storage"))
+        else:
+            issues.append(_issue(requirement, "ASSET_KIND_UNKNOWN", "unknown requirement kind", "use file, directory, or model"))
+    issues.extend(_validate_training_split_pairs(requirements))
+    return PreflightReport("READY" if not issues else "BLOCKED", tuple(issues), tuple(checked))
+
+
+def inspect_model_directory(path: str | Path, *, cell_id: str = "") -> PreflightReport:
+    root = Path(path)
+    requirement = AssetRequirement(root.name or "model", root, "model", cell_id)
+    issues: list[PreflightIssue] = []
+    if not root.is_dir():
+        issues.append(_issue(requirement, "MODEL_DIRECTORY_MISSING", "model directory is missing", "mount the persistent model directory"))
+        return PreflightReport("BLOCKED", tuple(issues), (requirement.asset_id,))
+    if not (root / "config.json").is_file():
+        issues.append(_issue(requirement, "MODEL_CONFIG_MISSING", "config.json is missing", "download a complete model snapshot"))
+    tokenizer_candidates = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model", "vocab.json")
+    if not any((root / name).is_file() for name in tokenizer_candidates):
+        issues.append(_issue(requirement, "MODEL_TOKENIZER_MISSING", "tokenizer files are missing", "download tokenizer assets into the model directory"))
+    weight_files = [
+        file for pattern in ("*.safetensors", "pytorch_model*.bin", "*.pth")
+        for file in root.glob(pattern) if file.is_file()
+    ]
+    if not weight_files:
+        issues.append(_issue(requirement, "MODEL_WEIGHTS_MISSING", "model weights are missing", "download all weight shards and any index JSON"))
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = root / index_name
+        if not index_path.is_file():
+            continue
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            shard_names = {str(name) for name in dict(payload["weight_map"]).values()}
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            issues.append(_issue(requirement, "MODEL_INDEX_INVALID", f"invalid weight index: {index_name}", "replace it with a complete snapshot index"))
+            continue
+        missing_shards = sorted(name for name in shard_names if not (root / name).is_file())
+        if missing_shards:
+            issues.append(_issue(requirement, "MODEL_SHARD_MISSING", f"weight index references missing shards: {missing_shards[:3]}", "download every shard listed by the index"))
+    return PreflightReport("READY" if not issues else "BLOCKED", tuple(issues), (requirement.asset_id,))
+
+
+def inspect_submission_package(
+    root: str | Path,
+    *,
+    max_file_bytes: int = 512 * 1024 * 1024,
+    max_total_bytes: int = 512 * 1024 * 1024,
+) -> PreflightReport:
+    package = Path(root)
+    requirement = AssetRequirement("submission_package", package, "package")
+    issues: list[PreflightIssue] = []
+    total = 0
+    if not package.is_dir():
+        issues.append(_issue(requirement, "PACKAGE_DIRECTORY_MISSING", "submission directory is missing", "select an existing code directory"))
+        return PreflightReport("BLOCKED", tuple(issues), (requirement.asset_id,))
+    forbidden_roots = {"models", "model", "data", "datasets", "outputs", "output"}
+    forbidden_suffixes = {".safetensors", ".bin", ".pt", ".pth", ".arrow", ".parquet"}
+    for current, directories, files in os.walk(package, followlinks=False):
+        current_path = Path(current)
+        for name in tuple(directories):
+            child = current_path / name
+            if child.is_symlink():
+                issues.append(_issue(requirement, "PACKAGE_SYMLINK", f"symbolic link is forbidden: {child.relative_to(package)}", "remove links from the upload package"))
+                directories.remove(name)
+            elif current_path == package and name.lower() in forbidden_roots:
+                issues.append(_issue(requirement, "PACKAGE_ASSET_DIRECTORY", f"asset directory is inside package: {child.relative_to(package)}", "mount models/data/outputs from persistent storage"))
+        for name in files:
+            file = current_path / name
+            if file.is_symlink():
+                issues.append(_issue(requirement, "PACKAGE_SYMLINK", f"symbolic link is forbidden: {file.relative_to(package)}", "remove links from the upload package"))
+                continue
+            size = file.stat().st_size
+            total += size
+            if size > max_file_bytes:
+                issues.append(_issue(requirement, "PACKAGE_FILE_TOO_LARGE", f"file exceeds upload limit: {file.relative_to(package)}", "move the file to persistent storage"))
+            if file.suffix.lower() in forbidden_suffixes:
+                issues.append(_issue(requirement, "PACKAGE_ASSET_FILE", f"model/data artifact is inside package: {file.relative_to(package)}", "exclude generated and weight artifacts"))
+    if total > max_total_bytes:
+        issues.append(_issue(requirement, "PACKAGE_TOTAL_TOO_LARGE", "package exceeds total upload limit", "upload code only and mount persistent assets"))
+    return PreflightReport("READY" if not issues else "BLOCKED", tuple(issues), (requirement.asset_id,))

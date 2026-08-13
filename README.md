@@ -1,5 +1,13 @@
 # Qwen3.5 Safety Pipeline
 
+## ICLR 全量消融
+
+- 统一运行说明：[`docs/ablations/ICLR_ALL_ABLATIONS_RUNBOOK.md`](docs/ablations/ICLR_ALL_ABLATIONS_RUNBOOK.md)
+- 35 项实验覆盖表：[`docs/ablations/EXPERIMENT_COVERAGE.md`](docs/ablations/EXPERIMENT_COVERAGE.md)
+- ModelMate 分片作业说明：[`docs/ABLATION_MODELMATE_RUNBOOK.md`](docs/ABLATION_MODELMATE_RUNBOOK.md)
+
+正式训练前必须先执行 `plan` 和精确分片的 `preflight`；本地 CPU 测试不会伪造 NPU 训练结果。
+
 This workspace now keeps the proposal-aligned `00 -> 11` phase-1 pipeline for the Qwen3.5-0.8B safety experiment, plus a smaller exploratory intervention path.
 
 ## Environment

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -9,6 +10,7 @@ import pandas as pd
 
 from .template_qwen import build_qwen_messages
 from src.utils.io import ensure_dir, write_json, write_jsonl
+from src.ablations.data_audit import canonical_prompt, write_data_audit
 
 
 PAN_REQUIRED_FILES = [
@@ -30,6 +32,39 @@ def truncate_pan_prompt(text: str, max_length: int) -> str:
         return text
     half_length = max_length // 2
     return text[:half_length] + text[-half_length:]
+
+
+def _take_frame_excluding_prompts(
+    frame: pd.DataFrame,
+    *,
+    prompt_column: str,
+    protected_prompts: set[str],
+    count: int,
+    max_prompt_chars: int,
+    source_group: str,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    candidate = frame.copy()
+    keys = candidate[prompt_column].astype(str).map(
+        lambda value: canonical_prompt(truncate_pan_prompt(value, max_prompt_chars))
+    )
+    overlap_mask = keys.isin(protected_prompts)
+    eligible = candidate.loc[~overlap_mask].iloc[:count].copy()
+    if len(eligible) < count:
+        raise ValueError(
+            f"Not enough non-overlapping PAN rows for {source_group}: "
+            f"requested {count}, found {len(eligible)}."
+        )
+    drops = [
+        {
+            "id": f"{source_group}:{int(row.get('source_row', index))}",
+            "source": str(row.get("source_dataset", source_group)),
+            "label": "",
+            "prompt_sha256": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+            "drop_reason": "train_eval_prompt_overlap",
+        }
+        for (index, row), key in zip(candidate.loc[overlap_mask].iterrows(), keys.loc[overlap_mask])
+    ]
+    return eligible, drops
 
 
 def _split_train_test(
@@ -160,20 +195,6 @@ def build_pan_train_test_records(
         harmful_train_frames[method] = train_df
         harmful_test_frames[method] = test_df
 
-    train_toxic_df = pd.concat(
-        [harmful_train_frames[method].iloc[:exposure_size].copy() for method in harmful_methods]
-        + [add_moderation_df.iloc[:harmful_remaining].copy()],
-        ignore_index=True,
-    )
-    train_toxic_df["user_text"] = train_toxic_df["jailbroken_prompt"].astype(str)
-    train_toxic_df["accept_response"] = train_toxic_df["accept"].astype(str)
-    train_toxic_df["rejected_response"] = train_toxic_df["rejected"].astype(str)
-
-    train_safe_df = safety_df.iloc[:safe_size].copy()
-    train_safe_df["user_text"] = train_safe_df["jailbroken_prompt"].astype(str)
-    train_safe_df["accept_response"] = train_safe_df["accept"].astype(str)
-    train_safe_df["rejected_response"] = train_safe_df["rejected"].astype(str)
-
     test_toxic_df = pd.concat(
         [harmful_test_frames[method].copy() for method in harmful_methods],
         ignore_index=True,
@@ -186,6 +207,54 @@ def build_pan_train_test_records(
     test_safe_df["user_text"] = test_safe_df["jailbroken_prompt"].astype(str)
     test_safe_df["accept_response"] = test_safe_df["accept"].astype(str)
     test_safe_df["rejected_response"] = test_safe_df["rejected"].astype(str)
+
+    protected_harmful = {
+        canonical_prompt(truncate_pan_prompt(value, max_prompt_chars))
+        for value in test_toxic_df["jailbroken_prompt"].astype(str)
+    }
+    protected_safe = {
+        canonical_prompt(truncate_pan_prompt(value, max_prompt_chars))
+        for value in test_safe_df["jailbroken_prompt"].astype(str)
+    }
+    split_drops: list[dict[str, Any]] = []
+    harmful_train_parts: list[pd.DataFrame] = []
+    for method in harmful_methods:
+        selected, drops = _take_frame_excluding_prompts(
+            harmful_train_frames[method],
+            prompt_column="jailbroken_prompt",
+            protected_prompts=protected_harmful,
+            count=exposure_size,
+            max_prompt_chars=max_prompt_chars,
+            source_group=f"harmful:{method}",
+        )
+        harmful_train_parts.append(selected)
+        split_drops.extend(drops)
+    selected_add, drops = _take_frame_excluding_prompts(
+        add_moderation_df,
+        prompt_column="jailbroken_prompt",
+        protected_prompts=protected_harmful,
+        count=harmful_remaining,
+        max_prompt_chars=max_prompt_chars,
+        source_group="harmful:add_moderation",
+    )
+    split_drops.extend(drops)
+    train_toxic_df = pd.concat(harmful_train_parts + [selected_add], ignore_index=True)
+    train_toxic_df["user_text"] = train_toxic_df["jailbroken_prompt"].astype(str)
+    train_toxic_df["accept_response"] = train_toxic_df["accept"].astype(str)
+    train_toxic_df["rejected_response"] = train_toxic_df["rejected"].astype(str)
+
+    train_safe_df, drops = _take_frame_excluding_prompts(
+        safety_df,
+        prompt_column="jailbroken_prompt",
+        protected_prompts=protected_safe,
+        count=safe_size,
+        max_prompt_chars=max_prompt_chars,
+        source_group="harmless:safety",
+    )
+    split_drops.extend(drops)
+    train_safe_df["user_text"] = train_safe_df["jailbroken_prompt"].astype(str)
+    train_safe_df["accept_response"] = train_safe_df["accept"].astype(str)
+    train_safe_df["rejected_response"] = train_safe_df["rejected"].astype(str)
 
     for frame in [train_toxic_df, train_safe_df, test_toxic_df, test_safe_df]:
         frame["user_text"] = frame["user_text"].astype(str).apply(
@@ -233,6 +302,8 @@ def build_pan_train_test_records(
             "safe_size": safe_size,
             "harmful_remaining_from_add_moderation": harmful_remaining,
             "harmful_methods": harmful_methods,
+            "train_test_prompt_overlap_removed": len(split_drops),
+            "split_drops": split_drops,
             "train_source_counts": pd.Series(
                 [record["source_dataset"] for record in train_records]
             ).value_counts().to_dict(),
@@ -426,6 +497,15 @@ def prepare_phase1_datasets(
     }
     write_json(metadata_path / "split_info.json", split_info)
     write_json(metadata_path / "prompt_template_info.json", prompt_template_info)
+    write_data_audit(
+        metadata_path / "pan_split_audit.json",
+        dataset="pan",
+        train=train_records,
+        evaluation=test_records,
+        drops=list(pan_meta["pan_reconstruction"].get("split_drops", [])),
+        license_name="PAN upstream licenses; see copied source repository",
+        intended_use="safety alignment train/test evaluation",
+    )
 
     return {
         "prompts_all_path": str(processed_path / "prompts_all.jsonl"),

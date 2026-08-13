@@ -133,6 +133,7 @@ def _build_spec(config_path: Path, force_rebuild: bool) -> tuple[SafetyDatasetSp
         max_eval_samples=int(safety_cfg.max_eval_samples or 0),
         max_eval_samples_per_label=int(safety_cfg.max_eval_samples_per_label or 0),
         eval_output_path=eval_output_path or None,
+        eval_holdout_fraction=float(safety_cfg.eval_holdout_fraction),
         seed=seed,
     )
     return spec, kind

@@ -20,8 +20,18 @@ from src.training.eval_utils import (
     looks_like_refusal,
     mean,
 )
-from src.training.losses import cosine_layer_alignment_loss
+from src.ablations.strategies.losses import layer_alignment_loss, supervision_weights
 from src.utils.io import ensure_dir, read_jsonl, write_json
+
+
+def count_nonpadding_tokens(attention_mask: torch.Tensor) -> int:
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        raise ValueError("attention_mask must be a rank-2 tensor")
+    if not torch.isfinite(attention_mask).all():
+        raise ValueError("attention_mask must contain finite binary values")
+    if not torch.all((attention_mask == 0) | (attention_mask == 1)):
+        raise ValueError("attention_mask must contain only 0/1 values")
+    return int(attention_mask.to(dtype=torch.int64).sum().item())
 
 
 def load_student_target_map(target_dir: str | Path) -> tuple[Dict[str, Dict[int, torch.Tensor]], List[int]]:
@@ -225,6 +235,7 @@ class BatchPayload:
     attention_mask: torch.Tensor
     labels: torch.Tensor
     prompt_last_positions: torch.Tensor
+    prompt_lengths: torch.Tensor
     layer_targets: Dict[int, torch.Tensor]
     layer_anchors: Dict[int, torch.Tensor] | None
     sample_ids: List[str]
@@ -341,6 +352,7 @@ class SemAlignCollator:
             attention_mask=encoded_full["attention_mask"],
             labels=labels,
             prompt_last_positions=prompt_last_positions,
+            prompt_lengths=prompt_lengths,
             layer_targets=layer_targets,
             layer_anchors=layer_anchors,
             sample_ids=[str(record["id"]) for record in records],
@@ -365,11 +377,48 @@ def build_dataloader(
     )
 
 
+def select_training_representations(
+    hidden: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    *,
+    mode: str,
+) -> torch.Tensor:
+    """Select differentiable teacher-forced positions using Phase1 semantics."""
+
+    if hidden.ndim != 3 or attention_mask.shape != hidden.shape[:2]:
+        raise ValueError("hidden and attention_mask must share [batch, sequence]")
+    if prompt_lengths.ndim != 1 or prompt_lengths.numel() != hidden.size(0):
+        raise ValueError("prompt_lengths must have shape [batch]")
+    normalized = str(mode).strip().lower()
+    positions = torch.arange(hidden.size(1), device=hidden.device).unsqueeze(0)
+    prompt_lengths = prompt_lengths.to(device=hidden.device, dtype=torch.long).unsqueeze(1)
+    valid = attention_mask.to(device=hidden.device, dtype=torch.bool)
+    if normalized == "last_prompt":
+        indices = prompt_lengths.squeeze(1) - 1
+        return hidden[torch.arange(hidden.size(0), device=hidden.device), indices, :]
+    if normalized == "mean_prompt":
+        mask = valid & (positions < prompt_lengths)
+    elif normalized == "first_generated":
+        mask = valid & (positions == prompt_lengths)
+    elif normalized == "first_4_generated_mean":
+        mask = valid & (positions >= prompt_lengths) & (positions < prompt_lengths + 4)
+    else:
+        raise ValueError(f"unsupported representation mode: {mode}")
+    counts = mask.sum(dim=1)
+    if bool((counts == 0).any().detach().cpu().item()):
+        raise ValueError(f"{normalized} has no valid assistant token in one or more training rows")
+    weights = mask.to(dtype=hidden.dtype).unsqueeze(-1)
+    return (hidden * weights).sum(dim=1) / counts.to(dtype=hidden.dtype).unsqueeze(-1)
+
+
 def _capture_layer_outputs(
     model: nn.Module,
     *,
     layer_ids: Sequence[int],
-    prompt_last_positions: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    representation_mode: str,
     cache: Dict[int, torch.Tensor],
     pair_to_student_layer: Dict[int, int],
 ):
@@ -387,8 +436,12 @@ def _capture_layer_outputs(
 
         def hook(_module, _inputs, output, current_pair_idx=int(pair_idx)):
             hidden = output[0] if isinstance(output, tuple) else output
-            batch_indices = torch.arange(hidden.size(0), device=hidden.device)
-            selected = hidden[batch_indices, prompt_last_positions.to(hidden.device), :]
+            selected = select_training_representations(
+                hidden,
+                attention_mask,
+                prompt_lengths,
+                mode=representation_mode,
+            )
             cache[current_pair_idx] = selected
             return output
 
@@ -446,18 +499,22 @@ def forward_semalign_batch(
     layer_loss_policy: str = "all",
     harmful_layer_weight: float = 1.0,
     harmless_layer_weight: float = 1.0,
+    layer_loss_kind: str = "cosine",
+    contrastive_margin: float = 0.2,
+    representation_mode: str = "last_prompt",
 ) -> tuple[torch.Tensor, Dict[str, float]]:
     inputs = {
         "input_ids": batch.input_ids.to(device),
         "attention_mask": batch.attention_mask.to(device),
         "labels": batch.labels.to(device),
     }
-    prompt_last_positions = batch.prompt_last_positions.to(device)
     cache: Dict[int, torch.Tensor] = {}
     hooks = _capture_layer_outputs(
         model,
         layer_ids=layer_ids,
-        prompt_last_positions=prompt_last_positions,
+        attention_mask=batch.attention_mask.to(device),
+        prompt_lengths=batch.prompt_lengths.to(device),
+        representation_mode=representation_mode,
         cache=cache,
         pair_to_student_layer=pair_to_student_layer,
     )
@@ -482,10 +539,12 @@ def forward_semalign_batch(
         harmless_layer_weight=harmless_layer_weight,
         has_layer_target=batch.has_layer_target,
     )
-    loss_layer, cosine_by_layer = cosine_layer_alignment_loss(
+    loss_layer, cosine_by_layer = layer_alignment_loss(
         predicted_by_layer,
         target_by_layer,
+        kind=layer_loss_kind,
         sample_weights=sample_weights,
+        margin=contrastive_margin,
     )
     loss_out = outputs.loss
     loss_total = (sft_loss_weight * loss_out) + (layer_loss_weight * loss_layer)
@@ -523,34 +582,14 @@ def _layer_sample_weights(
     those rows out.
     """
 
-    policy = str(layer_loss_policy).strip().lower()
-    if policy not in {"all", "harmful_only", "label_weighted", "harmless_anchor"}:
-        raise ValueError(
-            f"Unsupported layer_loss_policy: {layer_loss_policy}. "
-            "Expected 'all', 'harmful_only', 'label_weighted', or 'harmless_anchor'."
-        )
-    has_target_list = (
-        [bool(flag) for flag in has_layer_target.detach().cpu().tolist()]
-        if has_layer_target is not None
-        else [True] * len(labels_text)
+    return supervision_weights(
+        labels_text,
+        mode=layer_loss_policy,
+        harmful_weight=harmful_layer_weight,
+        harmless_weight=harmless_layer_weight,
+        has_target=has_layer_target,
+        device=device,
     )
-    any_missing = not all(has_target_list)
-    if policy == "all" and not any_missing:
-        return None
-    weights = []
-    for label, has_target in zip(labels_text, has_target_list):
-        if not has_target:
-            weights.append(0.0)
-            continue
-        if policy == "all":
-            weights.append(1.0)
-        elif str(label) == "harmful":
-            weights.append(float(harmful_layer_weight))
-        elif str(label) == "harmless":
-            weights.append(0.0 if policy == "harmful_only" else float(harmless_layer_weight))
-        else:
-            weights.append(0.0)
-    return torch.tensor(weights, device=device, dtype=torch.float32)
 
 
 @torch.no_grad()
@@ -564,6 +603,7 @@ def evaluate_layer_alignment(
     layer_loss_policy: str = "all",
     harmful_layer_weight: float = 1.0,
     harmless_layer_weight: float = 1.0,
+    representation_mode: str = "last_prompt",
 ) -> float:
     cosine_scores: List[float] = []
     model.eval()
@@ -572,12 +612,13 @@ def evaluate_layer_alignment(
             "input_ids": batch.input_ids.to(device),
             "attention_mask": batch.attention_mask.to(device),
         }
-        prompt_last_positions = batch.prompt_last_positions.to(device)
         cache: Dict[int, torch.Tensor] = {}
         hooks = _capture_layer_outputs(
             model,
             layer_ids=layer_ids,
-            prompt_last_positions=prompt_last_positions,
+            attention_mask=batch.attention_mask.to(device),
+            prompt_lengths=batch.prompt_lengths.to(device),
+            representation_mode=representation_mode,
             cache=cache,
             pair_to_student_layer=pair_to_student_layer,
         )
@@ -626,6 +667,8 @@ def evaluate_generation_refusal_metrics(
     max_new_tokens: int,
     batch_size: int = 1,
     initial_max_new_tokens: int = 0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
 ) -> Dict[str, Any]:
     """PAN safety metrics with refusal/safe-non-refusal/unsafe split.
 
@@ -672,6 +715,10 @@ def evaluate_generation_refusal_metrics(
     else:
         first_pass_max_new_tokens = full_max_new_tokens
     can_retry = first_pass_max_new_tokens < full_max_new_tokens
+    if float(temperature) < 0.0:
+        raise ValueError("temperature must be non-negative")
+    if not 0.0 < float(top_p) <= 1.0:
+        raise ValueError("top_p must be in (0,1]")
 
     eos_ids: List[int] = []
     if isinstance(tokenizer.eos_token_id, (list, tuple)):
@@ -689,14 +736,16 @@ def evaluate_generation_refusal_metrics(
         )
         encoded = {key: value.to(device) for key, value in encoded.items()}
         with torch.inference_mode():
-            generated = model.generate(
-                **encoded,
-                max_new_tokens=gen_max_new_tokens,
-                do_sample=False,
-                use_cache=True,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id,
-            )
+            generation = {
+                "max_new_tokens": gen_max_new_tokens,
+                "do_sample": float(temperature) > 0.0,
+                "use_cache": True,
+                "eos_token_id": tokenizer.eos_token_id,
+                "pad_token_id": tokenizer.pad_token_id,
+            }
+            if generation["do_sample"]:
+                generation.update(temperature=float(temperature), top_p=float(top_p))
+            generated = model.generate(**encoded, **generation)
         # PPU/NPU eager mode: no XLA graph step required.
         prompt_width = int(encoded["input_ids"].size(1))
         generated_only = generated[:, prompt_width:]

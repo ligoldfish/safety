@@ -73,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing shard files even when skip_existing is enabled.",
     )
+    parser.add_argument(
+        "--representation-mode",
+        choices=["last_prompt", "mean_prompt", "first_generated", "first_4_generated_mean"],
+        default="last_prompt",
+        help="Token-position representation used consistently for this hidden-state artifact.",
+    )
     return parser.parse_args()
 
 
@@ -115,7 +121,11 @@ def _apply_per_label_limit(
 FINGERPRINT_FILENAME = ".extract_fingerprint.json"
 
 
-def _split_fingerprint(records: List[Dict[str, Any]], shard_size: int) -> Dict[str, Any]:
+def _split_fingerprint(
+    records: List[Dict[str, Any]],
+    shard_size: int,
+    representation_mode: str = "last_prompt",
+) -> Dict[str, Any]:
     """Identity fingerprint of a split: ordered sample ids + count + shard size.
 
     Used to detect when the prepared split was rebuilt (e.g. different ids after
@@ -125,7 +135,12 @@ def _split_fingerprint(records: List[Dict[str, Any]], shard_size: int) -> Dict[s
     """
     ids = [str(record["id"]) for record in records]
     id_hash = hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()
-    return {"num_records": len(ids), "shard_size": int(shard_size), "id_hash": id_hash}
+    return {
+        "num_records": len(ids),
+        "shard_size": int(shard_size),
+        "id_hash": id_hash,
+        "representation_mode": str(representation_mode),
+    }
 
 
 def _fingerprint_path(shard_dir: Path) -> Path:
@@ -152,6 +167,7 @@ def _shards_are_fresh(shard_dir: Path, fingerprint: Dict[str, Any]) -> bool:
         stored.get("id_hash") == fingerprint["id_hash"]
         and stored.get("num_records") == fingerprint["num_records"]
         and stored.get("shard_size") == fingerprint["shard_size"]
+        and stored.get("representation_mode", "last_prompt") == fingerprint["representation_mode"]
     )
 
 
@@ -180,6 +196,7 @@ def _save_shard(
     max_length: int,
     batch_size: int,
     storage_dtype: torch.dtype,
+    representation_mode: str = "last_prompt",
 ) -> None:
     hidden_by_layer: Dict[str, List[torch.Tensor]] = {}
     sample_ids: List[str] = []
@@ -194,6 +211,7 @@ def _save_shard(
             tokenizer=tokenizer,
             messages_batch=messages_batch,
             max_length=max_length,
+            mode=representation_mode,
         )
         if not hidden_by_layer:
             hidden_by_layer = {str(layer_idx): [] for layer_idx in range(len(layer_hiddens))}
@@ -210,6 +228,7 @@ def _save_shard(
         "model_name": model_cfg.name,
         "model_path": model_cfg.path,
         "feature_type": "first_generated_token_hidden_state",
+        "representation_mode": representation_mode,
         "layer_indices": list(range(len(hidden_by_layer))),
         "sample_ids": sample_ids,
         "labels": labels,
@@ -230,7 +249,7 @@ def main() -> None:
             "PyTorch is required for hidden-state extraction. Install torch in the active Python environment first."
         )
 
-    from src.features.first_gen_token import gather_first_generated_token_representations
+    from src.features.first_gen_token import gather_position_representations
     from src.models.hf_loader import load_hf_model
 
     cfg = load_phase1_config(args.config)
@@ -283,7 +302,11 @@ def main() -> None:
     # Invalidate stale shards when the prepared split was rebuilt with different
     # ids: skip_existing must not reuse hidden states that no longer match the
     # current data (otherwise downstream id-keyed joins silently drop records).
-    fingerprint = _split_fingerprint(records, cfg.extraction.shard_size)
+    fingerprint = _split_fingerprint(
+        records,
+        cfg.extraction.shard_size,
+        representation_mode=args.representation_mode,
+    )
     data_changed = not _shards_are_fresh(shard_dir, fingerprint)
     if data_changed or args.overwrite:
         removed = _clear_stale_shards(shard_dir)
@@ -307,12 +330,13 @@ def main() -> None:
             shard_idx=shard_idx,
             shard_dir=shard_dir,
             model_cfg=model_cfg,
-            gather_fn=gather_first_generated_token_representations,
+            gather_fn=gather_position_representations,
             tokenizer=tokenizer,
             model=model,
             max_length=cfg.extraction.max_length,
             batch_size=cfg.extraction.batch_size,
             storage_dtype=storage_dtype,
+            representation_mode=args.representation_mode,
         )
         log_kv(
             logger,
@@ -333,6 +357,7 @@ def main() -> None:
         "shard_size": cfg.extraction.shard_size,
         "batch_size": cfg.extraction.batch_size,
         "max_samples_per_label": args.max_samples_per_label,
+        "representation_mode": args.representation_mode,
     }
     summary_path = shard_dir / "manifest.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

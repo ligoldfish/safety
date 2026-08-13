@@ -210,7 +210,9 @@ class RefusalOnlyEvaluatorTests(unittest.TestCase):
             self.assertNotIn(dead_key, metrics)
         for gen in metrics["generations"]:
             self.assertNotIn("retried_for_final_response", gen)
-            self.assertEqual(gen["used_max_new_tokens"], 4)
+            # The fake emits one real continuation token. The metric records
+            # actual generated length, not the requested generation budget.
+            self.assertEqual(gen["used_max_new_tokens"], 1)
             # final_text is the text actually fed to looks_like_refusal
             # (post-preamble-strip). For preamble-free outputs it equals the
             # raw decoded text; scripts/aggregators read it alongside

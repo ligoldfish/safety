@@ -150,15 +150,16 @@ class FirstGeneratedTokenPositionTests(unittest.TestCase):
 
 
 class HiddenStateLoaderStrictnessTests(unittest.TestCase):
-    def _write_shard(self, split_dir: Path, feature_type: str) -> None:
+    def _write_shard(self, split_dir: Path, feature_type: str, *, part: int = 0, mode: str = "last_prompt") -> None:
         torch.save(
             {
                 "feature_type": feature_type,
+                "representation_mode": mode,
                 "sample_ids": ["sample-1"],
                 "labels": ["harmful"],
                 "hidden_by_layer": {"0": torch.zeros(1, 2)},
             },
-            split_dir / "part_000.pt",
+            split_dir / f"part_{part:03d}.pt",
         )
 
     def test_loader_accepts_canonical_feature_type_by_default(self):
@@ -168,6 +169,15 @@ class HiddenStateLoaderStrictnessTests(unittest.TestCase):
             split = load_hidden_state_split(split_dir)
             self.assertFalse(split.legacy_final_response_prefix)
             self.assertEqual(split.labels, ["harmful"])
+            self.assertEqual(split.representation_mode, "last_prompt")
+
+    def test_loader_rejects_mixed_representation_modes(self):
+        with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as tmpdir:
+            split_dir = Path(tmpdir)
+            self._write_shard(split_dir, "first_generated_token_hidden_state", part=0, mode="last_prompt")
+            self._write_shard(split_dir, "first_generated_token_hidden_state", part=1, mode="mean_prompt")
+            with self.assertRaisesRegex(ValueError, "Mixed representation modes"):
+                load_hidden_state_split(split_dir)
 
     def test_loader_rejects_legacy_final_response_prefix_by_default(self):
         with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as tmpdir:

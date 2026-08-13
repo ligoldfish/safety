@@ -4,6 +4,10 @@ import math
 from dataclasses import dataclass
 from typing import List
 
+import torch
+
+from src.ablations.strategies.pairing import pair_layers
+
 
 @dataclass
 class LayerPair:
@@ -53,17 +57,24 @@ def build_layer_pairs(
     *,
     teacher_num_layers: int,
     student_num_layers: int,
+    mode: str = "relative_depth",
+    cka: torch.Tensor | None = None,
+    seed: int | None = None,
 ) -> List[LayerPair]:
+    student_layers = pair_layers(
+        teacher_layers,
+        teacher_layers=teacher_num_layers,
+        student_layers=student_num_layers,
+        mode=mode,
+        cka=cka,
+        seed=seed,
+    )
     pairs: List[LayerPair] = []
-    for teacher_layer in teacher_layers:
+    for teacher_layer, student_layer in zip(teacher_layers, student_layers):
         pairs.append(
             LayerPair(
                 teacher_layer=int(teacher_layer),
-                student_layer=map_teacher_to_student_layer(
-                    int(teacher_layer),
-                    teacher_num_layers=teacher_num_layers,
-                    student_num_layers=student_num_layers,
-                ),
+                student_layer=int(student_layer),
                 teacher_relative_depth=float((int(teacher_layer) + 1) / teacher_num_layers),
             )
         )

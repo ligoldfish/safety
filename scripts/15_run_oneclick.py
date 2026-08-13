@@ -7,7 +7,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import yaml
 
@@ -17,6 +17,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.baselines.config import load_distill_config, load_eval_config, load_sft_config
+from src.ablations.efficiency import (
+    append_efficiency_record,
+    phase_for_script,
+    run_profiled_subprocess,
+)
+from src.ablations.platform import resolve_portable_path
 from src.utils.config import load_phase1_config, load_phasef_config
 from src.pairs import DEFAULT_PAIR, PAIRS, apply_tokens
 
@@ -573,6 +579,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     full_parser.add_argument(
+        "--phase1-stage-extras",
+        default="{}",
+        help=(
+            "JSON object mapping Phase-1 stage names to argv token lists. "
+            "Supported keys: extract, analyze, subspace, pairing, bridge, "
+            "project, decompose, recompose. Tokens are forwarded as argv and "
+            "never passed through a shell."
+        ),
+    )
+    full_parser.add_argument(
         "--cell-id",
         default="",
         help=(
@@ -581,6 +597,20 @@ def parse_args() -> argparse.Namespace:
             "so concurrent sweep cells write to isolated dirs and do not clobber "
             "each other's checkpoints / eval_suite. PAN flow gets isolation via "
             "--phase1-config / --phasef-config output_root overrides instead."
+        ),
+    )
+    full_parser.add_argument(
+        "--disable-dataset-overrides",
+        action="store_true",
+        help="Disable WJB/WGM dataset-specific Phase1/PhaseF overrides for global-default fairness cells.",
+    )
+    full_parser.add_argument(
+        "--skip-test-eval",
+        action="store_true",
+        help=(
+            "After PhaseF training, skip sanity/test evaluation and tables. Reserved for "
+            "validation-only fairness-search candidates; their saved validation generations "
+            "are judged separately and the formal winner is evaluated in P0-07."
         ),
     )
     add_common_flags(full_parser)
@@ -619,6 +649,31 @@ def _run_script(
     env = os.environ.copy()
     if env_overrides:
         env.update(env_overrides)
+    profile_log = str(env.get("SAFETY_ABLATION_RUNTIME_LOG", "")).strip()
+    phase = phase_for_script(script_name)
+    if profile_log and phase:
+        output_root = str(
+            env.get("SAFETY_ABLATION_PROFILE_OUTPUT_ROOT", PROJECT_ROOT / "outputs")
+        )
+        cell_id = str(env.get("SAFETY_ABLATION_CELL_ID", ""))
+        try:
+            device_count = int(env.get("SAFETY_ABLATION_DEVICE_COUNT", "1"))
+        except ValueError as exc:
+            raise ValueError("SAFETY_ABLATION_DEVICE_COUNT must be an integer") from exc
+        returncode, record = run_profiled_subprocess(
+            cmd,
+            cwd=PROJECT_ROOT,
+            env=env,
+            stage=phase,
+            script=script_name,
+            output_root=output_root,
+            cell_id=cell_id,
+            device_count=device_count,
+        )
+        append_efficiency_record(profile_log, record)
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, cmd)
+        return
     subprocess.run(cmd, cwd=PROJECT_ROOT, check=True, env=env)
 
 
@@ -966,11 +1021,25 @@ def _run_phase1_precompute(
     skip_prepare: bool = False,
     analyze_extras: Sequence[str] | None = None,
     subspace_extras: Sequence[str] | None = None,
+    stage_extras: Mapping[str, Sequence[str]] | None = None,
+    validation_only: bool = False,
 ) -> None:
+    allowed_stages = {
+        "extract", "extract_alignment", "analyze", "subspace", "pairing", "bridge",
+        "project", "decompose", "recompose",
+    }
+    normalized_stage_extras: dict[str, list[str]] = {}
+    for stage, tokens in dict(stage_extras or {}).items():
+        if stage not in allowed_stages:
+            raise ValueError(f"Unsupported Phase-1 stage extra key: {stage}")
+        if isinstance(tokens, (str, bytes)) or not all(isinstance(token, str) for token in tokens):
+            raise ValueError(f"Phase-1 stage extras for {stage} must be a list of strings")
+        normalized_stage_extras[stage] = list(tokens)
     if not skip_prepare:
         _run_script("00_prepare_data.py", ["--config", str(phase1_config)], dry_run=dry_run, env_overrides=env_overrides)
 
-    for split in PIPELINE_SPLITS:
+    active_splits = ("alignment", "analysis_val") if validation_only else PIPELINE_SPLITS
+    for split in active_splits:
         split_args = [
             "--config",
             str(phase1_config),
@@ -979,6 +1048,9 @@ def _run_phase1_precompute(
             "--model",
             "teacher",
         ]
+        split_args.extend(normalized_stage_extras.get("extract", ()))
+        if split == "alignment":
+            split_args.extend(normalized_stage_extras.get("extract_alignment", ()))
         _run_script("01_extract_hidden_states.py", split_args, dry_run=dry_run, env_overrides=env_overrides)
 
     for split in ("alignment", "analysis_val"):
@@ -990,6 +1062,9 @@ def _run_phase1_precompute(
             "--model",
             "student",
         ]
+        split_args.extend(normalized_stage_extras.get("extract", ()))
+        if split == "alignment":
+            split_args.extend(normalized_stage_extras.get("extract_alignment", ()))
         _run_script("01_extract_hidden_states.py", split_args, dry_run=dry_run, env_overrides=env_overrides)
 
     analyze_args = ["--config", str(phase1_config)]
@@ -999,6 +1074,8 @@ def _run_phase1_precompute(
         analyze_args.extend(str(tok) for tok in analyze_extras)
     if subspace_extras:
         subspace_args.extend(str(tok) for tok in subspace_extras)
+    analyze_args.extend(normalized_stage_extras.get("analyze", ()))
+    subspace_args.extend(normalized_stage_extras.get("subspace", ()))
     if smoke:
         analyze_args += [
             "--top-k",
@@ -1015,25 +1092,35 @@ def _run_phase1_precompute(
 
     _run_script("02_analyze_teacher_layers.py", analyze_args, dry_run=dry_run, env_overrides=env_overrides)
     _run_script("03_build_teacher_safe_subspace.py", subspace_args, dry_run=dry_run, env_overrides=env_overrides)
-    _run_script("04_pair_layers.py", ["--config", str(phase1_config)], dry_run=dry_run, env_overrides=env_overrides)
-    _run_script("05_build_semantic_bases.py", ["--config", str(phase1_config)], dry_run=dry_run, env_overrides=env_overrides)
+    _run_script(
+        "04_pair_layers.py",
+        ["--config", str(phase1_config), *normalized_stage_extras.get("pairing", ())],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
+    _run_script(
+        "05_build_semantic_bases.py",
+        ["--config", str(phase1_config), *normalized_stage_extras.get("bridge", ())],
+        dry_run=dry_run,
+        env_overrides=env_overrides,
+    )
 
-    for split in PIPELINE_SPLITS:
+    for split in active_splits:
         _run_script(
             "06_project_teacher_safe_component.py",
-            ["--config", str(phase1_config), "--split", split],
+            ["--config", str(phase1_config), "--split", split, *normalized_stage_extras.get("project", ())],
             dry_run=dry_run,
             env_overrides=env_overrides,
         )
         _run_script(
             "07_decompose_teacher_semantics.py",
-            [*semantic_args_suffix, "--split", split],
+            [*semantic_args_suffix, "--split", split, *normalized_stage_extras.get("decompose", ())],
             dry_run=dry_run,
             env_overrides=env_overrides,
         )
         _run_script(
             "08_recompose_student_targets.py",
-            ["--config", str(phase1_config), "--split", split],
+            ["--config", str(phase1_config), "--split", split, *normalized_stage_extras.get("recompose", ())],
             dry_run=dry_run,
             env_overrides=env_overrides,
         )
@@ -1154,13 +1241,21 @@ def _invoke_phase1_curation(
     """
 
     teacher_path, teacher_runtime = _read_phase1_teacher(phase1_yaml)
+    raw_phase1 = yaml.safe_load(Path(phase1_yaml).read_text(encoding="utf-8")) or {}
+    requested_mode = str(
+        ((raw_phase1.get("dataset") or {}).get("curation_mode") or "auto")
+        if isinstance(raw_phase1, dict)
+        else "auto"
+    ).strip().lower()
+    if requested_mode not in {"auto", "off", "minimal", "strict"}:
+        raise ValueError(f"invalid Phase1 dataset.curation_mode: {requested_mode!r}")
     curate_args = [
         "--baseline",
         baseline_name,
         "--processed-dir",
         str(processed_dir),
         "--mode",
-        "auto",
+        requested_mode,
         "--force-rebuild",
     ]
     if teacher_path:
@@ -1212,6 +1307,7 @@ def _make_safety_full_overrides(
     safety_phasef_output_root: Path,
     phasef_base_override: str = "",
     phase1_base_override: str = "",
+    apply_dataset_overrides: bool = True,
 ) -> tuple[Path, Path]:
     """Generate runtime override yamls for Phase 1 + PhaseF on safety data.
 
@@ -1283,7 +1379,7 @@ def _make_safety_full_overrides(
         safety_phase1_output_root / "hidden_states" / "student_analysis_val"
     )
     phasef_raw.setdefault("output", {})["output_root"] = str(safety_phasef_output_root)
-    _ov = SAFETY_PHASE_OVERRIDES_BY_BASELINE.get(baseline_name, {})
+    _ov = SAFETY_PHASE_OVERRIDES_BY_BASELINE.get(baseline_name, {}) if apply_dataset_overrides else {}
     # Per-baseline PhaseF epoch override (e.g. WildJailbreak -> 5 epochs).
     # Applied to ours + sft1 + random alike so they share the same epoch budget
     # (fair ablation comparison on the harder distribution).
@@ -1311,6 +1407,75 @@ def _make_safety_full_overrides(
     return phase1_override_path, phasef_override_path
 
 
+def _configured_output_root(config_path: str, section: str) -> Path:
+    path = _resolve(config_path)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get(section), dict):
+        raise ValueError(f"{path} must contain a {section!r} mapping")
+    value = raw[section].get("output_root")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{path} must define {section}.output_root")
+    return Path(
+        resolve_portable_path(value, path.parent, category="output")
+    ).resolve()
+
+
+def _resolve_safety_full_roots(
+    *,
+    baseline_name: str,
+    device: str,
+    cell_id: str,
+    phase1_config_path: str,
+    phasef_config_path: str,
+) -> tuple[Path, Path, Path, Path]:
+    """Resolve persistent data roots and isolated outputs for a safety cell.
+
+    The ablation backend stages configs with cell-owned output roots. Those
+    explicit roots are authoritative; legacy one-click calls without staged
+    configs keep their historical per-baseline naming.
+    """
+
+    pan_processed_dir = Path(
+        resolve_portable_path(
+            str(PROJECT_ROOT / "data" / "processed"),
+            PROJECT_ROOT,
+            category="data",
+        )
+    ).resolve()
+
+    if phase1_config_path:
+        phase1_root = _configured_output_root(phase1_config_path, "extraction")
+        # Derived split/curation files are mutable cell outputs. Keeping them
+        # beside the cell-owned Phase1 root prevents concurrent ablation jobs
+        # from overwriting one shared safety_full_<dataset> directory.
+        safety_processed_dir = (phase1_root.parent / "processed").resolve()
+    else:
+        cell_suffix = f"_{cell_id}" if cell_id else ""
+        legacy = (
+            PROJECT_ROOT
+            / "outputs"
+            / f"safety_full_{baseline_name}_{device}{_pair_suffix()}{cell_suffix}"
+            / "phase1"
+        )
+        phase1_root = Path(
+            resolve_portable_path(str(legacy), PROJECT_ROOT, category="output")
+        ).resolve()
+        safety_processed_dir = Path(
+            resolve_portable_path(
+                str(PROJECT_ROOT / "data" / "processed" / f"safety_full_{baseline_name}"),
+                PROJECT_ROOT,
+                category="data",
+            )
+        ).resolve()
+
+    phasef_root = (
+        _configured_output_root(phasef_config_path, "output")
+        if phasef_config_path
+        else (phase1_root / "training").resolve()
+    )
+    return safety_processed_dir, pan_processed_dir, phase1_root, phasef_root
+
+
 def _run_safety_full(
     device: str,
     *,
@@ -1329,7 +1494,10 @@ def _run_safety_full(
     phase1_config_path: str = "",
     analyze_extras: Sequence[str] | None = None,
     subspace_extras: Sequence[str] | None = None,
+    stage_extras: Mapping[str, Sequence[str]] | None = None,
     cell_id: str = "",
+    disable_dataset_overrides: bool = False,
+    skip_test_eval: bool = False,
 ) -> None:
     _validate_device_request(num_devices)
     if smoke:
@@ -1345,12 +1513,6 @@ def _run_safety_full(
         )
     sft_safety_config = _make_runtime_override_config(
         _resolve(SAFETY_SFT_CONFIGS[config_key]),
-        device=device,
-        device_id=device_id,
-    )
-    eval_config_src = _resolve(_safety_eval_config(device, "0.8b", baseline_name))
-    eval_config = _make_runtime_override_config(
-        eval_config_src,
         device=device,
         device_id=device_id,
     )
@@ -1371,10 +1533,18 @@ def _run_safety_full(
     )
 
     # 2) Split into PAN-style 5 JSONLs under a per-baseline processed_dir.
-    safety_processed_dir = (
-        PROJECT_ROOT / "data" / "processed" / f"safety_full_{baseline_name}"
-    ).resolve()
-    pan_processed_dir = (PROJECT_ROOT / "data" / "processed").resolve()
+    (
+        safety_processed_dir,
+        pan_processed_dir,
+        safety_phase1_output_root,
+        safety_phasef_output_root,
+    ) = _resolve_safety_full_roots(
+        baseline_name=baseline_name,
+        device=device,
+        cell_id=cell_id,
+        phase1_config_path=phase1_config_path,
+        phasef_config_path=phasef_config_path,
+    )
     if not dry_run:
         safety_processed_dir.mkdir(parents=True, exist_ok=True)
     _run_script(
@@ -1388,25 +1558,14 @@ def _run_safety_full(
             str(pan_processed_dir),
             "--harmless-source",
             "auto",
+            *(["--validation-only"] if skip_test_eval else []),
         ],
         dry_run=dry_run,
         env_overrides=env_overrides,
     )
 
-    # 3) Generate Phase 1 + PhaseF override yamls pointing at the safety dir.
-    # Per-cell isolated output dirs when cell_id provided (parallel sweep mode);
-    # else fall back to per-baseline shared dir (sequential default).
-    cell_suffix = f"_{cell_id}" if cell_id else ""
-    safety_phase1_output_root = (
-        PROJECT_ROOT
-        / "outputs"
-        / f"safety_full_{baseline_name}_{device}{_pair_suffix()}{cell_suffix}"
-        / "phase1"
-    ).resolve()
-    # PhaseF output lives under phase1/training so that 10_sanity_eval and
-    # 11_make_tables — which both default to <phase1.extraction.output_root>/training
-    # — can locate the LoRA checkpoint without --training-dir overrides.
-    safety_phasef_output_root = (safety_phase1_output_root / "training").resolve()
+    # 3) Generate Phase 1 + PhaseF override yamls pointing at the persistent
+    # safety split and the cell-owned output roots resolved above.
     phase1_override, phasef_override = _make_safety_full_overrides(
         device=device,
         device_id=device_id,
@@ -1416,6 +1575,7 @@ def _run_safety_full(
         safety_phasef_output_root=safety_phasef_output_root,
         phasef_base_override=phasef_config_path,
         phase1_base_override=phase1_config_path,
+        apply_dataset_overrides=not disable_dataset_overrides,
     )
 
     # 3b) Curate the Phase 1 contrast subset (alignment_set.jsonl) from
@@ -1434,7 +1594,9 @@ def _run_safety_full(
     # Per-baseline cleaner-subspace knobs (e.g. WJB: --top-k 3 / --energy-threshold
     # 0.7 / --rank-cap 8) go first; caller-supplied extras append after so an
     # explicit CLI --phase1-analyze-extra / --phase1-subspace-extra still wins.
-    phase_overrides = SAFETY_PHASE_OVERRIDES_BY_BASELINE.get(baseline_name, {})
+    phase_overrides = (
+        {} if disable_dataset_overrides else SAFETY_PHASE_OVERRIDES_BY_BASELINE.get(baseline_name, {})
+    )
     merged_analyze_extras = [
         *phase_overrides.get("analyze_extra", ()),
         *(analyze_extras or ()),
@@ -1451,6 +1613,8 @@ def _run_safety_full(
         skip_prepare=True,
         analyze_extras=merged_analyze_extras,
         subspace_extras=merged_subspace_extras,
+        stage_extras=stage_extras,
+        validation_only=skip_test_eval,
     )
 
     # 5) PhaseF training.
@@ -1461,37 +1625,39 @@ def _run_safety_full(
         env_overrides=env_overrides,
     )
 
-    # 6) Sanity eval + tables (still PAN-comparable; uses safety processed_dir).
-    _run_script(
-        "10_sanity_eval.py",
-        ["--config", str(phase1_override)],
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-    )
-    _run_script(
-        "11_make_tables.py",
-        ["--config", str(phase1_override)],
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-    )
+    if not skip_test_eval:
+        eval_config_src = _resolve(_safety_eval_config(device, "0.8b", baseline_name))
+        # 6) Sanity eval + tables (still PAN-comparable; uses safety processed_dir).
+        _run_script(
+            "10_sanity_eval.py",
+            ["--config", str(phase1_override)],
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
+        _run_script(
+            "11_make_tables.py",
+            ["--config", str(phase1_override)],
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
 
-    # 7) PAN safety eval + OpenCompass general eval against every epoch checkpoint.
-    phasef_cfg = load_phasef_config(phasef_override)
-    _run_adapter_eval(
-        device=device,
-        model_size="0.8b",
-        training_output_root=safety_phasef_output_root,
-        epochs=int(phasef_cfg.optim.epochs),
-        device_id=device_id,
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-        opencompass_dir=opencompass_dir,
-        opencompass_datasets=opencompass_datasets,
-        skip_opencompass=skip_opencompass,
-        enable_opencompass=enable_opencompass,
-        safety_eval_datasets=safety_eval_datasets,
-        eval_config_path=str(eval_config_src),
-    )
+        # 7) Test evaluation belongs only to the formal result cell, never a selector.
+        phasef_cfg = load_phasef_config(phasef_override)
+        _run_adapter_eval(
+            device=device,
+            model_size="0.8b",
+            training_output_root=safety_phasef_output_root,
+            epochs=int(phasef_cfg.optim.epochs),
+            device_id=device_id,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+            opencompass_dir=opencompass_dir,
+            opencompass_datasets=opencompass_datasets,
+            skip_opencompass=skip_opencompass,
+            enable_opencompass=enable_opencompass,
+            safety_eval_datasets=safety_eval_datasets,
+            eval_config_path=str(eval_config_src),
+        )
 
 
 def _run_safety_distill(
@@ -2502,6 +2668,7 @@ def _run_full_pipeline(
     phase1_config_path: str = "",
     analyze_extras: Sequence[str] | None = None,
     subspace_extras: Sequence[str] | None = None,
+    stage_extras: Mapping[str, Sequence[str]] | None = None,
 ) -> None:
     _validate_device_request(num_devices)
     config_map = FULL_PIPELINE_CONFIGS
@@ -2537,6 +2704,7 @@ def _run_full_pipeline(
         env_overrides=env_overrides,
         analyze_extras=analyze_extras,
         subspace_extras=subspace_extras,
+        stage_extras=stage_extras,
     )
 
     training_output_root = Path(phasef_cfg.output.output_root)
@@ -2773,15 +2941,24 @@ def main() -> None:
             analyze_extras = json.loads(analyze_extras_raw) if isinstance(analyze_extras_raw, str) else list(analyze_extras_raw)
             subspace_extras_raw = getattr(args, "phase1_subspace_extra", "[]") or "[]"
             subspace_extras = json.loads(subspace_extras_raw) if isinstance(subspace_extras_raw, str) else list(subspace_extras_raw)
+            stage_extras_raw = getattr(args, "phase1_stage_extras", "{}") or "{}"
+            stage_extras = json.loads(stage_extras_raw) if isinstance(stage_extras_raw, str) else dict(stage_extras_raw)
         except json.JSONDecodeError as exc:
             raise ValueError(
-                f"--phase1-analyze-extra / --phase1-subspace-extra must be JSON lists; "
+                f"Phase-1 extra arguments must be valid JSON; "
                 f"got analyze={args.phase1_analyze_extra!r} subspace={args.phase1_subspace_extra!r}"
             ) from exc
         if not isinstance(analyze_extras, list) or not all(isinstance(x, str) for x in analyze_extras):
             raise ValueError("--phase1-analyze-extra must be a JSON list of strings")
         if not isinstance(subspace_extras, list) or not all(isinstance(x, str) for x in subspace_extras):
             raise ValueError("--phase1-subspace-extra must be a JSON list of strings")
+        if not isinstance(stage_extras, dict) or not all(
+            isinstance(key, str)
+            and isinstance(tokens, list)
+            and all(isinstance(token, str) for token in tokens)
+            for key, tokens in stage_extras.items()
+        ):
+            raise ValueError("--phase1-stage-extras must be a JSON object of string lists")
         phase1_config_path = getattr(args, "phase1_config", "") or ""
         if args.baseline != "pan":
             _run_safety_full(
@@ -2796,7 +2973,10 @@ def main() -> None:
                 phase1_config_path=phase1_config_path,
                 analyze_extras=analyze_extras,
                 subspace_extras=subspace_extras,
+                stage_extras=stage_extras,
                 cell_id=getattr(args, "cell_id", "") or "",
+                disable_dataset_overrides=bool(getattr(args, "disable_dataset_overrides", False)),
+                skip_test_eval=bool(getattr(args, "skip_test_eval", False)),
                 **oc_kwargs,
             )
             return
@@ -2810,6 +2990,7 @@ def main() -> None:
             phase1_config_path=phase1_config_path,
             analyze_extras=analyze_extras,
             subspace_extras=subspace_extras,
+            stage_extras=stage_extras,
             **oc_kwargs,
         )
         return
