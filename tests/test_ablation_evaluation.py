@@ -211,7 +211,7 @@ class AblationEvaluationTests(unittest.TestCase):
                 {
                     "axes": {"test_suite": "pan_heldout"},
                     "inputs": {
-                        "trained_checkpoints": str(registry),
+                        "checkpoint_registry": str(registry),
                         "common_test": str(common),
                         "wildguard_model": str(wildguard),
                     },

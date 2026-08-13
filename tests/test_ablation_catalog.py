@@ -55,6 +55,13 @@ class AblationCatalogTests(unittest.TestCase):
                 self.assertTrue(item.metrics)
                 self.assertTrue(item.completion_artifacts)
 
+    def test_cross_corpus_registry_is_not_aliased_to_single_checkpoint_directory(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        self.assertIn("checkpoint_registry", catalog.experiments["P0-08"].requires)
+        self.assertNotIn("trained_checkpoints", catalog.experiments["P0-08"].requires)
+        self.assertIn("trained_checkpoints", catalog.experiments["P1-19"].requires)
+        self.assertIn("trained_checkpoints", catalog.experiments["P2-05"].requires)
+
     def test_duplicate_ids_are_rejected(self) -> None:
         raw = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
         raw["experiments"].append(dict(raw["experiments"][0]))

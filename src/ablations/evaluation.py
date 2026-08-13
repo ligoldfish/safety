@@ -111,7 +111,7 @@ def prepare_evaluation(
         raise EvaluationError("evaluation inputs must be a mapping")
 
     if handler == "cross_corpus_matrix":
-        registry = _path(inputs, "trained_checkpoints", directory=False)
+        registry = _path(inputs, "checkpoint_registry", directory=False)
         common = _path(inputs, "common_test", directory=True)
         wildguard = _path(inputs, "wildguard_model", directory=True)
         _require_complete_hf_model(wildguard)

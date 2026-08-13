@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 from dataclasses import asdict, dataclass
@@ -165,6 +166,147 @@ def _issue(requirement: AssetRequirement, code: str, message: str, suggestion: s
     )
 
 
+def _read_jsonl_objects(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError("JSONL rows must be objects")
+            rows.append(value)
+    if not rows:
+        raise ValueError("JSONL file is empty")
+    return rows
+
+
+def _registry_path(registry: Path, value: object) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("registry path is empty")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = registry.parent / path
+    return path.resolve()
+
+
+def _validate_checkpoint_registry(requirement: AssetRequirement) -> PreflightIssue | None:
+    registry = requirement.path
+    required = {
+        "checkpoint_id",
+        "pair",
+        "train_corpus",
+        "method",
+        "kind",
+        "checkpoint_hash",
+    }
+    try:
+        rows = _read_jsonl_objects(registry)
+        seen: set[str] = set()
+        for row in rows:
+            if not required <= set(row):
+                raise ValueError("immutable identity fields are missing")
+            checkpoint_id = str(row["checkpoint_id"]).strip()
+            if (
+                not checkpoint_id
+                or Path(checkpoint_id).name != checkpoint_id
+                or checkpoint_id in seen
+            ):
+                raise ValueError("checkpoint_id is invalid or duplicated")
+            seen.add(checkpoint_id)
+            if any(not str(row[key]).strip() for key in required - {"checkpoint_id", "kind"}):
+                raise ValueError("immutable identity field is empty")
+            kind = str(row["kind"]).strip().lower()
+            if kind == "merged":
+                model = _registry_path(registry, row.get("model_path"))
+                if inspect_model_directory(model).status != "READY":
+                    raise ValueError("merged model snapshot is incomplete")
+            elif kind == "adapter":
+                base_model = _registry_path(registry, row.get("base_model_path"))
+                manifest = _registry_path(registry, row.get("manifest_path"))
+                checkpoint = _registry_path(registry, row.get("checkpoint_path"))
+                if inspect_model_directory(base_model).status != "READY":
+                    raise ValueError("adapter base model snapshot is incomplete")
+                if not manifest.is_file() or not checkpoint.is_file():
+                    raise ValueError("adapter artifact is missing")
+                if manifest.stat().st_size == 0 or checkpoint.stat().st_size == 0:
+                    raise ValueError("adapter artifact is empty")
+            else:
+                raise ValueError("unsupported checkpoint kind")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _issue(
+            requirement,
+            "CHECKPOINT_REGISTRY_INVALID",
+            "checkpoint registry is malformed or references incomplete artifacts",
+            "rebuild the immutable checkpoint registry from completed training outputs",
+        )
+    return None
+
+
+def _validate_search_ledger(requirement: AssetRequirement) -> PreflightIssue | None:
+    required = {
+        "trial_id",
+        "dataset",
+        "config",
+        "method",
+        "selection_split",
+        "selected",
+        "validation_metric",
+    }
+    try:
+        rows = _read_jsonl_objects(requirement.path)
+        groups: dict[tuple[str, str], list[dict]] = {}
+        trial_ids: set[str] = set()
+        for row in rows:
+            if not required <= set(row):
+                raise ValueError("trial provenance fields are missing")
+            trial_id = str(row["trial_id"]).strip()
+            dataset = str(row["dataset"]).strip()
+            config = str(row["config"]).strip()
+            method = str(row["method"]).strip()
+            if not all((trial_id, dataset, config, method)) or trial_id in trial_ids:
+                raise ValueError("trial identity is empty or duplicated")
+            trial_ids.add(trial_id)
+            if str(row["selection_split"]) != "validation":
+                raise ValueError("model selection did not use validation")
+            metric = row["validation_metric"]
+            if type(metric) not in {int, float} or not math.isfinite(float(metric)):
+                raise ValueError("validation metric is not finite")
+            if type(row["selected"]) is not bool:
+                raise ValueError("selected flag is not boolean")
+            groups.setdefault((dataset, config), []).append(row)
+        for (_, config), group in groups.items():
+            counts: dict[str, int] = {}
+            selected: dict[str, int] = {}
+            for row in group:
+                method = str(row["method"])
+                counts[method] = counts.get(method, 0) + 1
+                selected[method] = selected.get(method, 0) + int(row["selected"])
+            if len(counts) < 2 or len(set(counts.values())) != 1:
+                raise ValueError("search budgets differ across methods")
+            if config == "validation_selected" and any(
+                selected.get(method, 0) != 1 for method in counts
+            ):
+                raise ValueError("validation_selected lacks one winner per method")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _issue(
+            requirement,
+            "SEARCH_LEDGER_INVALID",
+            "search ledger is malformed, leaks test selection, or uses unequal budgets",
+            "export validation-only trials with equal search counts for every method",
+        )
+    return None
+
+
+def _validate_structured_asset(requirement: AssetRequirement) -> PreflightIssue | None:
+    if requirement.asset_id == "checkpoint_registry":
+        return _validate_checkpoint_registry(requirement)
+    if requirement.asset_id == "search_ledger":
+        return _validate_search_ledger(requirement)
+    return None
+
+
 def run_preflight(
     requirements: Iterable[AssetRequirement],
     *,
@@ -187,6 +329,10 @@ def run_preflight(
         elif requirement.kind == "file":
             if not path.is_file():
                 issues.append(_issue(requirement, "ASSET_FILE_MISSING", "required file is missing", "prepare or upload the file before submitting"))
+            else:
+                issue = _validate_structured_asset(requirement)
+                if issue is not None:
+                    issues.append(issue)
         elif requirement.kind == "output":
             probe = path if path.exists() else path.parent
             if not probe.exists() or not probe.is_dir():

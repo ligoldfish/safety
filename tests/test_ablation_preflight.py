@@ -108,6 +108,58 @@ class AblationPreflightTests(unittest.TestCase):
         self.assertNotIn(secret, str(report.to_dict()))
         self.assertNotIn("HF_TOKEN", str(report.to_dict()))
 
+    def test_checkpoint_registry_is_semantically_validated_before_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "merged"
+            self._complete_model(model)
+            registry = root / "checkpoints.jsonl"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "checkpoint_id": "pan-ours",
+                        "pair": "qwen35_9b_to_08b",
+                        "train_corpus": "pan",
+                        "method": "ours",
+                        "kind": "merged",
+                        "checkpoint_hash": "sha256:abc",
+                        "model_path": "merged",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ready = run_preflight(
+                [AssetRequirement("checkpoint_registry", registry, "file", "p0-08")]
+            )
+            registry.write_text(
+                json.dumps({"checkpoint_id": "broken", "kind": "merged"}) + "\n",
+                encoding="utf-8",
+            )
+            blocked = run_preflight(
+                [AssetRequirement("checkpoint_registry", registry, "file", "p0-08")]
+            )
+        self.assertEqual(ready.status, "READY")
+        self.assertEqual(blocked.status, "BLOCKED")
+        self.assertIn("CHECKPOINT_REGISTRY_INVALID", {issue.code for issue in blocked.issues})
+
+    def test_search_ledger_blocks_test_selected_or_unequal_method_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "search.jsonl"
+            rows = [
+                {"trial_id": "a1", "dataset": "pan", "config": "global", "method": "ours", "selection_split": "validation", "selected": False, "validation_metric": 0.8},
+                {"trial_id": "b1", "dataset": "pan", "config": "global", "method": "sft", "selection_split": "test", "selected": False, "validation_metric": 0.7},
+                {"trial_id": "b2", "dataset": "pan", "config": "global", "method": "sft", "selection_split": "validation", "selected": False, "validation_metric": 0.6},
+            ]
+            ledger.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            report = run_preflight(
+                [AssetRequirement("search_ledger", ledger, "file", "p0-07")]
+            )
+        self.assertEqual(report.status, "BLOCKED")
+        self.assertIn("SEARCH_LEDGER_INVALID", {issue.code for issue in report.issues})
+
     def test_manifest_requirements_are_exact_and_support_explicit_kinds(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

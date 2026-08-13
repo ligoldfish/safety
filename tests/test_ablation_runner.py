@@ -427,7 +427,7 @@ class AblationCompileTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "trained_checkpoints": {"path": str(registry), "kind": "file"},
+                        "checkpoint_registry": {"path": str(registry), "kind": "file"},
                         "common_test": str(root / "common"),
                         "wildguard_model": {"path": str(root / "wildguard"), "kind": "model"},
                     }
@@ -442,6 +442,7 @@ class AblationCompileTests(unittest.TestCase):
             )[0]
         self.assertIn("--evaluation-handler", command.argv)
         spec = json.loads(next(x for x in command.argv if x.startswith("--cell-spec=")).split("=", 1)[1])
+        self.assertEqual(spec["inputs"]["checkpoint_registry"], str(registry.resolve()))
         self.assertIn("wildguard_model", spec["inputs"])
 
 

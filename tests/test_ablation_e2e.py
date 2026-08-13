@@ -154,7 +154,7 @@ class AblationE2ETests(unittest.TestCase):
             output = root / "out"
             execute_handler(
                 "cross_corpus_matrix",
-                {"axes": {"test_suite": "common_safety"}, "inputs": {"trained_checkpoints": str(checkpoints), "common_test": str(common)}},
+                {"axes": {"test_suite": "common_safety"}, "inputs": {"checkpoint_registry": str(checkpoints), "common_test": str(common)}},
                 output_dir=output,
                 required_artifacts=["cross_corpus_matrix.json"],
             )

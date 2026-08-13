@@ -32,7 +32,7 @@ _INPUTS = {
     "validation_iso_hr": ("validation_predictions", "test_predictions"),
     "wjb_failure_analysis": ("wildjailbreak_data", "common_test"),
     "global_default_budget": ("search_ledger",),
-    "cross_corpus_matrix": ("trained_checkpoints", "common_test"),
+    "cross_corpus_matrix": ("checkpoint_registry", "common_test"),
     "target_control": ("semantic_targets",),
     "subspace_control": ("teacher_hidden_states",),
     "bridge_control": ("alignment_hidden_states",),
