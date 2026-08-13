@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
 import yaml
+
+from .preflight import inspect_model_directory
 
 
 class EvaluationError(RuntimeError):
@@ -51,12 +54,42 @@ def _write_yaml(path: Path, payload: Mapping) -> None:
     )
 
 
+def _read_jsonl(path: Path, label: str) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise EvaluationError(f"{label} row {line_number} must be an object")
+                rows.append(value)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvaluationError(f"missing or invalid {label}: {path}") from exc
+    if not rows:
+        raise EvaluationError(f"empty {label}: {path}")
+    return rows
+
+
 def _checkpoint_files(root: Path) -> tuple[Path | None, Path | None]:
     manifest = root / "manifest.json"
     checkpoints = sorted(root.glob("epoch_*.pt"))
     if not checkpoints:
         checkpoints = sorted((root / "checkpoints").glob("epoch_*.pt"))
     return (manifest if manifest.is_file() else None, checkpoints[-1] if checkpoints else None)
+
+
+def _require_complete_hf_model(path: Path) -> None:
+    report = inspect_model_directory(path)
+    if report.status != "READY":
+        codes = ", ".join(issue.code for issue in report.issues)
+        raise EvaluationError(f"model is not a complete Hugging Face snapshot: {path} ({codes})")
+
+
+def _require_opencompass_checkout(path: Path) -> None:
+    if not any(candidate.is_file() for candidate in (path / "run.py", path / "tools" / "run.py")):
+        raise EvaluationError(f"OpenCompass checkout lacks run.py or tools/run.py: {path}")
 
 
 def prepare_evaluation(
@@ -76,6 +109,97 @@ def prepare_evaluation(
     inputs = spec.get("inputs") or {}
     if not isinstance(inputs, Mapping):
         raise EvaluationError("evaluation inputs must be a mapping")
+
+    if handler == "cross_corpus_matrix":
+        registry = _path(inputs, "trained_checkpoints", directory=False)
+        common = _path(inputs, "common_test", directory=True)
+        wildguard = _path(inputs, "wildguard_model", directory=True)
+        _require_complete_hf_model(wildguard)
+        suite = str(axes.get("test_suite", ""))
+        if suite not in {"pan_heldout", "common_safety"}:
+            raise EvaluationError(f"unsupported cross-corpus test suite: {suite}")
+        test_jsonl = common / f"{suite}.jsonl"
+        if not test_jsonl.is_file() or test_jsonl.stat().st_size == 0:
+            raise EvaluationError(f"common_test lacks non-empty {suite}.jsonl: {common}")
+        normalized: list[dict] = []
+        seen: set[str] = set()
+        required = {"checkpoint_id", "pair", "train_corpus", "method", "kind", "checkpoint_hash"}
+        for row in _read_jsonl(registry, "checkpoint registry"):
+            if not required <= set(row):
+                raise EvaluationError("checkpoint registry row lacks immutable identity fields")
+            checkpoint_id = str(row["checkpoint_id"]).strip()
+            if not checkpoint_id or Path(checkpoint_id).name != checkpoint_id or checkpoint_id in seen:
+                raise EvaluationError(f"invalid or duplicate checkpoint_id: {checkpoint_id!r}")
+            seen.add(checkpoint_id)
+            kind = str(row["kind"]).strip().lower()
+            item = {
+                "checkpoint_id": checkpoint_id,
+                "pair": str(row["pair"]).strip(),
+                "train_corpus": str(row["train_corpus"]).strip(),
+                "method": str(row["method"]).strip(),
+                "kind": kind,
+                "checkpoint_hash": str(row["checkpoint_hash"]).strip(),
+                "output_dir": str((output / "raw" / checkpoint_id).resolve()),
+            }
+            if not all(item[key] for key in ("pair", "train_corpus", "method", "checkpoint_hash")):
+                raise EvaluationError(f"checkpoint {checkpoint_id} has empty provenance fields")
+
+            def registry_path(name: str, *, directory: bool) -> Path:
+                value = str(row.get(name, "")).strip()
+                if not value:
+                    raise EvaluationError(f"checkpoint {checkpoint_id} lacks {name}")
+                path = Path(value).expanduser()
+                if not path.is_absolute():
+                    path = registry.parent / path
+                path = path.resolve()
+                if (directory and not path.is_dir()) or (not directory and not path.is_file()):
+                    raise EvaluationError(f"checkpoint {checkpoint_id} has invalid {name}: {path}")
+                return path
+
+            if kind == "merged":
+                model = registry_path("model_path", directory=True)
+                _require_complete_hf_model(model)
+                item["model_path"] = str(model)
+            elif kind == "adapter":
+                base_model = registry_path("base_model_path", directory=True)
+                _require_complete_hf_model(base_model)
+                manifest = registry_path("manifest_path", directory=False)
+                checkpoint = registry_path("checkpoint_path", directory=False)
+                if manifest.stat().st_size == 0 or checkpoint.stat().st_size == 0:
+                    raise EvaluationError(f"checkpoint {checkpoint_id} has empty adapter artifacts")
+                item.update(
+                    base_model_path=str(base_model),
+                    manifest_path=str(manifest),
+                    checkpoint_path=str(checkpoint),
+                )
+            else:
+                raise EvaluationError(f"checkpoint {checkpoint_id} has unsupported kind: {kind}")
+            normalized.append(item)
+        runtime_device = f"{device}:{device_id}" if str(device) != "cpu" else "cpu"
+        manifest_payload = {
+            "schema_version": 1,
+            "test_suite": suite,
+            "test_jsonl": str(test_jsonl.resolve()),
+            "wildguard_model": str(wildguard),
+            "runtime_backend": str(device),
+            "runtime_device": runtime_device,
+            "checkpoints": normalized,
+        }
+        manifest_path = output / "cross_corpus_run_manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest_payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return EvaluationPlan(
+            (
+                python_executable,
+                str(project / "scripts" / "31_eval_cross_corpus.py"),
+                "--manifest",
+                str(manifest_path),
+            ),
+            "cross_corpus_matrix.json",
+            manifest_path,
+        )
 
     if handler == "decoding_robustness":
         trained = _path(inputs, "trained_checkpoints", directory=True)
@@ -100,6 +224,7 @@ def prepare_evaluation(
         )
         payload["output"]["output_root"] = str(output / "raw")
         if (trained / "config.json").is_file():
+            _require_complete_hf_model(trained)
             payload["model"]["path"] = str(trained)
             manifest = checkpoint = None
         else:
@@ -123,6 +248,8 @@ def prepare_evaluation(
     if handler == "general_capability_suite":
         model = _path(inputs, "trained_checkpoints", directory=True)
         opencompass = _path(inputs, "benchmark_assets", directory=True)
+        _require_complete_hf_model(model)
+        _require_opencompass_checkout(opencompass)
         benchmark = str(axes.get("benchmark", "")).lower()
         if benchmark not in _OPENCOMPASS_DATASETS:
             raise EvaluationError(f"unsupported general-capability benchmark: {benchmark}")
@@ -204,7 +331,62 @@ def collect_evaluation_result(handler: str, spec: Mapping, output_dir: str | Pat
     output = Path(output_dir)
     raw = output / "raw"
     axes = dict(spec.get("axes") or {})
-    if handler == "decoding_robustness":
+    if handler == "cross_corpus_matrix":
+        run_manifest = _read_json(output / "cross_corpus_run_manifest.json")
+        if str(run_manifest.get("test_suite")) != str(axes.get("test_suite")):
+            raise EvaluationError("cross-corpus run manifest suite does not match the cell")
+        rows = []
+        matrix: dict[str, dict[str, dict[str, dict]]] = {}
+        for checkpoint in run_manifest.get("checkpoints") or []:
+            if not isinstance(checkpoint, Mapping):
+                raise EvaluationError("invalid checkpoint entry in cross-corpus run manifest")
+            run_dir = Path(str(checkpoint["output_dir"]))
+            pan = _read_json(run_dir / "pan_results.json")
+            judge = _read_json(run_dir / "judge_results.json")
+            if pan.get("status") != "ok" or not isinstance(pan.get("generations"), list) or not pan["generations"]:
+                raise EvaluationError(f"cross-corpus evaluation lacks real generations: {checkpoint['checkpoint_id']}")
+            if judge.get("judge") != "wildguard" or float(judge.get("judge_parse_rate", 0.0)) <= 0.0:
+                raise EvaluationError(f"cross-corpus evaluation lacks parsed WildGuard verdicts: {checkpoint['checkpoint_id']}")
+            if int(judge.get("num_unmatched_ids", -1)) != 0:
+                raise EvaluationError(f"cross-corpus judge has unmatched sample IDs: {checkpoint['checkpoint_id']}")
+            metrics = {
+                "wildguard_asr": judge.get("llm_judge_asr"),
+                "wildguard_harmful_refusal": judge.get("llm_judge_refusal_rate"),
+                "wildguard_over_refusal": judge.get("llm_judge_over_refusal"),
+                "keyword_harmful_refusal": pan.get("harmful_refusal_rate"),
+                "keyword_over_refusal": pan.get("harmless_over_refusal_rate"),
+            }
+            for name, value in metrics.items():
+                try:
+                    number = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise EvaluationError(f"missing cross-corpus metric {name}") from exc
+                if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+                    raise EvaluationError(f"invalid cross-corpus metric {name}: {value}")
+                metrics[name] = number
+            row = {
+                "checkpoint_id": str(checkpoint["checkpoint_id"]),
+                "checkpoint_hash": str(checkpoint["checkpoint_hash"]),
+                "pair": str(checkpoint["pair"]),
+                "train_corpus": str(checkpoint["train_corpus"]),
+                "method": str(checkpoint["method"]),
+                "test_suite": str(run_manifest["test_suite"]),
+                "n": len(pan["generations"]),
+                **metrics,
+            }
+            rows.append(row)
+            pair_matrix = matrix.setdefault(row["pair"], {})
+            corpus_matrix = pair_matrix.setdefault(row["train_corpus"], {})
+            if row["method"] in corpus_matrix:
+                raise EvaluationError(
+                    f"duplicate pair/corpus/method checkpoint: {row['pair']}/{row['train_corpus']}/{row['method']}"
+                )
+            corpus_matrix[row["method"]] = metrics
+        if not rows:
+            raise EvaluationError("cross-corpus evaluation produced no checkpoint rows")
+        payload = {"schema_version": 1, "test_suite": run_manifest["test_suite"], "rows": rows, "matrix": matrix}
+        destination = output / "cross_corpus_matrix.json"
+    elif handler == "decoding_robustness":
         result = _read_json(raw / "pan_results.json")
         if result.get("status") != "ok" or not result.get("generations"):
             raise EvaluationError("decoding evaluation lacks successful per-sample generations")

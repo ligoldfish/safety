@@ -110,7 +110,7 @@ experiments:
     execution_kind: evaluate
     handler: cross_corpus_matrix
     axes: {test_suite: [pan_heldout, common_safety]}
-    requires: [trained_checkpoints, common_test]
+    requires: [trained_checkpoints, common_test, wildguard_model]
     metrics: [wildguard_asr, harmful_refusal, over_refusal]
     completion_artifacts: [cross_corpus_matrix.json]
 

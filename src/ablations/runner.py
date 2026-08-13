@@ -275,10 +275,14 @@ def _worker_command(definition, cell: ExperimentCell, context: RunnerContext) ->
     for requirement in definition.requires:
         if requirement in assets:
             raw = assets[requirement]
-            inputs[requirement] = str(raw.get("path", "")) if isinstance(raw, Mapping) else str(raw)
+            path_text = str(raw.get("path", "")) if isinstance(raw, Mapping) else str(raw)
+            path = Path(path_text).expanduser()
+            if not path.is_absolute() and context.asset_manifest is not None:
+                path = context.asset_manifest.parent / path
+            inputs[requirement] = str(path.resolve())
     worker_flag = (
         "--evaluation-handler"
-        if definition.handler in {"general_capability_suite", "causal_intervention", "decoding_robustness"}
+        if definition.handler in {"cross_corpus_matrix", "general_capability_suite", "causal_intervention", "decoding_robustness"}
         else "--analysis-handler"
     )
     argv = (

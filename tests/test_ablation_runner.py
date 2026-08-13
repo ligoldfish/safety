@@ -47,7 +47,26 @@ class AblationCompileTests(unittest.TestCase):
             command = compile_cell_commands(CATALOG, _cell("P0-04", seed=42), context)[0]
         spec_arg = next(token for token in command.argv if token.startswith("--cell-spec="))
         spec = json.loads(spec_arg.split("=", 1)[1])
-        self.assertEqual(spec["inputs"]["aligned_sample_predictions"], "/data/pairs.jsonl")
+        self.assertEqual(
+            spec["inputs"]["aligned_sample_predictions"],
+            str((manifest.parent / Path("/data/pairs.jsonl")).resolve()),
+        )
+
+    def test_worker_anchors_relative_manifest_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = root / "assets" / "pairs.jsonl"
+            data.parent.mkdir()
+            data.write_text("{}\n", encoding="utf-8")
+            manifest = root / "assets.json"
+            manifest.write_text(
+                json.dumps({"aligned_sample_predictions": {"path": "assets/pairs.jsonl", "kind": "file"}}),
+                encoding="utf-8",
+            )
+            context = RunnerContext(ROOT, root / "state", "python", "npu", 0, asset_manifest=manifest)
+            command = compile_cell_commands(CATALOG, _cell("P0-04", seed=42), context)[0]
+        spec = json.loads(next(x for x in command.argv if x.startswith("--cell-spec=")).split("=", 1)[1])
+        self.assertEqual(spec["inputs"]["aligned_sample_predictions"], str(data.resolve()))
 
     def test_worker_extracts_paths_from_strict_asset_manifest_entries(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -67,7 +86,10 @@ class AblationCompileTests(unittest.TestCase):
             command = compile_cell_commands(CATALOG, _cell("P0-04", seed=42), context)[0]
         spec_arg = next(token for token in command.argv if token.startswith("--cell-spec="))
         spec = json.loads(spec_arg.split("=", 1)[1])
-        self.assertEqual(spec["inputs"]["aligned_sample_predictions"], "/data/pairs.jsonl")
+        self.assertEqual(
+            spec["inputs"]["aligned_sample_predictions"],
+            str((manifest.parent / Path("/data/pairs.jsonl")).resolve()),
+        )
 
     def test_training_command_receives_declared_manifest_inputs_with_anchored_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -393,6 +415,34 @@ class AblationCompileTests(unittest.TestCase):
         self.assertIn("--evaluation-handler", command.argv)
         self.assertEqual(command.argv[command.argv.index("--evaluation-handler") + 1], "causal_intervention")
         self.assertEqual(command.argv[command.argv.index("--device-id") + 1], "2")
+
+    def test_cross_corpus_dispatches_to_evaluation_and_requires_independent_judge(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name in ("common", "wildguard"):
+                (root / name).mkdir()
+            registry = root / "checkpoints.jsonl"
+            registry.write_text("{}\n", encoding="utf-8")
+            manifest = root / "assets.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "trained_checkpoints": {"path": str(registry), "kind": "file"},
+                        "common_test": str(root / "common"),
+                        "wildguard_model": {"path": str(root / "wildguard"), "kind": "model"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            context = RunnerContext(ROOT, root / "state", "python", "npu", 0, asset_manifest=manifest)
+            command = compile_cell_commands(
+                CATALOG,
+                _cell("P0-08", test_suite="pan_heldout"),
+                context,
+            )[0]
+        self.assertIn("--evaluation-handler", command.argv)
+        spec = json.loads(next(x for x in command.argv if x.startswith("--cell-spec=")).split("=", 1)[1])
+        self.assertIn("wildguard_model", spec["inputs"])
 
 
 class AblationRunnerStateTests(unittest.TestCase):
