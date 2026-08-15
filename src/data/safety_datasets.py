@@ -36,6 +36,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from src.ablations.data_audit import (
+    deduplicate_prompts,
+    exclude_protected_prompts,
+    stratified_holdout,
+    write_data_audit,
+)
 from src.data.template_qwen import DEFAULT_SYSTEM_PROMPT
 from src.utils.io import ensure_dir, write_json, write_jsonl
 
@@ -1403,8 +1409,8 @@ def _build_wildguardmix_pool(
     seed: int,
     for_eval: bool = False,
     drops: Optional[Dict[str, int]] = None,
+    drop_records: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    seen: set[str] = set()
     records: List[Dict[str, Any]] = []
     drop_counts = drops if drops is not None else {}
     for index, row in enumerate(rows):
@@ -1470,10 +1476,6 @@ def _build_wildguardmix_pool(
             else:
                 target = pick_refusal_template(prompt, seed=seed)
                 metadata["target_source"] = "template_pool"
-        if prompt in seen:
-            drop_counts["duplicate_prompt"] = drop_counts.get("duplicate_prompt", 0) + 1
-            continue
-        seen.add(prompt)
         records.append(
             _build_binary_record(
                 record_id=str(row.get("id") or f"wildguardmix_{config_name}_{index:08d}"),
@@ -1487,6 +1489,13 @@ def _build_wildguardmix_pool(
                 metadata=metadata,
             )
         )
+    records, duplicate_drops = deduplicate_prompts(records)
+    if duplicate_drops:
+        drop_counts["duplicate_prompt"] = (
+            drop_counts.get("duplicate_prompt", 0) + len(duplicate_drops)
+        )
+        if drop_records is not None:
+            drop_records.extend(duplicate_drops)
     return records
 
 
@@ -1507,6 +1516,7 @@ def build_wildguardmix_records(
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
     drops: Dict[str, int] = {}
+    duplicate_drop_records: List[Dict[str, Any]] = []
     train_pool = _build_wildguardmix_pool(
         _load_wildguardmix_rows(
             source_name=source_name,
@@ -1518,6 +1528,7 @@ def build_wildguardmix_records(
         system_prompt=system_prompt,
         seed=seed,
         drops=drops,
+        drop_records=duplicate_drop_records,
     )
     eval_records: List[Dict[str, Any]] = []
     split_drop_records: List[Dict[str, Any]] = []
@@ -1537,12 +1548,11 @@ def build_wildguardmix_records(
                 seed=seed,
                 for_eval=True,
                 drops=drops,
+                drop_records=duplicate_drop_records,
             )
             if len({r["label"] for r in eval_pool}) < 2:
                 raise RuntimeError("WildGuardTest does not contain both labels")
             test_source = f"{source_name}:wildguardtest"
-            from src.ablations.data_audit import exclude_protected_prompts
-
             train_pool, split_drop_records = exclude_protected_prompts(
                 train_pool,
                 eval_pool,
@@ -1578,14 +1588,12 @@ def build_wildguardmix_records(
         )
         eval_records = [_to_eval_record(record, id_prefix="wildguardmix_test") for record in eval_selected]
         write_jsonl(eval_output_path, eval_records)
-        from src.ablations.data_audit import write_data_audit
-
         write_data_audit(
             Path(output_path).with_suffix(Path(output_path).suffix + ".split_audit.json"),
             dataset="wildguardmix",
             train=records,
             evaluation=eval_records,
-            drops=split_drop_records,
+            drops=duplicate_drop_records + split_drop_records,
             license_name="ODC-BY-1.0",
             intended_use="safety alignment training and evaluation",
         )
@@ -2271,6 +2279,7 @@ def build_safety_tuned_llamas_records(
             f"No usable records were parsed from {json_path}; "
             "check that the file follows the Alpaca schema."
         )
+    records, duplicate_drops = deduplicate_prompts(records)
 
     if include_harmless_contrast:
         harmless_path = _resolve_safety_tuned_llamas_file(
@@ -2288,6 +2297,16 @@ def build_safety_tuned_llamas_records(
                 f"include_harmless_contrast=True but {harmless_path} parsed "
                 "into zero records; check the alpaca_small.json schema."
             )
+        harmless_records, harmless_duplicate_drops = deduplicate_prompts(
+            harmless_records
+        )
+        harmless_records, cross_label_drops = exclude_protected_prompts(
+            harmless_records,
+            records,
+            reason="duplicate_prompt",
+        )
+        duplicate_drops.extend(harmless_duplicate_drops)
+        duplicate_drops.extend(cross_label_drops)
         harmless_cap = (
             len(records)
             if harmless_max_samples is None
@@ -2299,8 +2318,6 @@ def build_safety_tuned_llamas_records(
         records.extend(harmless_records)
 
     if eval_output_path:
-        from src.ablations.data_audit import stratified_holdout, write_data_audit
-
         records, eval_records = stratified_holdout(
             records,
             fraction=eval_holdout_fraction,
@@ -2313,7 +2330,7 @@ def build_safety_tuned_llamas_records(
             dataset="safety_tuned_llamas",
             train=records,
             evaluation=eval_records,
-            drops=[],
+            drops=duplicate_drops,
             license_name="upstream repository license",
             intended_use="safety alignment training and held-out evaluation",
         )
@@ -2773,6 +2790,45 @@ def _coconot_refusal_quality(records: Sequence[Dict[str, Any]]) -> Dict[str, flo
     }
 
 
+def _sample_coconot_training_records(
+    harmful_pool: Sequence[Dict[str, Any]],
+    harmless_pool: Sequence[Dict[str, Any]],
+    *,
+    max_train_samples: int,
+    max_train_samples_per_label: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """Return a deterministic 50/50 CoCoNot training sample."""
+
+    target_per_label = min(len(harmful_pool), len(harmless_pool))
+    if max_train_samples_per_label and max_train_samples_per_label > 0:
+        target_per_label = min(target_per_label, int(max_train_samples_per_label))
+    if max_train_samples and max_train_samples > 0:
+        target_per_label = min(target_per_label, int(max_train_samples) // 2)
+
+    sampled_harmful = list(harmful_pool)
+    random.Random(int(seed)).shuffle(sampled_harmful)
+    sampled_harmless = list(harmless_pool)
+    random.Random(int(seed) + 1).shuffle(sampled_harmless)
+    records = (
+        sampled_harmful[:target_per_label]
+        + sampled_harmless[:target_per_label]
+    )
+    random.Random(int(seed) + 2).shuffle(records)
+    return records
+
+
+def _require_coconot_binary_pools(
+    harmful_pool: Sequence[Dict[str, Any]],
+    harmless_pool: Sequence[Dict[str, Any]],
+) -> None:
+    if not harmful_pool or not harmless_pool:
+        raise RuntimeError(
+            "CoCoNot requires both labels after canonical deduplication and "
+            "train/eval exclusion."
+        )
+
+
 def build_coconot_records(
     *,
     output_path: str | Path,
@@ -2892,41 +2948,26 @@ def build_coconot_records(
             "CoCoNot pref/train produced 0 harmless records (compliable `chosen`)."
         )
 
-    # --- 50/50 balance: downsample the larger pool to the smaller. ---
-    target_per_label = min(len(harmful_pool), len(harmless_pool))
-    if max_train_samples_per_label and max_train_samples_per_label > 0:
-        target_per_label = min(target_per_label, int(max_train_samples_per_label))
-    if max_train_samples and max_train_samples > 0:
-        target_per_label = min(target_per_label, int(max_train_samples) // 2)
+    deduplicated_pool, duplicate_drops = deduplicate_prompts(
+        harmful_pool + harmless_pool
+    )
+    split_drop_records = list(duplicate_drops)
+    harmful_pool = [record for record in deduplicated_pool if record["label"] == "harmful"]
+    harmless_pool = [record for record in deduplicated_pool if record["label"] == "harmless"]
+    _require_coconot_binary_pools(harmful_pool, harmless_pool)
+    drops["duplicate_prompt"] = len(duplicate_drops)
 
-    rng_h = random.Random(int(seed))
-    rng_l = random.Random(int(seed) + 1)
-    sampled_harmful = list(harmful_pool)
-    rng_h.shuffle(sampled_harmful)
-    sampled_harmful = sampled_harmful[:target_per_label]
-    sampled_harmless = list(harmless_pool)
-    rng_l.shuffle(sampled_harmless)
-    sampled_harmless = sampled_harmless[:target_per_label]
-    train_pool = sampled_harmful + sampled_harmless
-    random.Random(int(seed) + 2).shuffle(train_pool)
-    records = train_pool
+    # --- 50/50 balance: downsample the larger pool to the smaller. ---
+    records = _sample_coconot_training_records(
+        harmful_pool,
+        harmless_pool,
+        max_train_samples=max_train_samples,
+        max_train_samples_per_label=max_train_samples_per_label,
+        seed=seed,
+    )
 
     _validate_binary_training_records(records)
     write_jsonl(output_path, records)
-
-    # Built-in quality log: catch a HH-style "safe-but-evasive target" pathology
-    # at build time using the SAME judge the eval scores HR with.
-    quality = _coconot_refusal_quality(records)
-    for key, value in quality.items():
-        drops[f"{key}_x1000"] = int(round(value * 1000))
-    refusal_rate = quality.get("harmful_target_refusal_rate")
-    if refusal_rate is not None and refusal_rate < 0.5:
-        print(
-            f"[coconot] WARNING: harmful-target refusal rate {refusal_rate:.1%} < 50% "
-            "under the eval judge -- CoCoNot responses may be safe-but-evasive; verify "
-            "with scripts/diag_harmful_target_refusal_rate.py before trusting sft.",
-            flush=True,
-        )
 
     # --- Test: original/test (harmful) + contrast/test (harmless), prompt-only ---
     eval_records: List[Dict[str, Any]] = []
@@ -2999,6 +3040,10 @@ def build_coconot_records(
                 f"{source_name}:original/pref train holdout (official test unavailable)"
             )
 
+        eval_pool, eval_duplicate_drops = deduplicate_prompts(eval_pool)
+        split_drop_records.extend(eval_duplicate_drops)
+        drops["eval_duplicate_prompt"] = len(eval_duplicate_drops)
+
         eval_selected = _sample_balanced_by_label(
             eval_pool,
             subset_mode=eval_subset_mode,
@@ -3010,25 +3055,58 @@ def build_coconot_records(
             _to_eval_record(record, id_prefix="coconot_test") for record in eval_selected
         ]
 
-        # Cross-split prompt-leak: drop train records sharing a prompt with test.
-        def _first_user_text(record: Dict[str, Any]) -> str:
-            for msg in record.get("messages") or []:
-                if str(msg.get("role", "")).lower() == "user":
-                    return str(msg.get("content", "")).strip()
-            return ""
-
-        test_prompt_set = {_first_user_text(r) for r in eval_records}
-        test_prompt_set.discard("")
-        if test_prompt_set:
-            pre_drop = len(records)
-            records = [r for r in records if _first_user_text(r) not in test_prompt_set]
-            removed = pre_drop - len(records)
-            drops["train_test_prompt_overlap_removed_from_train"] = removed
-            if removed:
-                write_jsonl(output_path, records)
-                _validate_binary_training_records(records)
+        # Cross-split prompt-leak: use the same canonical prompt rule as audit.
+        eligible_pool, overlap_drops = exclude_protected_prompts(
+            harmful_pool + harmless_pool,
+            eval_records,
+            reason="train_eval_prompt_overlap",
+        )
+        harmful_pool = [
+            record for record in eligible_pool if record["label"] == "harmful"
+        ]
+        harmless_pool = [
+            record for record in eligible_pool if record["label"] == "harmless"
+        ]
+        _require_coconot_binary_pools(harmful_pool, harmless_pool)
+        records = _sample_coconot_training_records(
+            harmful_pool,
+            harmless_pool,
+            max_train_samples=max_train_samples,
+            max_train_samples_per_label=max_train_samples_per_label,
+            seed=seed,
+        )
+        removed = len(overlap_drops)
+        split_drop_records.extend(overlap_drops)
+        drops["train_test_prompt_overlap_removed_from_train"] = removed
+        write_jsonl(output_path, records)
+        _validate_binary_training_records(records)
 
         write_jsonl(eval_output_path, eval_records)
+        write_data_audit(
+            Path(output_path).with_suffix(
+                Path(output_path).suffix + ".split_audit.json"
+            ),
+            dataset="coconot",
+            train=records,
+            evaluation=eval_records,
+            drops=split_drop_records,
+            license_name="CoCoNot upstream dataset license",
+            intended_use="safety alignment training and evaluation",
+        )
+
+    # Built-in quality log: catch a HH-style "safe-but-evasive target" pathology
+    # at build time using the SAME judge the eval scores HR with.
+    quality = _coconot_refusal_quality(records)
+    for key, value in quality.items():
+        drops[f"{key}_x1000"] = int(round(value * 1000))
+    refusal_rate = quality.get("harmful_target_refusal_rate")
+    if refusal_rate is not None and refusal_rate < 0.5:
+        print(
+            f"[coconot] WARNING: harmful-target refusal rate {refusal_rate:.1%} < 50% "
+            "under the eval judge -- CoCoNot responses may be safe-but-evasive; verify "
+            "with scripts/diag_harmful_target_refusal_rate.py before trusting sft.",
+            flush=True,
+        )
 
     _write_materialization_summary(
         output_path=output_path,

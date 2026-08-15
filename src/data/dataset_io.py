@@ -42,28 +42,45 @@ def _take_frame_excluding_prompts(
     count: int,
     max_prompt_chars: int,
     source_group: str,
+    selected_prompts: set[str] | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    if count < 0:
+        raise ValueError("PAN sample count must be non-negative.")
+    if count == 0:
+        return frame.iloc[0:0].copy(), []
     candidate = frame.copy()
-    keys = candidate[prompt_column].astype(str).map(
-        lambda value: canonical_prompt(truncate_pan_prompt(value, max_prompt_chars))
-    )
-    overlap_mask = keys.isin(protected_prompts)
-    eligible = candidate.loc[~overlap_mask].iloc[:count].copy()
-    if len(eligible) < count:
+    reserved = selected_prompts if selected_prompts is not None else set()
+    selected_indices: list[Any] = []
+    drops: list[dict[str, Any]] = []
+    for index, row in candidate.iterrows():
+        key = canonical_prompt(
+            truncate_pan_prompt(str(row[prompt_column]), max_prompt_chars)
+        )
+        if key in protected_prompts:
+            drop_reason = "train_eval_prompt_overlap"
+        elif key in reserved:
+            drop_reason = "duplicate_prompt"
+        else:
+            reserved.add(key)
+            selected_indices.append(index)
+            if len(selected_indices) == count:
+                break
+            continue
+        drops.append(
+            {
+                "id": f"{source_group}:{int(row.get('source_row', index))}",
+                "source": str(row.get("source_dataset", source_group)),
+                "label": "",
+                "prompt_sha256": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+                "drop_reason": drop_reason,
+            }
+        )
+    eligible = candidate.loc[selected_indices].copy()
+    if len(eligible) != count:
         raise ValueError(
-            f"Not enough non-overlapping PAN rows for {source_group}: "
+            f"Not enough unique, non-overlapping PAN rows for {source_group}: "
             f"requested {count}, found {len(eligible)}."
         )
-    drops = [
-        {
-            "id": f"{source_group}:{int(row.get('source_row', index))}",
-            "source": str(row.get("source_dataset", source_group)),
-            "label": "",
-            "prompt_sha256": hashlib.sha256(key.encode("utf-8")).hexdigest(),
-            "drop_reason": "train_eval_prompt_overlap",
-        }
-        for (index, row), key in zip(candidate.loc[overlap_mask].iterrows(), keys.loc[overlap_mask])
-    ]
     return eligible, drops
 
 
@@ -184,9 +201,6 @@ def build_pan_train_test_records(
     harmful_remaining = harmful_size - exposure_size * len(harmful_methods)
     if harmful_remaining < 0:
         raise ValueError("Not enough harmful slots left after exposure selection.")
-    if harmful_remaining > len(add_moderation_df):
-        raise ValueError("add_moderation.csv does not have enough rows for the requested train size.")
-
     harmful_train_frames: Dict[str, pd.DataFrame] = {}
     harmful_test_frames: Dict[str, pd.DataFrame] = {}
     for method in harmful_methods:
@@ -216,26 +230,40 @@ def build_pan_train_test_records(
         canonical_prompt(truncate_pan_prompt(value, max_prompt_chars))
         for value in test_safe_df["jailbroken_prompt"].astype(str)
     }
+    protected_eval_prompts = protected_harmful | protected_safe
     split_drops: list[dict[str, Any]] = []
+    selected_train_prompts: set[str] = set()
     harmful_train_parts: list[pd.DataFrame] = []
     for method in harmful_methods:
         selected, drops = _take_frame_excluding_prompts(
             harmful_train_frames[method],
             prompt_column="jailbroken_prompt",
-            protected_prompts=protected_harmful,
+            protected_prompts=protected_eval_prompts,
             count=exposure_size,
             max_prompt_chars=max_prompt_chars,
             source_group=f"harmful:{method}",
+            selected_prompts=selected_train_prompts,
         )
         harmful_train_parts.append(selected)
         split_drops.extend(drops)
+    # Prefer add_moderation for the remaining harmful budget.  Canonical
+    # duplicates can make its nominal row count overstate the usable count,
+    # so append the method-specific pools as deterministic backfill after each
+    # method has received its required exposure quota above.
+    harmful_backfill_candidates = pd.concat(
+        [add_moderation_df]
+        + [harmful_train_frames[method] for method in harmful_methods],
+        ignore_index=True,
+        sort=False,
+    )
     selected_add, drops = _take_frame_excluding_prompts(
-        add_moderation_df,
+        harmful_backfill_candidates,
         prompt_column="jailbroken_prompt",
-        protected_prompts=protected_harmful,
+        protected_prompts=protected_eval_prompts,
         count=harmful_remaining,
         max_prompt_chars=max_prompt_chars,
-        source_group="harmful:add_moderation",
+        source_group="harmful:remaining",
+        selected_prompts=selected_train_prompts,
     )
     split_drops.extend(drops)
     train_toxic_df = pd.concat(harmful_train_parts + [selected_add], ignore_index=True)
@@ -246,10 +274,11 @@ def build_pan_train_test_records(
     train_safe_df, drops = _take_frame_excluding_prompts(
         safety_df,
         prompt_column="jailbroken_prompt",
-        protected_prompts=protected_safe,
+        protected_prompts=protected_eval_prompts,
         count=safe_size,
         max_prompt_chars=max_prompt_chars,
         source_group="harmless:safety",
+        selected_prompts=selected_train_prompts,
     )
     split_drops.extend(drops)
     train_safe_df["user_text"] = train_safe_df["jailbroken_prompt"].astype(str)
@@ -302,7 +331,14 @@ def build_pan_train_test_records(
             "safe_size": safe_size,
             "harmful_remaining_from_add_moderation": harmful_remaining,
             "harmful_methods": harmful_methods,
-            "train_test_prompt_overlap_removed": len(split_drops),
+            "train_test_prompt_overlap_removed": sum(
+                item["drop_reason"] == "train_eval_prompt_overlap"
+                for item in split_drops
+            ),
+            "duplicate_prompt_removed": sum(
+                item["drop_reason"] == "duplicate_prompt"
+                for item in split_drops
+            ),
             "split_drops": split_drops,
             "train_source_counts": pd.Series(
                 [record["source_dataset"] for record in train_records]

@@ -59,6 +59,26 @@ def exclude_protected_prompts(
     return kept, dropped
 
 
+def deduplicate_prompts(
+    records: Sequence[Mapping],
+    *,
+    reason: str = "duplicate_prompt",
+) -> tuple[list[dict], list[dict]]:
+    """Keep the first record for each canonical prompt, preserving order."""
+
+    seen: set[str] = set()
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for record in records:
+        prompt_hash = prompt_sha256(record)
+        if prompt_hash in seen:
+            dropped.append(_drop_record(record, reason=reason))
+            continue
+        seen.add(prompt_hash)
+        kept.append(dict(record))
+    return kept, dropped
+
+
 def stratified_holdout(
     records: Sequence[Mapping], *, fraction: float, seed: int
 ) -> tuple[list[dict], list[dict]]:
