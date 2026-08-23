@@ -651,7 +651,8 @@ class AblationCompileTests(unittest.TestCase):
             args = SimpleNamespace(output_dir=str(Path(td) / "artifacts"), cell_id="cell-42")
             environment = module._training_environment(args)
         self.assertTrue(environment["SAFETY_ABLATION_RUNTIME_LOG"].endswith("phase_runtime_logs.jsonl"))
-        self.assertTrue(environment["SAFETY_ABLATION_PROFILE_OUTPUT_ROOT"].endswith("pipeline\\phase1"))
+        profile_root = Path(environment["SAFETY_ABLATION_PROFILE_OUTPUT_ROOT"])
+        self.assertEqual(profile_root.parts[-2:], ("pipeline", "phase1"))
         self.assertEqual(environment["SAFETY_ABLATION_CELL_ID"], "cell-42")
 
     def test_benchmark_missing_assets_is_blocked_and_decode_is_shared(self) -> None:
