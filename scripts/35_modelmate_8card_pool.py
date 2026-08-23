@@ -444,6 +444,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-device-check", action="store_true")
+    # ModelMate training jobs inject these reserved key/value arguments even
+    # when this project reads its real inputs and checkpoints from persistent
+    # DPC paths.  Accept only the documented platform fields and deliberately
+    # leave them unused; keeping parse_args() strict still catches misspelled
+    # experiment controls instead of silently changing a formal run.
+    parser.add_argument(
+        "--checkpoint_url",
+        "--checkpoint-url",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--data_url",
+        "--data-url",
+        default="",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 

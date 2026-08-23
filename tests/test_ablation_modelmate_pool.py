@@ -189,6 +189,22 @@ class ModelMateDynamicPoolTests(unittest.TestCase):
 
 
 class ModelMatePoolEntrypointTests(unittest.TestCase):
+    def test_parser_accepts_only_known_modelmate_injected_arguments(self) -> None:
+        module = _load_pool_script()
+        args = module.build_parser().parse_args(
+            [
+                "--round=p0-smoke",
+                "--checkpoint_url=",
+                "--data_url=s3://platform-placeholder/dataset",
+            ]
+        )
+        self.assertEqual(args.round, "p0-smoke")
+        self.assertEqual(args.checkpoint_url, "")
+        self.assertEqual(args.data_url, "s3://platform-placeholder/dataset")
+
+        with self.assertRaises(SystemExit):
+            module.build_parser().parse_args(["--unknown-platform-argument=1"])
+
     def test_worker_environment_isolates_one_scheduler_visible_npu_per_process(self) -> None:
         module = _load_pool_script()
         scheduler = {
