@@ -232,6 +232,7 @@ def main(argv: list[str] | None = None, *, environment: Mapping[str, str] | None
         HF_HOME=str(config.data_root / "_hf"),
         HF_HUB_OFFLINE="1",
         TRANSFORMERS_OFFLINE="1",
+        SAFETY_REQUIRE_PREPARED_DATA="1",
     )
     for command in build_commands(config):
         print(json.dumps({"command": list(command)}, ensure_ascii=False), flush=True)

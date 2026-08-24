@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -60,7 +61,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Re-materialize the JSONL even when it already exists.",
     )
+    parser.add_argument(
+        "--require-existing",
+        action="store_true",
+        help=(
+            "Require already-prepared train/eval JSONLs and never invoke an "
+            "upstream dataset loader. Formal ModelMate jobs enable this mode."
+        ),
+    )
     return parser.parse_args()
+
+
+def _environment_flag(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _load_data_block(config_path: Path) -> tuple[SupervisedDataConfig, str, int]:
@@ -163,13 +176,20 @@ def main() -> None:
     args = parse_args()
     config_path = Path(args.config).resolve()
     spec, kind = _build_spec(config_path, args.force_rebuild)
-    output_path = materialize_safety_train_dataset(spec)
+    require_existing = bool(args.require_existing) or _environment_flag(
+        "SAFETY_REQUIRE_PREPARED_DATA"
+    )
+    output_path = materialize_safety_train_dataset(
+        spec,
+        require_existing=require_existing,
+    )
     summary = {
         "config_path": str(config_path),
         "config_kind": kind,
         "dataset_name": spec.name,
         "output_path": str(output_path),
         "force_rebuild": spec.force_rebuild,
+        "require_existing": require_existing,
         "labels": _summarize_labels(output_path),
     }
     if spec.eval_output_path:

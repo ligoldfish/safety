@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -26,6 +27,17 @@ from src.ablations.schema import ExperimentCell, ExperimentPlan
 
 
 DEFAULT_CATALOG = PROJECT_ROOT / "configs" / "ablations" / "catalog.yaml"
+
+
+def _interrupt_on_termination(signum, frame) -> None:
+    """Convert pool SIGTERM into Python unwinding so ledger cleanup runs."""
+
+    del frame
+    try:
+        signal_name = signal.Signals(int(signum)).name
+    except ValueError:
+        signal_name = str(signum)
+    raise KeyboardInterrupt(f"received {signal_name}")
 
 
 def _write_jsonl(path: Path, rows) -> None:
@@ -374,8 +386,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    previous_sigterm = signal.signal(signal.SIGTERM, _interrupt_on_termination)
     try:
-        raise SystemExit(main())
-    except (RunnerError, ValueError, OSError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        try:
+            raise SystemExit(main())
+        except (RunnerError, ValueError, OSError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)

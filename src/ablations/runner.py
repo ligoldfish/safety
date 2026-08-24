@@ -533,9 +533,11 @@ class AblationRunner:
                             RunState.BLOCKED,
                             reason=json.dumps(model_report.to_dict(), ensure_ascii=False, sort_keys=True),
                         )
-            ledger.transition(RunState.RUNNING)
             efficiency = []
             try:
+                # Enter RUNNING inside the guarded region so a termination
+                # signal cannot leave a tiny RUNNING-before-try race window.
+                ledger.transition(RunState.RUNNING)
                 for command in commands:
                     profiler = StageProfiler(
                         command.stage,
@@ -567,8 +569,12 @@ class AblationRunner:
                     {"schema_version": 1, "stages": [record.to_dict() for record in efficiency]},
                 )
                 return ledger.transition(RunState.COMPLETED, artifact_hash=artifact_hash)
-            except (KeyboardInterrupt, BaseException) as exc:
+            except BaseException as exc:
                 # SystemExit and KeyboardInterrupt must also leave a recoverable
                 # FAILED ledger. Re-raise the original signal after persistence.
-                ledger.transition(RunState.FAILED, reason=f"{type(exc).__name__}: {exc}")
+                if RunState(ledger.read()["state"]) is RunState.RUNNING:
+                    ledger.transition(
+                        RunState.FAILED,
+                        reason=f"{type(exc).__name__}: {exc}",
+                    )
                 raise

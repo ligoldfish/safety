@@ -578,6 +578,39 @@ def _existing_eval_matches_request(
     return bool(summary.get("full_test")) and not bool(summary.get("eval_subset_mode"))
 
 
+def _validate_prepared_jsonl(path: Path, *, label: str) -> None:
+    """Fail closed when a formal offline run is missing a usable JSONL.
+
+    The comprehensive ablation preflight performs the expensive schema and
+    train/eval overlap audits. This local guard checks the invariant needed at
+    every worker launch: the persisted path is a non-empty JSONL whose first
+    record is a JSON object. It never calls an upstream loader.
+    """
+
+    if not path.is_file():
+        raise RuntimeError(
+            f"prepared safety {label} JSONL is missing: {path}; "
+            "formal offline execution will not download or rebuild it"
+        )
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    raise RuntimeError(
+                        f"prepared safety {label} JSONL record {line_number} "
+                        f"is not an object: {path}"
+                    )
+                return
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"prepared safety {label} JSONL is unreadable or invalid: {path}"
+        ) from exc
+    raise RuntimeError(f"prepared safety {label} JSONL is empty: {path}")
+
+
 def _iter_dataset_rows(loaded: Any) -> Iterable[Dict[str, Any]]:
     """Iterate either a HF Dataset or a DatasetDict's first split.
 
@@ -3340,12 +3373,18 @@ SAFETY_TRAIN_DATASETS: Dict[str, SafetyDatasetBuilder] = {
 
 def materialize_safety_train_dataset(
     spec: SafetyDatasetSpec,
+    *,
+    require_existing: bool = False,
 ) -> Path:
     """Build (or reuse) the JSONL training file for a safety baseline.
 
     Returns the absolute output path. When ``spec.force_rebuild`` is False
     and the requested train/eval JSONLs already match the requested subset
     mode, the existing files are left untouched.
+
+    ``require_existing`` is the formal-job safety boundary: both persisted
+    JSONLs must already exist and be minimally valid, and no dataset builder
+    is ever invoked. Their complete validation belongs to ablation preflight.
     """
 
     if spec.name not in SAFETY_TRAIN_DATASETS:
@@ -3356,6 +3395,13 @@ def materialize_safety_train_dataset(
 
     output_path = Path(spec.output_path)
     eval_path = Path(spec.eval_output_path) if spec.eval_output_path else None
+    if require_existing:
+        if spec.force_rebuild:
+            raise ValueError("require_existing and force_rebuild are mutually exclusive")
+        _validate_prepared_jsonl(output_path, label="train")
+        if eval_path is not None:
+            _validate_prepared_jsonl(eval_path, label="eval")
+        return output_path.resolve()
     if (
         not spec.force_rebuild
         and output_path.exists()

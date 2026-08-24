@@ -108,6 +108,7 @@ def _runtime_environment(model_root: Path, data_root: Path, output_root: Path) -
         HF_HOME=str(data_root / "_hf"),
         HF_HUB_OFFLINE="1",
         TRANSFORMERS_OFFLINE="1",
+        SAFETY_REQUIRE_PREPARED_DATA="1",
         TOKENIZERS_PARALLELISM="false",
     )
     return environment

@@ -1371,6 +1371,52 @@ class SafetyDatasetRegistryTests(unittest.TestCase):
             builder.assert_called_once()
             self.assertEqual(output_path.read_text(encoding="utf-8"), "rebuilt\n")
 
+    def test_require_existing_reuses_preflighted_jsonls_without_builder_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "train.jsonl"
+            eval_path = Path(tmpdir) / "eval.jsonl"
+            output_path.write_text('{"id": "prepared-train"}\n', encoding="utf-8")
+            eval_path.write_text('{"id": "prepared-eval"}\n', encoding="utf-8")
+            spec = SafetyDatasetSpec(
+                name="c5",
+                output_path=str(output_path),
+                eval_output_path=str(eval_path),
+                eval_subset_mode=False,
+                max_eval_samples=0,
+            )
+            builder = mock.Mock()
+            with mock.patch.dict(safety_datasets.SAFETY_TRAIN_DATASETS, {"c5": builder}):
+                resolved = materialize_safety_train_dataset(
+                    spec,
+                    require_existing=True,
+                )
+            builder.assert_not_called()
+            self.assertEqual(resolved, output_path.resolve())
+
+    def test_require_existing_fails_closed_instead_of_downloading(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "missing-train.jsonl"
+            eval_path = Path(tmpdir) / "missing-eval.jsonl"
+            spec = SafetyDatasetSpec(
+                name="c5",
+                output_path=str(output_path),
+                eval_output_path=str(eval_path),
+            )
+            builder = mock.Mock()
+            with mock.patch.dict(safety_datasets.SAFETY_TRAIN_DATASETS, {"c5": builder}):
+                with self.assertRaisesRegex(RuntimeError, "prepared safety train JSONL"):
+                    materialize_safety_train_dataset(spec, require_existing=True)
+            builder.assert_not_called()
+
+    def test_require_existing_rejects_force_rebuild(self) -> None:
+        spec = SafetyDatasetSpec(
+            name="c5",
+            output_path="/tmp/prepared.jsonl",
+            force_rebuild=True,
+        )
+        with self.assertRaisesRegex(ValueError, "require_existing.*force_rebuild"):
+            materialize_safety_train_dataset(spec, require_existing=True)
+
     def test_force_rebuild_invokes_builder(self) -> None:
         rows = [
             {

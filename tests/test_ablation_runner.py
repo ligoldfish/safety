@@ -836,6 +836,37 @@ class AblationCompileTests(unittest.TestCase):
 
 
 class AblationRunnerStateTests(unittest.TestCase):
+    def test_ablation_entrypoint_converts_sigterm_to_python_interrupt(self) -> None:
+        path = ROOT / "scripts" / "30_ablation.py"
+        spec = importlib.util.spec_from_file_location("ablation_sigterm_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        with self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM"):
+            module._interrupt_on_termination(module.signal.SIGTERM, None)
+
+    def test_interrupt_marks_running_cell_failed_and_releases_writer_lock(self) -> None:
+        cell = _cell("P1-11", layer_loss_weight=0.25)
+
+        def interrupted(*args, **kwargs):
+            del args, kwargs
+            raise KeyboardInterrupt("received SIGTERM")
+
+        with tempfile.TemporaryDirectory() as td:
+            state_root = Path(td) / "state"
+            runner = AblationRunner(
+                CATALOG,
+                RunnerContext(ROOT, state_root, "python", "npu", 0),
+                executor=interrupted,
+            )
+            with self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM"):
+                runner.run_cell(cell)
+            status = runner.status(cell)
+            lock_path = state_root / cell.cell_id / ".writer.lock"
+            self.assertEqual(status["state"], "FAILED")
+            self.assertIn("KeyboardInterrupt", status["reason"])
+            self.assertFalse(lock_path.exists())
+
     def test_real_runner_blocks_before_execution_when_assets_are_missing(self) -> None:
         cell = _cell("P0-07", dataset="pan", config="global", method="ours")
         with tempfile.TemporaryDirectory() as td:

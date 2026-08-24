@@ -237,6 +237,17 @@ class ModelMateDynamicPoolTests(unittest.TestCase):
 
 
 class ModelMatePoolEntrypointTests(unittest.TestCase):
+    def test_formal_pool_requires_prepared_offline_data(self) -> None:
+        module = _load_pool_script()
+        environment = module._runtime_environment(
+            Path("/persistent/models"),
+            Path("/persistent/data"),
+            Path("/persistent/output"),
+        )
+        self.assertEqual(environment["HF_HUB_OFFLINE"], "1")
+        self.assertEqual(environment["TRANSFORMERS_OFFLINE"], "1")
+        self.assertEqual(environment["SAFETY_REQUIRE_PREPARED_DATA"], "1")
+
     def test_parser_accepts_only_known_modelmate_injected_arguments(self) -> None:
         module = _load_pool_script()
         args = module.build_parser().parse_args(

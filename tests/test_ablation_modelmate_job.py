@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +23,42 @@ def _load():
 
 
 class ModelMateAblationJobTests(unittest.TestCase):
+    def test_job_processes_require_prepared_offline_data(self) -> None:
+        module = _load()
+        captured: dict[str, str] = {}
+
+        def fake_run(command, **kwargs):
+            del command
+            captured.update(kwargs["env"])
+            return SimpleNamespace(returncode=0)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            manifest = root / "assets.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            with patch.object(module, "build_commands", return_value=(("noop",),)), patch.object(
+                module.subprocess, "run", side_effect=fake_run
+            ):
+                result = module.main(
+                    [
+                        "--wave",
+                        "core-train",
+                        "--output-root",
+                        str(root / "outputs"),
+                        "--asset-manifest",
+                        str(manifest),
+                        "--shard-index",
+                        "0",
+                        "--shard-count",
+                        "1",
+                    ],
+                    environment={},
+                )
+        self.assertEqual(result, 0)
+        self.assertEqual(captured["HF_HUB_OFFLINE"], "1")
+        self.assertEqual(captured["TRANSFORMERS_OFFLINE"], "1")
+        self.assertEqual(captured["SAFETY_REQUIRE_PREPARED_DATA"], "1")
+
     def test_wave_partition_covers_every_cell_exactly_once(self) -> None:
         module = _load()
         from src.ablations.catalog import load_catalog
