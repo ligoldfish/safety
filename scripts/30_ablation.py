@@ -71,7 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     catalog.add_argument("--json", action="store_true")
 
     plan = subparsers.add_parser("plan")
-    plan.add_argument("--scope", choices=["main-table", "all", "p0", "p1", "p2"], default="all")
+    plan.add_argument(
+        "--scope",
+        choices=["main-table", "full", "all", "p0", "p1", "p2"],
+        default="full",
+    )
     plan.add_argument("--experiment-id", action="append", default=[])
     plan.add_argument("--exclude-experiment-id", action="append", default=[])
     plan.add_argument(

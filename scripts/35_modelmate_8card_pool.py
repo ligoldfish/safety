@@ -500,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
     complete = build_catalog_plan(
         catalog,
         output_root=output_root / "cell-outputs",
-        scope="all",
+        scope="full",
     )
     plan = build_round_plan(catalog, complete, spec)
     layout = derive_pool_layout(

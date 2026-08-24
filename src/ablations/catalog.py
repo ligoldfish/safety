@@ -6,6 +6,7 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from .schema import (
+    CampaignTier,
     ExecutionKind,
     ExperimentCatalog,
     ExperimentDefinition,
@@ -32,6 +33,7 @@ _EXPERIMENT_KEYS = {
     "question",
     "execution_kind",
     "handler",
+    "campaign_tier",
     "axes",
     "overrides",
     "requires",
@@ -94,6 +96,7 @@ def _parse_experiment(
     try:
         priority = Priority(str(item["priority"]))
         execution_kind = ExecutionKind(str(item["execution_kind"]))
+        campaign_tier = CampaignTier(str(item.get("campaign_tier", "full")))
     except ValueError as exc:
         raise CatalogError(str(exc)) from exc
 
@@ -104,6 +107,7 @@ def _parse_experiment(
         question=str(item["question"]).strip(),
         execution_kind=execution_kind,
         handler=str(item["handler"]).strip(),
+        campaign_tier=campaign_tier,
         axes=axes,
         overrides=overrides,
         requires=_tuple_of_strings(item.get("requires", []), f"{item['id']}.requires", allow_empty=True),

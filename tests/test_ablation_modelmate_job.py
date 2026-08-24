@@ -27,7 +27,7 @@ class ModelMateAblationJobTests(unittest.TestCase):
         from src.ablations.planner import build_catalog_plan
 
         catalog = load_catalog(ROOT / "configs" / "ablations" / "catalog.yaml")
-        complete = build_catalog_plan(catalog, output_root="/out", scope="all")
+        complete = build_catalog_plan(catalog, output_root="/out", scope="full")
         seen: set[str] = set()
         counts = {}
         for wave in module.EXECUTION_WAVES:
@@ -38,9 +38,9 @@ class ModelMateAblationJobTests(unittest.TestCase):
         self.assertEqual(
             counts,
             {
-                "core-train": 175,
-                "wjb": 90,
-                "fairness": 24,
+                "core-train": 122,
+                "wjb": 6,
+                "fairness": 12,
                 "evaluate": 31,
                 "analyze": 186,
                 "manual": 3,
@@ -59,7 +59,7 @@ class ModelMateAblationJobTests(unittest.TestCase):
                 output_root=root / "outputs",
                 asset_manifest=ROOT / "configs" / "ablations" / "assets.modelmate.template.json",
                 shard_index=2,
-                shard_count=175,
+                shard_count=122,
                 max_cells=1,
                 device="npu",
                 device_id=0,
@@ -127,7 +127,7 @@ class ModelMateAblationJobTests(unittest.TestCase):
                 data_root=root / "datasets",
                 output_root=root / "outputs",
                 asset_manifest=root / "assets.json",
-                shard_count=175,
+                shard_count=122,
                 max_cells=1,
                 device="npu",
                 device_id=0,
@@ -140,8 +140,8 @@ class ModelMateAblationJobTests(unittest.TestCase):
         left_state = Path(left[2][left[2].index("--state-root") + 1])
         right_state = Path(right[2][right[2].index("--state-root") + 1])
         self.assertNotEqual(left_plan, right_plan)
-        self.assertIn("shard-00000-of-00175", left_plan.as_posix())
-        self.assertIn("shard-00001-of-00175", right_plan.as_posix())
+        self.assertIn("shard-00000-of-00122", left_plan.as_posix())
+        self.assertIn("shard-00001-of-00122", right_plan.as_posix())
         self.assertEqual(left_state, right_state)
 
 

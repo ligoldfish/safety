@@ -55,6 +55,24 @@ class AblationCatalogTests(unittest.TestCase):
                 self.assertTrue(item.metrics)
                 self.assertTrue(item.completion_artifacts)
 
+    def test_campaign_tiers_separate_full_from_extended_only_experiments(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        extended = {
+            experiment.id
+            for experiment in catalog.experiments.values()
+            if experiment.campaign_tier == "extended"
+        }
+        self.assertEqual(
+            extended,
+            {"P1-06", "P1-10", "P1-12", "P1-14", "P1-15", "P1-17"},
+        )
+        self.assertTrue(
+            all(
+                experiment.campaign_tier in {"full", "extended"}
+                for experiment in catalog.experiments.values()
+            )
+        )
+
     def test_cross_corpus_registry_is_not_aliased_to_single_checkpoint_directory(self) -> None:
         catalog = load_catalog(CATALOG_PATH)
         self.assertIn("checkpoint_registry", catalog.experiments["P0-08"].requires)
@@ -140,6 +158,15 @@ class AblationCatalogTests(unittest.TestCase):
             path = Path(td) / "catalog.yaml"
             path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
             with self.assertRaisesRegex(CatalogError, "unknown target.mode"):
+                load_catalog(path)
+
+    def test_unknown_campaign_tier_is_rejected(self) -> None:
+        raw = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
+        raw["experiments"][0]["campaign_tier"] = "surprise"
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "catalog.yaml"
+            path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+            with self.assertRaisesRegex(CatalogError, "surprise"):
                 load_catalog(path)
 
 

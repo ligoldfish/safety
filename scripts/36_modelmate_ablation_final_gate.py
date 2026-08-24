@@ -57,7 +57,7 @@ def audit_completion(output_root: Path) -> dict[str, object]:
     complete_plan = build_catalog_plan(
         catalog,
         output_root=output_root / "cell-outputs",
-        scope="all",
+        scope="full",
     )
     expected_all = {cell.cell_id for cell in complete_plan.cells}
     seen: set[str] = set()
@@ -149,8 +149,14 @@ def audit_completion(output_root: Path) -> dict[str, object]:
             f"final round coverage mismatch: missing={len(expected_all - seen)}, "
             f"unexpected={len(seen - expected_all)}"
         )
-    if len(expected_all) != 509:
-        blockers.append(f"catalog drift: expected 509 cells, got {len(expected_all)}")
+    train_cells = sum(
+        catalog.experiments[cell.experiment_id].execution_kind.value == "train"
+        for cell in complete_plan.cells
+    )
+    if len(expected_all) != 360:
+        blockers.append(f"catalog drift: expected 360 cells, got {len(expected_all)}")
+    if train_cells != 140:
+        blockers.append(f"training budget drift: expected 140 cells, got {train_cells}")
 
     return {
         "schema_version": 1,
@@ -158,6 +164,7 @@ def audit_completion(output_root: Path) -> dict[str, object]:
         "status": "READY" if not blockers else "BLOCKED",
         "output_root": str(output_root),
         "expected_cells": len(expected_all),
+        "training_cells": train_cells,
         "covered_cells": len(completed_seen),
         "rounds": rounds,
         "blockers": blockers,
@@ -166,7 +173,7 @@ def audit_completion(output_root: Path) -> dict[str, object]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fail-closed final completion gate for all 509 ICLR ablation cells."
+        description="Fail-closed final completion gate for the 360-cell Full ICLR plan."
     )
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--output", default="")

@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping
 
-from .schema import ExperimentCatalog, ExperimentCell, ExperimentPlan
+from .schema import CampaignTier, ExperimentCatalog, ExperimentCell, ExperimentPlan
 
 
 class PlanError(ValueError):
@@ -65,7 +65,12 @@ def _expand_axes(axes: Mapping[str, tuple[Any, ...]]) -> Iterable[dict[str, Any]
         yield dict(zip(keys, values))
 
 
-def _valid_declared_cell(experiment_id: str, axes: Mapping[str, Any]) -> bool:
+def _valid_declared_cell(
+    experiment_id: str,
+    axes: Mapping[str, Any],
+    *,
+    full_campaign: bool = False,
+) -> bool:
     """Apply the correlated-axis constraints stated in the experiment design."""
 
     if experiment_id == "P0-07":
@@ -73,17 +78,35 @@ def _valid_declared_cell(experiment_id: str, axes: Mapping[str, Any]) -> bool:
         # two corpora with historical per-dataset overrides receive the
         # validation-selected comparison; expanding this to the other four
         # would add unplanned tuning runs and change the fairness budget.
-        return (
+        valid = (
             str(axes.get("config")) == "global"
             or str(axes.get("dataset")) in {"wildjailbreak", "wildguardmix"}
         )
-    if experiment_id == "P1-05":
+        if not valid:
+            return False
+    elif experiment_id == "P1-05":
         # selected/evenly/last are deterministic single cells; only random-K
         # has the five independent draws required by the design.
-        return str(axes.get("mode")) == "random_k" or int(axes.get("draw", 0)) == 0
-    if experiment_id == "P1-15":
+        valid = str(axes.get("mode")) == "random_k" or int(axes.get("draw", 0)) == 0
+        if not valid:
+            return False
+    elif experiment_id == "P1-15":
         # Two one-dimensional sensitivity curves: tau @ cap=32 and cap @ tau=.8.
-        return int(axes.get("rank_cap")) == 32 or float(axes.get("energy_threshold")) == 0.8
+        valid = int(axes.get("rank_cap")) == 32 or float(axes.get("energy_threshold")) == 0.8
+        if not valid:
+            return False
+
+    if not full_campaign:
+        return True
+    if experiment_id == "P0-06":
+        return (
+            str(axes.get("pair")) == "qwen35_9b_to_08b"
+            and str(axes.get("method")) == "ours"
+        )
+    if experiment_id == "P0-07":
+        return str(axes.get("dataset")) in {"wildjailbreak", "wildguardmix"}
+    if experiment_id in {"P1-03", "P1-05"}:
+        return str(axes.get("dataset")) == "pan"
     return True
 
 
@@ -91,28 +114,37 @@ def build_catalog_plan(
     catalog: ExperimentCatalog,
     *,
     output_root: str,
-    scope: str = "all",
+    scope: str = "full",
 ) -> ExperimentPlan:
     """Expand a stable, immutable plan without loading data or models.
 
-    ``P0-01`` is the exact 5 x 6 x 5 main-table provenance matrix. Every
-    other experiment expands its declared axes as a Cartesian product. This
-    intentionally makes expensive work visible before submission rather than
-    hiding implicit loops in a launcher.
+    ``P0-01`` is the exact 5 x 6 x 5 main-table provenance matrix. ``full``
+    enforces the preregistered 140-training upper budget; ``all`` is the
+    explicit opt-in Extended matrix. Expensive work remains visible before
+    submission rather than being hidden in launcher loops.
     """
 
     normalized_scope = str(scope).strip().lower().replace("_", "-")
     if normalized_scope in {"main", "main-table"}:
         return build_main_table_plan(catalog, output_root=output_root)
-    if normalized_scope not in {"all", "p0", "p1", "p2"}:
+    if normalized_scope not in {"all", "full", "p0", "p1", "p2"}:
         raise PlanError(f"unknown plan scope: {scope}")
+
+    full_campaign = normalized_scope == "full"
 
     cells: list[ExperimentCell] = []
     main_cells = build_main_table_plan(catalog, output_root=output_root).cells
     selected_ids = {
         experiment_id
         for experiment_id in catalog.experiments
-        if normalized_scope == "all" or experiment_id.startswith(normalized_scope.upper() + "-")
+        if (
+            normalized_scope in {"all", "full"}
+            or experiment_id.startswith(normalized_scope.upper() + "-")
+        )
+        and (
+            not full_campaign
+            or catalog.experiments[experiment_id].campaign_tier == CampaignTier.FULL
+        )
     }
     if "P0-01" in selected_ids:
         cells.extend(main_cells)
@@ -121,7 +153,11 @@ def build_catalog_plan(
             continue
         definition = catalog.experiments[experiment_id]
         for axes in _expand_axes(definition.axes):
-            if not _valid_declared_cell(experiment_id, axes):
+            if not _valid_declared_cell(
+                experiment_id,
+                axes,
+                full_campaign=full_campaign,
+            ):
                 continue
             overrides = dict(definition.overrides)
             payload = {

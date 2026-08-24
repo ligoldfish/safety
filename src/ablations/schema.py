@@ -27,6 +27,11 @@ class Priority(str, Enum):
     P2 = "P2"
 
 
+class CampaignTier(str, Enum):
+    FULL = "full"
+    EXTENDED = "extended"
+
+
 @dataclass(frozen=True)
 class ExperimentDefinition:
     id: str
@@ -35,6 +40,7 @@ class ExperimentDefinition:
     question: str
     execution_kind: ExecutionKind
     handler: str
+    campaign_tier: CampaignTier = CampaignTier.FULL
     axes: Mapping[str, Tuple[Any, ...]] = field(default_factory=dict)
     overrides: Mapping[str, Any] = field(default_factory=dict)
     requires: Tuple[str, ...] = ()

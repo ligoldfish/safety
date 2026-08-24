@@ -1,18 +1,19 @@
 # ModelMate 全量消融实验运行手册
 
 本手册对应 `configs/ablations/catalog.yaml` 和
-`scripts/33_modelmate_ablation_job.py`。代码枚举得到的正式矩阵是 **509 个单元**：
+`scripts/33_modelmate_ablation_job.py`。正式入口使用 HTML Full 档：**360 个单元，其中恰好
+140 个训练**。`--scope all` 仍可显式生成 509/289 的 Extended 复现矩阵，但不属于默认正式作业：
 
 | 波次 | 单元数 | 内容 |
 |---|---:|---|
-| `core-train` | 175 | P0-02 六语料三方法三 seed、主文组件与敏感性消融、P2 常规训练；不含 WJB 边界和公平性 |
-| `wjb` | 90 | P0-06：5 模型对 × 2 配置 × 3 curation × 3 方法 |
-| `fairness` | 24 | P0-07：6 数据集的 global × 3 方法，加 WJB/WGM 的 validation-selected × 3 方法 |
+| `core-train` | 122 | Full 中除 WJB 边界和公平性外的训练 |
+| `wjb` | 6 | P0-06：主 Qwen3.5 模型对 × 2 配置 × 3 curation × ours |
+| `fairness` | 12 | P0-07：WJB/WGM × 2 配置 × 3 方法 |
 | `evaluate` | 31 | P0-08、P1-19、P2-02、P2-05 |
 | `analyze` | 186 | provenance、统计、机制、效率、伦理分析 |
 | `manual` | 3 | P0-03 三个分层的双人标注审计 |
 
-即 **289 个训练、31 个评测、186 个分析、3 个人工单元**。主表本身是
+即 **140 个训练、31 个评测、186 个分析、3 个人工单元**。主表本身是
 5 模型对 × 6 语料 × 5 方法 = 150 个 provenance 单元；它不是 150 次额外训练。
 
 ## 1. 持久目录
@@ -83,7 +84,7 @@ epochs completed、样本数、optimizer steps 与非 padding training tokens；
 
 ### 2.1 先运行 P0-07 的 12 个验证集搜索任务
 
-这 12 个上游候选不计入 509 个正式结果单元。它们只覆盖
+这 12 个上游候选不计入 360 个正式结果单元。它们只覆盖
 `WJB/WGM × sft1/random/ours × {global,historical_override}`，每个作业只允许一个
 `trial-id`。搜索训练显式跳过 sanity/test/OpenCompass；训练完成后仅对最终 epoch 的
 validation generations 运行同一 WildGuard。不要手工填写或修改账本。
@@ -136,7 +137,7 @@ python scripts/33_modelmate_ablation_job.py \
 
 ## 3. 先做 dry-run
 
-每个平台作业只跑一个 cell，最稳妥。下面以 175 个常规训练单元的第 0 个为例：
+每个平台作业只跑一个 cell，最稳妥。下面以 122 个常规训练单元的第 0 个为例：
 
 ```bash
 python scripts/33_modelmate_ablation_job.py \
@@ -145,7 +146,7 @@ python scripts/33_modelmate_ablation_job.py \
   --data-root "$SAFETY_DATA_ROOT" \
   --output-root "$SAFETY_OUTPUT_ROOT" \
   --asset-manifest "$ASSET_MANIFEST" \
-  --shard-index 0 --shard-count 175 --max-cells 1 \
+  --shard-index 0 --shard-count 122 --max-cells 1 \
   --device npu --device-id 0 --num-devices 1 \
   --dry-run
 ```
@@ -164,16 +165,16 @@ python scripts/33_modelmate_ablation_job.py \
   --data-root "$SAFETY_DATA_ROOT" \
   --output-root "$SAFETY_OUTPUT_ROOT" \
   --asset-manifest "$ASSET_MANIFEST" \
-  --shard-index 0 --shard-count 175 --max-cells 1 \
+  --shard-index 0 --shard-count 122 --max-cells 1 \
   --device npu --device-id 0 --num-devices 1
 ```
 
 其它波次只替换 wave 和总分片数：
 
 ```text
-core-train  175
-wjb          90   # P0-06；Llama 在此非常重要，因为失败边界要求 5/5 模型对
-fairness     24   # P0-07；先准备严格的 search_ledger
+core-train  122
+wjb           6   # P0-06；Full 聚焦主 Qwen3.5 模型对
+fairness     12   # P0-07；先准备严格的 search_ledger
 evaluate     31
 analyze     186
 manual        3
@@ -187,16 +188,16 @@ manual        3
 入口等价于以下四步；诊断时可以手动执行：
 
 ```bash
-python scripts/30_ablation.py plan --scope all --execution-kind train \
+python scripts/30_ablation.py plan --scope full --execution-kind train \
   --exclude-experiment-id P0-06 --exclude-experiment-id P0-07 \
   --output-root "$SAFETY_OUTPUT_ROOT/cell-outputs" --output /tmp/core-plan.jsonl
 
 python scripts/30_ablation.py preflight --plan /tmp/core-plan.jsonl \
-  --asset-manifest "$ASSET_MANIFEST" --shard-index 0 --shard-count 175 \
+  --asset-manifest "$ASSET_MANIFEST" --shard-index 0 --shard-count 122 \
   --max-cells 1 --device npu --output "$SAFETY_OUTPUT_ROOT/preflight.json"
 
 python scripts/30_ablation.py run --plan /tmp/core-plan.jsonl \
-  --asset-manifest "$ASSET_MANIFEST" --shard-index 0 --shard-count 175 \
+  --asset-manifest "$ASSET_MANIFEST" --shard-index 0 --shard-count 122 \
   --max-cells 1 --state-root "$SAFETY_OUTPUT_ROOT/run-state" \
   --device npu --device-id 0 --num-devices 1
 
@@ -217,9 +218,8 @@ python scripts/30_ablation.py status --plan /tmp/core-plan.jsonl \
 5. 运行 `analyze`；
 6. 导出 P0-03 盲化包，双人标注回传后再运行 `manual`。
 
-P0-06 是最优先且 Llama 重要性高：设计要求验证 WJB 的负增益是否在 5/5 模型对上成立；缺少两个
-Llama 权重会使该结论只能退化为 Qwen 家族内部结论。P2-04 的跨 tokenizer 实验也依赖
-Llama-3.2-1B-Instruct。
+Full 的 P0-06 聚焦主 Qwen3.5 对；五模型对 WJB 全因子属于 Extended。Llama 仍用于 Full 的
+P2-04 跨 tokenizer 实验，所以正式资产不能删除 Llama-3.2-1B-Instruct。
 
 ## 7. 提交包与依赖
 

@@ -26,7 +26,7 @@ from src.ablations.planner import build_catalog_plan
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = load_catalog(ROOT / "configs" / "ablations" / "catalog.yaml")
-COMPLETE_PLAN = build_catalog_plan(CATALOG, output_root="/persistent/cells", scope="all")
+COMPLETE_PLAN = build_catalog_plan(CATALOG, output_root="/persistent/cells", scope="full")
 
 
 def _load_pool_script():
@@ -63,13 +63,13 @@ class ModelMateRoundSelectionTests(unittest.TestCase):
     def test_final_rounds_cover_every_cell_exactly_once(self) -> None:
         expected = {
             "p0-core": 54,
-            "p0-wjb": 90,
-            "p0-fairness": 24,
+            "p0-wjb": 6,
+            "p0-fairness": 12,
             "p0-evaluate": 2,
             "p0-analyze": 154,
             "p0-manual": 3,
-            "p1-mechanism": 99,
-            "p1-data": 16,
+            "p1-mechanism": 52,
+            "p1-data": 10,
             "p1-evaluate": 5,
             "p1-analyze": 5,
             "p2-generalization": 6,
@@ -87,7 +87,7 @@ class ModelMateRoundSelectionTests(unittest.TestCase):
 
         self.assertEqual(tuple(expected), FINAL_ROUND_ORDER)
         self.assertEqual(seen, {cell.cell_id for cell in COMPLETE_PLAN.cells})
-        self.assertEqual(len(seen), 509)
+        self.assertEqual(len(seen), 360)
 
     def test_production_rounds_form_one_explicit_dependency_chain(self) -> None:
         self.assertEqual(ROUND_SPECS["p0-smoke"].prerequisites, ())
@@ -541,7 +541,7 @@ class ModelMateCampaignTests(unittest.TestCase):
         self.assertEqual(payload["executed_stage_count"], 2)
         self.assertEqual(payload["planned_stage_count"], 5)
 
-    def test_final_wave_invokes_only_the_509_cell_gate(self) -> None:
+    def test_final_wave_invokes_only_the_360_cell_full_gate(self) -> None:
         module = _load_campaign_script()
         args = module.build_parser().parse_args(["--wave", "final"])
         commands = module.build_campaign_commands(args)
@@ -583,7 +583,7 @@ class ModelMateFinalGateTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-    def test_final_gate_requires_and_counts_all_509_real_cells(self) -> None:
+    def test_final_gate_requires_and_counts_all_360_real_cells(self) -> None:
         module = _load_final_gate_script()
         with tempfile.TemporaryDirectory() as td:
             output = Path(td).resolve()
@@ -594,8 +594,9 @@ class ModelMateFinalGateTests(unittest.TestCase):
             )
         self.assertEqual(result, 0)
         self.assertEqual(report["status"], "READY")
-        self.assertEqual(report["expected_cells"], 509)
-        self.assertEqual(report["covered_cells"], 509)
+        self.assertEqual(report["expected_cells"], 360)
+        self.assertEqual(report["covered_cells"], 360)
+        self.assertEqual(report["training_cells"], 140)
 
     def test_final_gate_rejects_dry_run_or_noncompleted_round(self) -> None:
         module = _load_final_gate_script()
@@ -611,7 +612,7 @@ class ModelMateFinalGateTests(unittest.TestCase):
             (root / "status.json").write_text(json.dumps(status) + "\n")
             report = module.audit_completion(output)
         self.assertEqual(report["status"], "BLOCKED")
-        self.assertEqual(report["covered_cells"], 508)
+        self.assertEqual(report["covered_cells"], 359)
         self.assertTrue(any("p1-data" in item for item in report["blockers"]))
 
 

@@ -20,6 +20,55 @@ CATALOG_PATH = ROOT / "configs" / "ablations" / "catalog.yaml"
 
 
 class AblationPlannerTests(unittest.TestCase):
+    def test_default_plan_is_the_full_budget_not_extended(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        implicit = build_catalog_plan(catalog, output_root="/persistent/outputs")
+        explicit = build_catalog_plan(
+            catalog,
+            output_root="/persistent/outputs",
+            scope="full",
+        )
+        self.assertEqual(implicit, explicit)
+
+    def test_full_plan_matches_preregistered_140_training_budget(self) -> None:
+        catalog = load_catalog(CATALOG_PATH)
+        plan = build_catalog_plan(catalog, output_root="/persistent/outputs", scope="full")
+        counts = {"train": 0, "evaluate": 0, "analyze": 0, "manual": 0}
+        by_experiment: dict[str, list[ExperimentCell]] = {}
+        for cell in plan.cells:
+            counts[catalog.experiments[cell.experiment_id].execution_kind.value] += 1
+            by_experiment.setdefault(cell.experiment_id, []).append(cell)
+
+        self.assertEqual(len(plan.cells), 360)
+        self.assertEqual(
+            counts,
+            {"train": 140, "evaluate": 31, "analyze": 186, "manual": 3},
+        )
+        self.assertEqual(len(by_experiment["P0-06"]), 6)
+        self.assertEqual(
+            {cell.axes["pair"] for cell in by_experiment["P0-06"]},
+            {"qwen35_9b_to_08b"},
+        )
+        self.assertEqual(
+            {cell.axes["method"] for cell in by_experiment["P0-06"]},
+            {"ours"},
+        )
+        self.assertEqual(len(by_experiment["P0-07"]), 12)
+        self.assertEqual(
+            {cell.axes["dataset"] for cell in by_experiment["P0-07"]},
+            {"wildjailbreak", "wildguardmix"},
+        )
+        self.assertEqual(len(by_experiment["P1-03"]), 5)
+        self.assertEqual(len(by_experiment["P1-05"]), 8)
+        self.assertEqual(
+            {cell.axes["dataset"] for cell in by_experiment["P1-03"] + by_experiment["P1-05"]},
+            {"pan"},
+        )
+        self.assertEqual(
+            set(catalog.experiments) - set(by_experiment),
+            {"P1-06", "P1-10", "P1-12", "P1-14", "P1-15", "P1-17"},
+        )
+
     def test_all_plan_covers_every_experiment_and_keeps_outputs_unique(self) -> None:
         catalog = load_catalog(CATALOG_PATH)
         plan = build_catalog_plan(catalog, output_root="/persistent/outputs", scope="all")

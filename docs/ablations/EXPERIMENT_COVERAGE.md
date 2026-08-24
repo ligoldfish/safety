@@ -1,8 +1,12 @@
 # 实验覆盖清单
 
-当前 catalog 覆盖 HTML 的 35/35 项，主表精确 150 单元，全计划 509 单元，其中 289 train、
-31 evaluate、186 analyze、3 manual。下表是代码 handler 与完成产物的审查索引；具体轴值以
+当前 catalog 覆盖 HTML 的 35/35 项，主表精确 150 单元。Full 正式计划为 360 单元，其中
+140 train、31 evaluate、186 analyze、3 manual；Extended 显式扩展计划仍为 509 单元，其中
+289 train、31 evaluate、186 analyze、3 manual。下表是代码 handler 与完成产物的审查索引；具体轴值以
 `configs/ablations/catalog.yaml` 为唯一事实源。
+
+Full 为 HTML 的 90–140 次训练档上界。`P1-06/10/12/14/15/17` 标记为 Extended；实现与
+产物契约均保留，但只有显式 `--scope all` 才会调度，正式六波次使用 `--scope full`。
 
 | ID | 类别 | Handler | 核心完成产物 |
 |---|---|---|---|

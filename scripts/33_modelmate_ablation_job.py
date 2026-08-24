@@ -87,7 +87,7 @@ def _plan_args(config: JobConfig, plan_path: Path, *, project_root: Path) -> lis
         str(project_root / "scripts" / "30_ablation.py"),
         "plan",
         "--scope",
-        "all",
+        "full",
         "--output-root",
         str(config.output_root / "cell-outputs"),
         "--output",

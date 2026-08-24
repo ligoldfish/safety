@@ -25,10 +25,6 @@ class RoundSpec:
     axis_filters: tuple[tuple[str, object], ...] = ()
 
 
-def _ids(prefix: str, start: int, stop: int) -> tuple[str, ...]:
-    return tuple(f"{prefix}-{index:02d}" for index in range(start, stop + 1))
-
-
 ROUND_SPECS: Mapping[str, RoundSpec] = {
     "p0-smoke": RoundSpec(
         "p0-smoke",
@@ -44,13 +40,13 @@ ROUND_SPECS: Mapping[str, RoundSpec] = {
         "p0-core", ("P0-02",), 54, "p0-core-v2", "npu", prerequisites=("p0-smoke",)
     ),
     "p0-wjb": RoundSpec(
-        "p0-wjb", ("P0-06",), 90, "p0-wjb", "npu", prerequisites=("p0-core",)
+        "p0-wjb", ("P0-06",), 6, "p0-wjb-full-v1", "npu", prerequisites=("p0-core",)
     ),
     "p0-fairness": RoundSpec(
         "p0-fairness",
         ("P0-07",),
-        24,
-        "p0-fairness",
+        12,
+        "p0-fairness-full-v1",
         "npu",
         prerequisites=("p0-wjb",),
     ),
@@ -80,17 +76,28 @@ ROUND_SPECS: Mapping[str, RoundSpec] = {
     ),
     "p1-mechanism": RoundSpec(
         "p1-mechanism",
-        _ids("P1", 1, 15),
-        99,
-        "p1-mechanism",
+        (
+            "P1-01",
+            "P1-02",
+            "P1-03",
+            "P1-04",
+            "P1-05",
+            "P1-07",
+            "P1-08",
+            "P1-09",
+            "P1-11",
+            "P1-13",
+        ),
+        52,
+        "p1-mechanism-full-v1",
         "npu",
         prerequisites=("p0-manual",),
     ),
     "p1-data": RoundSpec(
         "p1-data",
-        ("P1-16", "P1-17"),
-        16,
-        "p1-data",
+        ("P1-16",),
+        10,
+        "p1-data-full-v1",
         "npu",
         prerequisites=("p1-mechanism",),
     ),
@@ -148,7 +155,7 @@ class CampaignWave:
 
 # Six user-visible submissions replace the former fourteen hand-created jobs.
 # The internal round boundaries remain explicit so prerequisite checks, ledgers,
-# failure isolation, and the final 509-cell audit retain their original meaning.
+# failure isolation, and the final 360-cell Full-tier audit retain their meaning.
 CAMPAIGN_WAVES: Mapping[str, CampaignWave] = {
     "canary": CampaignWave("canary", ("p0-smoke",)),
     "p0": CampaignWave(

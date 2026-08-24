@@ -2,7 +2,7 @@
 
 ## 1. 固定执行语义
 
-正式调度使用 8 张 910B 作为 8 个并发槽位。509 个正式实验单元按 6 个用户可见波次提交；每个内部轮次最多拆为 16 个逻辑切片，每个实验 cell 始终只占用 1 张 NPU。
+正式调度使用 8 张 910B 作为 8 个并发槽位。Full 档 360 个正式实验单元（恰好 140 个训练 cell）按 6 个用户可见波次提交；每个内部轮次最多拆为 16 个逻辑切片，每个实验 cell 始终只占用 1 张 NPU。
 
 不要把单 cell 的 `--num-devices` 改成 8。这里的 8 卡用于并行运行 8 个独立实验，不是把同一个实验错误地复制到 8 卡。
 
@@ -14,7 +14,7 @@
 - 每个下游正式内部轮次必须看到上一轮真实 `READY`；
 - `--dry-run` 和 `--preflight-only` 不能满足正式依赖；
 - NPU 轮次启动前逐卡执行真实 forward/backward 探针；
-- 最终门禁逐个核对 509 个正式 cell 均为 `COMPLETED`。
+- 最终门禁逐个核对 360 个 Full 正式 cell 均为 `COMPLETED`，并核对训练预算恰好为 140。
 
 P0-02 另外启用 Phase1 基础产物缓存。同一模型对、数据集和 Phase1 配置只计算一次；`ours/random/sft1` 和不同种子的 PhaseF 训练、评测、ledger 仍逐 cell 独立。缓存减少重复计算，不改变论文实验数与正式训练预算。
 
@@ -66,11 +66,15 @@ boot_safety_8card.sh
 | 顺序 | 运行参数 | 内部内容 | 正式 cell |
 |---:|---|---|---:|
 | 1 | `--wave canary` | 8 卡 PAN 短预算连通性测试 | 0 |
-| 2 | `--wave p0` | core、WJB、fairness、evaluate、analyze | 324 |
+| 2 | `--wave p0` | core、WJB、fairness、evaluate、analyze | 228 |
 | 3 | `--wave p0-manual` | 盲化人工 judge agreement | 3 |
-| 4 | `--wave p1` | mechanism、data、evaluate、analyze | 125 |
+| 4 | `--wave p1` | mechanism、data、evaluate、analyze | 72 |
 | 5 | `--wave p2` | generalization、evaluate、analyze | 57 |
-| 6 | `--wave final` | 509 cell 最终门禁 | 0 |
+| 6 | `--wave final` | 360 cell / 140 train 最终门禁 | 0 |
+
+140 个训练 cell 的构成为：P0 72（P0-02=54、P0-06=6、P0-07=12），P1 62
+（机制=52、数据曲线=10），P2 6。其余 220 个 cell 是 186 个分析、31 个评测和 3 个人工审计，
+不应再被误报为训练次数。Extended 的 149 个额外训练不会被这六个波次隐式启动。
 
 `canary` 与正式 ledger 隔离，只使用 PAN 和 Qwen3.5 9B→0.8B。8 张卡各运行一个短序列、每标签 8 样本、1 epoch 的端到端检查。它不是所有模型或数据集的 Phase1，也不能作为论文结果。
 
@@ -137,8 +141,9 @@ $SAFETY_OUTPUT_ROOT/jobs/<internal-round>/shards/shard-*/worker.log
 
 ```text
 "status": "READY"
-"expected_cells": 509
-"covered_cells": 509
+"expected_cells": 360
+"training_cells": 140
+"covered_cells": 360
 ```
 
 审计文件：

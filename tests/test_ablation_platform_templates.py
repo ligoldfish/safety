@@ -54,6 +54,8 @@ class AblationPlatformTemplateTests(unittest.TestCase):
             "search_ledger",
             "509",
             "289",
+            "360",
+            "140",
             "31",
             "186",
             "3",
@@ -75,7 +77,7 @@ class AblationPlatformTemplateTests(unittest.TestCase):
         for experiment_id in CATALOG.experiments:
             self.assertIn(experiment_id, coverage)
         for token in (
-            "509", "289", "150", "35/35", "plan", "preflight", "run", "status", "summarize"
+            "509", "289", "360", "140", "150", "35/35", "plan", "preflight", "run", "status", "summarize"
         ):
             self.assertIn(token, coverage + runbook)
 

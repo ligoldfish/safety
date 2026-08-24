@@ -190,6 +190,7 @@ experiments:
     metrics: [trainable_parameters, wildguard_asr, over_refusal]
     completion_artifacts: [layer_selection.json, eval_predictions.jsonl]
   - id: P1-06
+    campaign_tier: extended
     priority: P1
     family: layer_selection
     question: Are both effect size and probe accuracy needed for layer scoring?
@@ -238,6 +239,7 @@ experiments:
     metrics: [retained_coefficient_energy, wildguard_asr, over_refusal]
     completion_artifacts: [semantic_manifest.json, eval_predictions.jsonl]
   - id: P1-10
+    campaign_tier: extended
     priority: P1
     family: semantic_bridge
     question: Do coefficient sign and token filtering affect transfer?
@@ -263,6 +265,7 @@ experiments:
     metrics: [validation_safety_f1, wildguard_asr, over_refusal]
     completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
   - id: P1-12
+    campaign_tier: extended
     priority: P1
     family: supervision
     question: Which harmful and harmless supervision policy gives the best trade-off?
@@ -287,6 +290,7 @@ experiments:
     metrics: [layer_loss, wildguard_asr, over_refusal]
     completion_artifacts: [training_manifest.json, eval_predictions.jsonl]
   - id: P1-14
+    campaign_tier: extended
     priority: P1
     family: capacity
     question: Is the gain explained by LoRA capacity or placement?
@@ -300,6 +304,7 @@ experiments:
     metrics: [trainable_parameters, wildguard_asr, over_refusal]
     completion_artifacts: [parameter_budget.json, eval_predictions.jsonl]
   - id: P1-15
+    campaign_tier: extended
     priority: P1
     family: subspace
     question: Are energy threshold and rank cap fragile engineering choices?
@@ -326,6 +331,7 @@ experiments:
     metrics: [sample_count, wildguard_asr, over_refusal]
     completion_artifacts: [sampling_manifest.json, eval_predictions.jsonl]
   - id: P1-17
+    campaign_tier: extended
     priority: P1
     family: curation
     question: Do class balance and curation determine the result?
