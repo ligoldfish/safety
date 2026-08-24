@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -83,7 +84,43 @@ def _absolutize_paths(value, anchor: Path) -> None:
             _absolutize_paths(child, anchor)
 
 
-def _stage_configs(args, phase1_updates: dict, phasef_updates: dict) -> tuple[Path, Path]:
+def _foundation_cache_key(args, phase1: dict, stage_extras: dict) -> str:
+    normalized = json.loads(json.dumps(phase1))
+    normalized.get("extraction", {}).pop("output_root", None)
+    payload = {
+        "schema_version": 1,
+        "pair": args.pair,
+        "dataset": args.dataset,
+        "teacher_variant": getattr(args, "teacher_variant", ""),
+        "disable_dataset_overrides": bool(
+            getattr(args, "disable_dataset_overrides", False)
+        ),
+        "phase1": normalized,
+        "stage_extras": stage_extras,
+        "implementation_sha256": {
+            str(path.relative_to(PROJECT_ROOT)).replace("\\", "/"): hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            for path in (
+                PROJECT_ROOT / "scripts" / "15_run_oneclick.py",
+                PROJECT_ROOT / "scripts" / "30_run_ablation_cell.py",
+                PROJECT_ROOT / "src" / "data" / "safety_datasets.py",
+                PROJECT_ROOT / "src" / "training" / "trainer_phase1.py",
+            )
+        },
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _stage_configs(
+    args,
+    phase1_updates: dict,
+    phasef_updates: dict,
+    stage_extras: dict | None = None,
+) -> tuple[Path, Path]:
     config_dir = Path(args.output_dir) / "configs"
     config_dir.mkdir(parents=True, exist_ok=True)
     phase1_source = PROJECT_ROOT / "configs" / f"{args.pair}_phase1_{args.device}.yaml"
@@ -103,10 +140,6 @@ def _stage_configs(args, phase1_updates: dict, phasef_updates: dict) -> tuple[Pa
                 )
     _absolutize_paths(phase1, phase1_source.parent)
     _absolutize_paths(phasef, phasef_source.parent)
-    phase1_root = (Path(args.output_dir) / "pipeline" / "phase1").resolve()
-    phasef_root = phase1_root / "training"
-    phase1["extraction"]["output_root"] = str(phase1_root)
-    phasef["output"]["output_root"] = str(phasef_root)
     if args.teacher_variant:
         registry_path = PROJECT_ROOT / "configs" / "ablations" / "teacher_registry.yaml"
         if not registry_path.is_file():
@@ -122,16 +155,46 @@ def _stage_configs(args, phase1_updates: dict, phasef_updates: dict) -> tuple[Pa
             registry_path.parent,
             category="model",
         )
+    for key, value in phase1_updates.items():
+        _set_dotted(phase1, key, value)
+    for key, value in phasef_updates.items():
+        _set_dotted(phasef, key, value)
+    execution_profile = getattr(args, "execution_profile", "formal")
+    if execution_profile not in {"formal", "canary"}:
+        raise ValueError(f"unsupported execution profile: {execution_profile}")
+    if execution_profile == "canary":
+        phase1["extraction"]["max_length"] = min(
+            int(phase1["extraction"]["max_length"]), 512
+        )
+        phasef["optim"]["epochs"] = 1
+        phasef["optim"]["max_length"] = min(
+            int(phasef["optim"]["max_length"]), 512
+        )
+        phasef["optim"]["max_new_tokens"] = min(
+            int(phasef["optim"]["max_new_tokens"]), 32
+        )
+    phase1_root = (Path(args.output_dir) / "pipeline" / "phase1").resolve()
+    cache_root = str(getattr(args, "foundation_cache_root", "") or "").strip()
+    if (
+        execution_profile == "formal"
+        and getattr(args, "experiment_id", "") == "P0-02"
+        and cache_root
+    ):
+        cache_key = _foundation_cache_key(args, phase1, dict(stage_extras or {}))
+        phase1_root = (
+            Path(cache_root).expanduser().resolve() / "p0-02" / cache_key / "phase1"
+        )
+        phasef_root = phase1_root / "training_cells" / str(args.cell_id)
+    else:
+        phasef_root = phase1_root / "training"
+    phase1["extraction"]["output_root"] = str(phase1_root)
+    phasef["output"]["output_root"] = str(phasef_root)
     inputs = phasef["inputs"]
     inputs["train_targets_dir"] = str(phase1_root / "student_targets" / "student_safe_targets_alignment")
     inputs["val_targets_dir"] = str(phase1_root / "student_targets" / "student_safe_targets_val")
     inputs["pairing_path"] = str(phase1_root / "layer_pairing" / "teacher_student_layer_pairs.json")
     inputs["train_anchor_dir"] = str(phase1_root / "hidden_states" / "student_alignment")
     inputs["val_anchor_dir"] = str(phase1_root / "hidden_states" / "student_analysis_val")
-    for key, value in phase1_updates.items():
-        _set_dotted(phase1, key, value)
-    for key, value in phasef_updates.items():
-        _set_dotted(phasef, key, value)
     phase1_path = config_dir / "phase1.yaml"
     phasef_path = config_dir / "phaseF.yaml"
     phase1_path.write_text(yaml.safe_dump(phase1, sort_keys=False, allow_unicode=True), encoding="utf-8")
@@ -159,6 +222,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-dataset-overrides", action="store_true")
     parser.add_argument("--skip-test-eval", action="store_true")
     parser.add_argument("--teacher-variant", default="")
+    parser.add_argument(
+        "--execution-profile", choices=["formal", "canary"], default="formal"
+    )
+    parser.add_argument("--canary", action="store_true")
+    parser.add_argument("--foundation-cache-root", default="")
     return parser.parse_args()
 
 
@@ -210,7 +278,23 @@ def main() -> int:
     raw_spec, phase1_updates, phasef_updates, stage_extras = (
         _prepare_training_configuration(args)
     )
-    phase1_path, phasef_path = _stage_configs(args, phase1_updates, phasef_updates)
+    if bool(args.canary) != (args.execution_profile == "canary"):
+        raise ValueError("--canary and --execution-profile canary must be used together")
+    if args.execution_profile == "canary":
+        stage_extras = _merge_stage_extras(
+            stage_extras,
+            {
+                "extract": ["--max-samples-per-label", "8"],
+                "extract_alignment": ["--max-samples-per-label", "8"],
+            },
+        )
+    phase1_path, phasef_path = _stage_configs(
+        args, phase1_updates, phasef_updates, stage_extras
+    )
+    staged_phase1 = yaml.safe_load(phase1_path.read_text(encoding="utf-8")) or {}
+    staged_phasef = yaml.safe_load(phasef_path.read_text(encoding="utf-8")) or {}
+    phase1_root = Path(staged_phase1["extraction"]["output_root"]).resolve()
+    training_root = Path(staged_phasef["output"]["output_root"]).resolve()
     command = [
         sys.executable,
         str(PROJECT_ROOT / "scripts" / "15_run_oneclick.py"),
@@ -235,6 +319,11 @@ def main() -> int:
         command.append("--disable-dataset-overrides")
     if args.skip_test_eval:
         command.append("--skip-test-eval")
+    if args.execution_profile == "canary":
+        command.extend(["--smoke", "--skip-test-eval"])
+    cache_root = str(args.foundation_cache_root or "").strip()
+    if args.execution_profile == "formal" and args.experiment_id == "P0-02" and cache_root:
+        command.extend(["--foundation-cache-key", phase1_root.parent.name])
     result = subprocess.run(
         command,
         cwd=str(PROJECT_ROOT),
@@ -246,7 +335,6 @@ def main() -> int:
     if args.experiment_id == "P0-06":
         from src.ablations.wjb_failure import prepare_failure_evaluations
 
-        phase1_root = (Path(args.output_dir) / "pipeline" / "phase1").resolve()
         processed = (phase1_root.parent / "processed").resolve()
         target_config = PROJECT_ROOT / "configs" / apply_tokens(
             f"baseline_eval_qwen35_08b_wildjailbreak_{args.device}.yaml",
@@ -285,12 +373,36 @@ def main() -> int:
             if completed.returncode:
                 return int(completed.returncode)
 
+    if args.execution_profile == "canary":
+        canary_payload = {
+            "schema_version": 1,
+            "status": "PASS",
+            "execution_profile": "canary",
+            "cell_id": args.cell_id,
+            "experiment_id": args.experiment_id,
+            "dataset": args.dataset,
+            "pair": args.pair,
+            "device": args.device,
+            "device_id": args.device_id,
+            "phase1_root": str(phase1_root),
+            "training_root": str(training_root),
+        }
+        destination = Path(args.output_dir) / "canary_manifest.json"
+        temporary = destination.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(canary_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, destination)
+        return 0
+
     from src.ablations.completion import collect_training_contract
 
     collect_training_contract(
         Path(args.output_dir),
         required,
-        Path(args.output_dir) / "pipeline" / "phase1",
+        phase1_root,
+        training_root=training_root,
         cell_spec=raw_spec,
     )
     return 0

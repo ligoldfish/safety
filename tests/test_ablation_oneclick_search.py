@@ -18,6 +18,38 @@ SPEC.loader.exec_module(MODULE)
 
 
 class OneClickFairnessSearchTests(unittest.TestCase):
+    def test_formal_safety_full_runs_sanity_tables_and_adapter_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            phase1 = root / "phase1"
+            phasef = phase1 / "training"
+            scripts: list[str] = []
+            with (
+                patch.object(MODULE, "_validate_device_request"),
+                patch.object(MODULE, "_make_runtime_override_config", side_effect=lambda path, **_: path),
+                patch.object(MODULE, "_resolve", side_effect=lambda path: Path(path)),
+                patch.object(MODULE, "_safety_eval_config", return_value="eval.yaml"),
+                patch.object(MODULE, "load_sft_config", return_value=SimpleNamespace(data=SimpleNamespace(train_split=str(root / "train.jsonl")))),
+                patch.object(MODULE, "load_phasef_config", return_value=SimpleNamespace(optim=SimpleNamespace(epochs=3))),
+                patch.object(MODULE, "_build_env_overrides", return_value={}),
+                patch.object(MODULE, "_resolve_safety_full_roots", return_value=(root / "processed", root / "pan", phase1, phasef)),
+                patch.object(MODULE, "_make_safety_full_overrides", return_value=(root / "phase1.yaml", root / "phasef.yaml")),
+                patch.object(MODULE, "_invoke_phase1_curation"),
+                patch.object(MODULE, "_run_phase1_precompute"),
+                patch.object(MODULE, "_run_script", side_effect=lambda name, args, **kwargs: scripts.append(name)),
+                patch.object(MODULE, "_run_adapter_eval") as adapter,
+            ):
+                MODULE._run_safety_full(
+                    "npu", baseline_name="coconot", device_id=0,
+                    num_devices=1, dry_run=True, force_rebuild=False, smoke=False,
+                    opencompass_dir="", opencompass_datasets=(), skip_opencompass=True,
+                    enable_opencompass=False, skip_test_eval=False,
+                )
+
+        self.assertIn("10_sanity_eval.py", scripts)
+        self.assertIn("11_make_tables.py", scripts)
+        adapter.assert_called_once()
+
     def test_skip_test_eval_runs_training_but_no_sanity_tables_or_test_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

@@ -43,6 +43,114 @@ def _cell(experiment_id: str, **axes):
 
 
 class AblationCompileTests(unittest.TestCase):
+    def test_p002_cells_share_phase1_but_keep_cell_owned_phasef_outputs(self) -> None:
+        path = ROOT / "scripts" / "30_run_ablation_cell.py"
+        spec = importlib.util.spec_from_file_location("ablation_cache_staging_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            def stage(cell_id: str, method: str):
+                args = SimpleNamespace(
+                    output_dir=str(root / "cells" / cell_id),
+                    pair="qwen35_9b_to_08b",
+                    dataset="pan",
+                    device="npu",
+                    teacher_variant="",
+                    execution_profile="formal",
+                    foundation_cache_root=str(root / "foundation"),
+                    experiment_id="P0-02",
+                    cell_id=cell_id,
+                    disable_dataset_overrides=False,
+                )
+                return module._stage_configs(
+                    args,
+                    {},
+                    {
+                        "seed": 42 if method == "ours" else 44,
+                        "target.mode": "semantic" if method == "ours" else "random_same_norm",
+                    },
+                    {},
+                )
+
+            phase1_a, phasef_a = stage("cell-a", "ours")
+            phase1_b, phasef_b = stage("cell-b", "random")
+            p1_a = yaml.safe_load(phase1_a.read_text(encoding="utf-8"))
+            p1_b = yaml.safe_load(phase1_b.read_text(encoding="utf-8"))
+            pf_a = yaml.safe_load(phasef_a.read_text(encoding="utf-8"))
+            pf_b = yaml.safe_load(phasef_b.read_text(encoding="utf-8"))
+
+        self.assertEqual(p1_a["extraction"]["output_root"], p1_b["extraction"]["output_root"])
+        self.assertNotEqual(pf_a["output"]["output_root"], pf_b["output"]["output_root"])
+        self.assertTrue(pf_a["output"]["output_root"].endswith("training_cells\\cell-a") or pf_a["output"]["output_root"].endswith("training_cells/cell-a"))
+
+    def test_canary_staging_uses_one_epoch_and_short_sequences(self) -> None:
+        path = ROOT / "scripts" / "30_run_ablation_cell.py"
+        spec = importlib.util.spec_from_file_location("ablation_canary_staging_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as td:
+            args = SimpleNamespace(
+                output_dir=str(Path(td) / "cell"),
+                pair="qwen35_9b_to_08b",
+                dataset="pan",
+                device="npu",
+                teacher_variant="",
+                execution_profile="canary",
+                foundation_cache_root="",
+                experiment_id="P0-02",
+                cell_id="canary-0",
+                disable_dataset_overrides=False,
+            )
+            phase1_path, phasef_path = module._stage_configs(args, {}, {}, {})
+            phase1 = yaml.safe_load(phase1_path.read_text(encoding="utf-8"))
+            phasef = yaml.safe_load(phasef_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(phase1["extraction"]["max_length"], 512)
+        self.assertEqual(phasef["optim"]["epochs"], 1)
+        self.assertEqual(phasef["optim"]["max_length"], 512)
+        self.assertEqual(phasef["optim"]["max_new_tokens"], 32)
+
+    def test_canary_profile_isolated_from_formal_completion_contract(self) -> None:
+        command = compile_cell_commands(
+            CATALOG,
+            _cell("P0-02", dataset="pan", method="ours", seed=42),
+            RunnerContext(
+                ROOT,
+                Path("/state"),
+                "python",
+                "npu",
+                0,
+                execution_profile="canary",
+            ),
+        )[0]
+        self.assertEqual(command.completion_artifacts, ("canary_manifest.json",))
+        self.assertIn("--canary", command.argv)
+        self.assertEqual(
+            command.argv[command.argv.index("--execution-profile") + 1], "canary"
+        )
+
+    def test_formal_training_command_receives_foundation_cache_root(self) -> None:
+        command = compile_cell_commands(
+            CATALOG,
+            _cell("P0-02", dataset="pan", method="ours", seed=42),
+            RunnerContext(
+                ROOT,
+                Path("/state"),
+                "python",
+                "npu",
+                0,
+                foundation_cache_root=Path("/persistent/foundation-cache"),
+            ),
+        )[0]
+        self.assertEqual(
+            command.argv[command.argv.index("--foundation-cache-root") + 1],
+            str(Path("/persistent/foundation-cache").resolve()),
+        )
+
     def test_analysis_command_receives_declared_paths_from_asset_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             manifest = Path(td) / "assets.json"

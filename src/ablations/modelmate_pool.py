@@ -21,6 +21,8 @@ class RoundSpec:
     default_device: str
     cell_limit: int | None = None
     prerequisites: tuple[str, ...] = ()
+    execution_profile: str = "formal"
+    axis_filters: tuple[tuple[str, object], ...] = ()
 
 
 def _ids(prefix: str, start: int, stop: int) -> tuple[str, ...]:
@@ -29,10 +31,17 @@ def _ids(prefix: str, start: int, stop: int) -> tuple[str, ...]:
 
 ROUND_SPECS: Mapping[str, RoundSpec] = {
     "p0-smoke": RoundSpec(
-        "p0-smoke", ("P0-02",), 8, "p0-core", "npu", cell_limit=8
+        "p0-smoke",
+        ("P0-02",),
+        8,
+        "p0-smoke",
+        "npu",
+        cell_limit=8,
+        execution_profile="canary",
+        axis_filters=(("dataset", "pan"),),
     ),
     "p0-core": RoundSpec(
-        "p0-core", ("P0-02",), 54, "p0-core", "npu", prerequisites=("p0-smoke",)
+        "p0-core", ("P0-02",), 54, "p0-core-v2", "npu", prerequisites=("p0-smoke",)
     ),
     "p0-wjb": RoundSpec(
         "p0-wjb", ("P0-06",), 90, "p0-wjb", "npu", prerequisites=("p0-core",)
@@ -128,8 +137,39 @@ ROUND_SPECS: Mapping[str, RoundSpec] = {
 }
 
 
-# Smoke is intentionally excluded because it is a reusable subset of p0-core.
-# These rounds must cover the complete catalog exactly once.
+@dataclass(frozen=True)
+class CampaignWave:
+    """One user-visible ModelMate submission containing ordered internal rounds."""
+
+    name: str
+    rounds: tuple[str, ...]
+    final_gate: bool = False
+
+
+# Six user-visible submissions replace the former fourteen hand-created jobs.
+# The internal round boundaries remain explicit so prerequisite checks, ledgers,
+# failure isolation, and the final 509-cell audit retain their original meaning.
+CAMPAIGN_WAVES: Mapping[str, CampaignWave] = {
+    "canary": CampaignWave("canary", ("p0-smoke",)),
+    "p0": CampaignWave(
+        "p0",
+        ("p0-core", "p0-wjb", "p0-fairness", "p0-evaluate", "p0-analyze"),
+    ),
+    "p0-manual": CampaignWave("p0-manual", ("p0-manual",)),
+    "p1": CampaignWave(
+        "p1",
+        ("p1-mechanism", "p1-data", "p1-evaluate", "p1-analyze"),
+    ),
+    "p2": CampaignWave(
+        "p2",
+        ("p2-generalization", "p2-evaluate", "p2-analyze"),
+    ),
+    "final": CampaignWave("final", (), final_gate=True),
+}
+
+
+# The canary is intentionally excluded because it has an isolated, reduced
+# execution profile. These formal rounds cover the complete catalog exactly once.
 FINAL_ROUND_ORDER: tuple[str, ...] = (
     "p0-core",
     "p0-wjb",
@@ -175,12 +215,14 @@ def select_round_cells(
     unknown = sorted(set(spec.experiment_ids).difference(catalog.experiments))
     if unknown:
         raise ValueError(f"round {spec.name} references unknown experiments: {unknown}")
+    filters = dict(spec.axis_filters)
     selected = tuple(
         sorted(
             (
                 cell
                 for cell in complete_plan.cells
                 if cell.experiment_id in set(spec.experiment_ids)
+                and all(cell.axes.get(key) == value for key, value in filters.items())
             ),
             key=lambda cell: cell.cell_id,
         )
@@ -242,11 +284,15 @@ def build_shard_command(
     device: str,
     device_id: int,
     dry_run: bool,
+    execution_profile: str = "formal",
+    foundation_cache_root: Path | None = None,
 ) -> tuple[str, ...]:
     if not 0 <= shard_index < layout.shard_count:
         raise ValueError("shard_index must be in [0, shard_count)")
     if device not in {"npu", "ppu", "cuda", "cpu"}:
         raise ValueError(f"unsupported device: {device}")
+    if execution_profile not in {"formal", "canary"}:
+        raise ValueError(f"unsupported execution profile: {execution_profile}")
     command = [
         str(python_executable),
         str(Path(project_root) / "scripts" / "30_ablation.py"),
@@ -270,7 +316,11 @@ def build_shard_command(
         # Each cell deliberately retains the validated single-device recipe.
         "--num-devices",
         "1",
+        "--execution-profile",
+        execution_profile,
     ]
+    if foundation_cache_root is not None:
+        command.extend(["--foundation-cache-root", str(foundation_cache_root)])
     if dry_run:
         command.append("--dry-run")
     return tuple(command)
@@ -283,6 +333,7 @@ def run_shard_pool(
     worker: ShardWorker,
     stagger_seconds: float = 0.0,
     sleep: Callable[[float], None] = time.sleep,
+    on_failure: Callable[[], None] | None = None,
 ) -> tuple[ShardResult, ...]:
     if shard_count <= 0:
         raise ValueError("shard_count must be positive")
@@ -303,8 +354,10 @@ def run_shard_pool(
     stop = threading.Event()
     result_lock = threading.Lock()
     results: list[ShardResult] = []
+    failure_notified = False
 
     def device_loop(device_id: int) -> None:
+        nonlocal failure_notified
         while not stop.is_set():
             try:
                 shard_index = pending.get_nowait()
@@ -332,6 +385,13 @@ def run_shard_pool(
                 )
             if returncode != 0 or error:
                 stop.set()
+                notify = False
+                with result_lock:
+                    if not failure_notified:
+                        failure_notified = True
+                        notify = True
+                if notify and on_failure is not None:
+                    on_failure()
                 return
 
     threads: list[threading.Thread] = []

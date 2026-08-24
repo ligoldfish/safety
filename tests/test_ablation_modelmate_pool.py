@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from src.ablations.catalog import load_catalog
 from src.ablations.modelmate_pool import (
+    CAMPAIGN_WAVES,
     FINAL_ROUND_ORDER,
     ROUND_SPECS,
     PoolLayout,
@@ -41,6 +42,16 @@ def _load_pool_script():
 def _load_final_gate_script():
     path = ROOT / "scripts" / "36_modelmate_ablation_final_gate.py"
     spec = importlib.util.spec_from_file_location("modelmate_final_gate_test", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_campaign_script():
+    path = ROOT / "scripts" / "37_modelmate_ablation_campaign.py"
+    spec = importlib.util.spec_from_file_location("modelmate_campaign_test", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -86,15 +97,27 @@ class ModelMateRoundSelectionTests(unittest.TestCase):
                 self.assertEqual(ROUND_SPECS[name].prerequisites, (previous,))
             previous = name
 
-    def test_smoke_is_a_reusable_subset_of_p0_core(self) -> None:
+    def test_smoke_is_an_isolated_eight_card_pan_canary(self) -> None:
         smoke = select_round_cells(CATALOG, COMPLETE_PLAN, ROUND_SPECS["p0-smoke"])
         core = select_round_cells(CATALOG, COMPLETE_PLAN, ROUND_SPECS["p0-core"])
         self.assertEqual(len(smoke), 8)
-        self.assertEqual(ROUND_SPECS["p0-smoke"].state_group, "p0-core")
+        self.assertEqual(ROUND_SPECS["p0-smoke"].state_group, "p0-smoke")
+        self.assertEqual(ROUND_SPECS["p0-smoke"].execution_profile, "canary")
+        self.assertEqual({cell.axes["dataset"] for cell in smoke}, {"pan"})
         self.assertLessEqual(
             {cell.cell_id for cell in smoke},
             {cell.cell_id for cell in core},
         )
+
+    def test_six_campaign_waves_preserve_every_internal_round(self) -> None:
+        self.assertEqual(tuple(CAMPAIGN_WAVES), ("canary", "p0", "p0-manual", "p1", "p2", "final"))
+        internal = tuple(
+            round_name
+            for wave in CAMPAIGN_WAVES.values()
+            for round_name in wave.rounds
+        )
+        self.assertEqual(internal, ("p0-smoke", *FINAL_ROUND_ORDER))
+        self.assertTrue(CAMPAIGN_WAVES["final"].final_gate)
 
 
 class ModelMatePoolLayoutTests(unittest.TestCase):
@@ -122,12 +145,19 @@ class ModelMatePoolLayoutTests(unittest.TestCase):
             device="npu",
             device_id=3,
             dry_run=False,
+            execution_profile="formal",
+            foundation_cache_root=Path("/persistent/foundation-cache"),
         )
         self.assertEqual(command[command.index("--shard-index") + 1], "9")
         self.assertEqual(command[command.index("--shard-count") + 1], "16")
         self.assertEqual(command[command.index("--max-cells") + 1], "4")
         self.assertEqual(command[command.index("--device-id") + 1], "3")
         self.assertEqual(command[command.index("--num-devices") + 1], "1")
+        self.assertEqual(command[command.index("--execution-profile") + 1], "formal")
+        self.assertEqual(
+            command[command.index("--foundation-cache-root") + 1],
+            str(Path("/persistent/foundation-cache")),
+        )
 
 
 class ModelMateDynamicPoolTests(unittest.TestCase):
@@ -186,6 +216,24 @@ class ModelMateDynamicPoolTests(unittest.TestCase):
 
         self.assertTrue(any(result.returncode == 7 for result in results))
         self.assertLess(len(calls), 12)
+
+    def test_first_failure_requests_running_sibling_termination_once(self) -> None:
+        notifications: list[str] = []
+
+        def worker(shard_index: int, device_id: int) -> int:
+            del device_id
+            return 9 if shard_index == 0 else 0
+
+        results = run_shard_pool(
+            shard_count=8,
+            device_ids=(0, 1),
+            worker=worker,
+            stagger_seconds=0,
+            on_failure=lambda: notifications.append("terminate"),
+        )
+
+        self.assertTrue(any(result.returncode == 9 for result in results))
+        self.assertEqual(notifications, ["terminate"])
 
 
 class ModelMatePoolEntrypointTests(unittest.TestCase):
@@ -459,6 +507,47 @@ class ModelMatePoolEntrypointTests(unittest.TestCase):
         self.assertNotIn("export ASCEND_RT_VISIBLE_DEVICES", content)
         self.assertIn('SAFETY_LOGICAL_SHARDS:-16', content)
         self.assertIn('SAFETY_POOL_DEVICES:-8', content)
+
+
+class ModelMateCampaignTests(unittest.TestCase):
+    def test_wave_builds_ordered_internal_round_commands(self) -> None:
+        module = _load_campaign_script()
+        args = module.build_parser().parse_args(["--wave", "p1"])
+        commands = module.build_campaign_commands(args)
+        self.assertEqual(
+            [command[command.index("--round") + 1] for command in commands],
+            ["p1-mechanism", "p1-data", "p1-evaluate", "p1-analyze"],
+        )
+        self.assertTrue(all("--logical-shards" in command for command in commands))
+
+    def test_wave_stops_after_first_failed_internal_round(self) -> None:
+        module = _load_campaign_script()
+        args = module.build_parser().parse_args(["--wave", "p0"])
+        calls: list[list[str]] = []
+
+        class Result:
+            def __init__(self, returncode: int) -> None:
+                self.returncode = returncode
+
+        def runner(command, **kwargs):
+            del kwargs
+            calls.append(command)
+            return Result(7 if len(calls) == 2 else 0)
+
+        exit_code, payload = module.run_campaign(args, runner=runner)
+        self.assertEqual(exit_code, 7)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(payload["status"], "FAILED")
+        self.assertEqual(payload["executed_stage_count"], 2)
+        self.assertEqual(payload["planned_stage_count"], 5)
+
+    def test_final_wave_invokes_only_the_509_cell_gate(self) -> None:
+        module = _load_campaign_script()
+        args = module.build_parser().parse_args(["--wave", "final"])
+        commands = module.build_campaign_commands(args)
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(commands[0][1].endswith("36_modelmate_ablation_final_gate.py"))
+        self.assertIn("--output-root", commands[0])
 
 
 class ModelMateFinalGateTests(unittest.TestCase):

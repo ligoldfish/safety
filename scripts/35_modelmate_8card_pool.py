@@ -194,6 +194,8 @@ class SubprocessShardExecutor:
         python_executable: str,
         device: str,
         dry_run: bool,
+        execution_profile: str = "formal",
+        foundation_cache_root: Path | None = None,
     ) -> None:
         self.project_root = Path(project_root)
         self.round_root = Path(round_root)
@@ -205,6 +207,12 @@ class SubprocessShardExecutor:
         self.python_executable = str(python_executable)
         self.device = str(device)
         self.dry_run = bool(dry_run)
+        self.execution_profile = str(execution_profile)
+        self.foundation_cache_root = (
+            Path(foundation_cache_root)
+            if foundation_cache_root is not None
+            else self.round_root.parent.parent / "foundation-cache"
+        )
         self._lock = threading.Lock()
         self._processes: dict[int, subprocess.Popen] = {}
 
@@ -227,6 +235,8 @@ class SubprocessShardExecutor:
             device=self.device,
             device_id=device_id,
             dry_run=self.dry_run,
+            execution_profile=self.execution_profile,
+            foundation_cache_root=self.foundation_cache_root,
         )
         with log_path.open("a", encoding="utf-8", buffering=1) as log:
             log.write(
@@ -504,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
     state_root = output_root / "jobs" / spec.state_group / (
         "dry-run-state" if args.dry_run else "run-state"
     )
+    foundation_cache_root = output_root / "foundation-cache"
     plan_path = round_root / "plan.jsonl"
     plan_sha256 = _write_plan(plan_path, plan)
     environment = _runtime_environment(model_root, data_root, output_root)
@@ -523,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
         "plan": str(plan_path),
         "plan_sha256": plan_sha256,
         "dry_run": bool(args.dry_run),
+        "execution_profile": spec.execution_profile,
+        "foundation_cache_root": str(foundation_cache_root),
     }
     _atomic_json(round_root / "job-metadata.json", metadata)
     print(json.dumps(metadata, ensure_ascii=False, sort_keys=True), flush=True)
@@ -612,6 +625,8 @@ def main(argv: list[str] | None = None) -> int:
         python_executable=sys.executable,
         device=device,
         dry_run=args.dry_run,
+        execution_profile=spec.execution_profile,
+        foundation_cache_root=foundation_cache_root,
     )
     received_signal = 0
 
@@ -628,6 +643,7 @@ def main(argv: list[str] | None = None) -> int:
             device_ids=device_ids,
             worker=executor,
             stagger_seconds=args.launch_stagger_seconds,
+            on_failure=executor.terminate_all,
         )
     except KeyboardInterrupt:
         executor.terminate_all()

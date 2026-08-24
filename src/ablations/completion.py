@@ -195,9 +195,9 @@ def _validated_training_budget(training: Mapping) -> dict[str, int]:
     return budget
 
 
-def _latest_pan_results(phase1_root: Path) -> tuple[Path, dict]:
+def _latest_pan_results(training_root: Path) -> tuple[Path, dict]:
     candidates = sorted(
-        (phase1_root / "training" / "eval_suite").glob("epoch_*/pan_results.json")
+        (training_root / "eval_suite").glob("epoch_*/pan_results.json")
     )
     if not candidates:
         raise CompletionError("real backend did not produce per-sample evaluation predictions")
@@ -292,8 +292,10 @@ def _distribution(rows: Sequence[Mapping], key: str) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _failure_boundary_contract(phase1: Path, axes: Mapping) -> dict:
-    boundary = phase1 / "training" / "failure_boundary"
+def _failure_boundary_contract(
+    phase1: Path, axes: Mapping, training_root: Path
+) -> dict:
+    boundary = training_root / "failure_boundary"
     manifest_path = boundary / "evaluation_manifest.json"
     manifest = _read_object(manifest_path, "P0-06 evaluation manifest")
     if manifest.get("experiment_id") != "P0-06":
@@ -414,6 +416,7 @@ def collect_training_contract(
     phase1_root: str | Path,
     *,
     cell_spec: Mapping,
+    training_root: str | Path | None = None,
 ) -> None:
     """Derive completion artifacts exclusively from a successful real backend.
 
@@ -424,8 +427,9 @@ def collect_training_contract(
 
     target = Path(output_dir)
     phase1 = Path(phase1_root)
+    training_dir = Path(training_root) if training_root is not None else phase1 / "training"
     target.mkdir(parents=True, exist_ok=True)
-    training_path = phase1 / "training" / "manifest.json"
+    training_path = training_dir / "manifest.json"
     training = _read_object(training_path, "training manifest")
     axes = dict(cell_spec.get("axes") or {})
     experiment_id = str(cell_spec.get("experiment_id", ""))
@@ -450,7 +454,7 @@ def collect_training_contract(
     for name in required_artifacts:
         destination = target / name
         if name == "eval_predictions.jsonl":
-            predictions = predictions or _latest_pan_results(phase1)
+            predictions = predictions or _latest_pan_results(training_dir)
             source_path, result = predictions
             normalized = []
             for index, row in enumerate(result["generations"]):
@@ -521,9 +525,13 @@ def collect_training_contract(
             extraction_path = phase1 / "hidden_states" / "teacher_alignment" / "manifest.json"
             payload = {**common, **_source_record(extraction_path, _read_object(extraction_path, "curated extraction manifest"))}
         elif name == "failure_analysis.json":
-            payload = {**common, **_failure_boundary_contract(phase1, axes), "training": training}
+            payload = {
+                **common,
+                **_failure_boundary_contract(phase1, axes, training_dir),
+                "training": training,
+            }
         elif name == "teacher_quality.json":
-            predictions = predictions or _latest_pan_results(phase1)
+            predictions = predictions or _latest_pan_results(training_dir)
             payload = {**common, "teacher_variant": axes.get("teacher"), "student_evaluation": _source_record(predictions[0], predictions[1])}
         else:
             raise CompletionError(f"no real completion collector is registered for {name}")

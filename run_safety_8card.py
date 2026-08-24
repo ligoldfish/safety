@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stable ModelMate startup shim for the allowlisted 8-card ablation pool."""
+"""Stable ModelMate startup shim for the six-wave 8-card ablation campaign."""
 
 import os
 import sys

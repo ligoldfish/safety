@@ -120,6 +120,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--num-devices", type=int, default=1)
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--asset-manifest", default="")
+    run.add_argument(
+        "--execution-profile", choices=["formal", "canary"], default="formal"
+    )
+    run.add_argument("--foundation-cache-root", default="")
     return parser
 
 
@@ -134,6 +138,12 @@ def _context(args) -> RunnerContext:
         asset_manifest=(
             Path(args.asset_manifest).expanduser().resolve()
             if getattr(args, "asset_manifest", "")
+            else None
+        ),
+        execution_profile=getattr(args, "execution_profile", "formal"),
+        foundation_cache_root=(
+            Path(args.foundation_cache_root).expanduser().resolve()
+            if getattr(args, "foundation_cache_root", "")
             else None
         ),
     )

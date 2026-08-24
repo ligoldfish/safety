@@ -35,6 +35,8 @@ class RunnerContext:
     device_id: int = 0
     num_devices: int = 1
     asset_manifest: Path | None = None
+    execution_profile: str = "formal"
+    foundation_cache_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +231,13 @@ def _train_command(
     method = str(axes.get("method", "ours"))
     if cell.experiment_id == "P0-02" and method not in {"ours", "random", "sft1"}:
         raise RunnerError(f"unsupported matched-control method: {method}")
+    if context.execution_profile not in {"formal", "canary"}:
+        raise RunnerError(f"unsupported execution profile: {context.execution_profile}")
+    completion_artifacts = (
+        ("canary_manifest.json",)
+        if context.execution_profile == "canary"
+        else tuple(definition.completion_artifacts)
+    )
     argv = [
         context.python_executable,
         str(context.project_root / "scripts" / "30_run_ablation_cell.py"),
@@ -257,7 +266,15 @@ def _train_command(
         "--phasef-updates=" + json.dumps(phasef_updates_for_cell(cell), ensure_ascii=False, sort_keys=True),
         "--phase1-stage-extras=" + json.dumps(_phase_extras(cell), ensure_ascii=False, sort_keys=True),
         "--required-artifacts=" + json.dumps(list(definition.completion_artifacts)),
+        "--execution-profile",
+        context.execution_profile,
     ]
+    if context.execution_profile == "canary":
+        argv.append("--canary")
+    if context.foundation_cache_root is not None:
+        argv.extend(
+            ["--foundation-cache-root", str(context.foundation_cache_root.resolve())]
+        )
     if teacher_variant:
         argv.extend(["--teacher-variant", teacher_variant])
     if (
@@ -265,7 +282,7 @@ def _train_command(
         or (cell.experiment_id == "P0-06" and axes.get("config") == "global")
     ):
         argv.append("--disable-dataset-overrides")
-    return CommandSpec("train", tuple(argv), tuple(definition.completion_artifacts))
+    return CommandSpec("train", tuple(argv), completion_artifacts)
 
 
 def _load_asset_manifest(path: Path | None) -> dict[str, object]:
@@ -433,6 +450,12 @@ class AblationRunner:
                     if self.context.asset_manifest is None
                     else canonical_hash(_load_asset_manifest(self.context.asset_manifest))
                 ),
+                "execution_profile": self.context.execution_profile,
+                "foundation_cache_root": (
+                    None
+                    if self.context.foundation_cache_root is None
+                    else str(self.context.foundation_cache_root.resolve())
+                ),
             }
         )
         ledger = ExperimentLedger(
@@ -531,10 +554,14 @@ class AblationRunner:
                         raise RunnerError(
                             f"cell {cell.cell_id} stage {command.stage} failed with exit code {result.returncode}"
                         )
-                artifact_hash = validate_completion(
-                    ledger.cell_dir,
-                    self.catalog.experiments[cell.experiment_id].completion_artifacts,
+                completion_artifacts = tuple(
+                    dict.fromkeys(
+                        artifact
+                        for command in commands
+                        for artifact in command.completion_artifacts
+                    )
                 )
+                artifact_hash = validate_completion(ledger.cell_dir, completion_artifacts)
                 _atomic_json(
                     ledger.cell_dir / "efficiency.json",
                     {"schema_version": 1, "stages": [record.to_dict() for record in efficiency]},

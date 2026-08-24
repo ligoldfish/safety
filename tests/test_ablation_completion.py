@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 import hashlib
+import shutil
 from pathlib import Path
 from tests.fairness_evidence import attach_validation_evidence
 
@@ -21,6 +22,30 @@ def _write_json(path: Path, value) -> None:
 
 
 class TrainingCompletionTests(unittest.TestCase):
+    def test_completion_accepts_shared_phase1_with_cell_owned_training_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            phase1 = self._pipeline(root)
+            training_root = root / "cell-training"
+            shutil.move(str(phase1 / "training"), training_root)
+            output = root / "contract"
+            definition = CATALOG.experiments["P0-02"]
+
+            collect_training_contract(
+                output,
+                definition.completion_artifacts,
+                phase1,
+                training_root=training_root,
+                cell_spec={
+                    "experiment_id": "P0-02",
+                    "axes": {"dataset": "pan", "method": "ours", "seed": 42},
+                },
+            )
+
+            self.assertTrue(
+                all((output / name).is_file() for name in definition.completion_artifacts)
+            )
+
     def _write_fairness_backend(
         self,
         phase1: Path,

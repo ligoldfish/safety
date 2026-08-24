@@ -9,13 +9,17 @@ DATA_ROOT="${SAFETY_DATA_ROOT:-/opt/dpcvol/datasets/safetytransfer}"
 OUTPUT_ROOT="${SAFETY_OUTPUT_ROOT:-$DATA_ROOT/ablation-outputs/iclr-886760f}"
 ACTIVATE="${SAFETY_ACTIVATE:-$MODEL_ROOT/_runtime_assets/activate-safety-ablation.sh}"
 ASSET_MANIFEST="${SAFETY_ASSET_MANIFEST:-$SRC_ROOT/configs/ablations/assets.modelmate.template.json}"
+CAMPAIGN_SCRIPT="$SRC_ROOT/scripts/37_modelmate_ablation_campaign.py"
 POOL_SCRIPT="$SRC_ROOT/scripts/35_modelmate_8card_pool.py"
+GATE_SCRIPT="$SRC_ROOT/scripts/36_modelmate_ablation_final_gate.py"
 
 for path in \
   "$SRC_ROOT" \
   "$ACTIVATE" \
   "$ASSET_MANIFEST" \
-  "$POOL_SCRIPT"
+  "$CAMPAIGN_SCRIPT" \
+  "$POOL_SCRIPT" \
+  "$GATE_SCRIPT"
 do
   if [ ! -e "$path" ]; then
     echo "[FAIL] missing required runtime path: $path" >&2
@@ -41,7 +45,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 
-exec "$JOB_PY" -u "$POOL_SCRIPT" \
+exec "$JOB_PY" -u "$CAMPAIGN_SCRIPT" \
   --model-root "$MODEL_ROOT" \
   --data-root "$DATA_ROOT" \
   --output-root "$OUTPUT_ROOT" \

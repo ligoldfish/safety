@@ -7,7 +7,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
@@ -23,6 +23,11 @@ from src.ablations.efficiency import (
     run_profiled_subprocess,
 )
 from src.ablations.platform import resolve_portable_path
+from src.ablations.foundation_cache import (
+    foundation_is_ready,
+    foundation_lock,
+    mark_foundation_ready,
+)
 from src.utils.config import load_phase1_config, load_phasef_config
 from src.pairs import DEFAULT_PAIR, PAIRS, apply_tokens
 
@@ -612,6 +617,16 @@ def parse_args() -> argparse.Namespace:
             "validation-only fairness-search candidates; their saved validation generations "
             "are judged separately and the formal winner is evaluated in P0-07."
         ),
+    )
+    full_parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run the bounded validation-only canary budget; never use for formal cells.",
+    )
+    full_parser.add_argument(
+        "--foundation-cache-key",
+        default="",
+        help="Validated Phase-1 cache identity supplied by the ablation backend.",
     )
     add_common_flags(full_parser)
     return parser.parse_args()
@@ -1498,6 +1513,7 @@ def _run_safety_full(
     cell_id: str = "",
     disable_dataset_overrides: bool = False,
     skip_test_eval: bool = False,
+    foundation_cache_key: str = "",
 ) -> None:
     _validate_device_request(num_devices)
     if smoke:
@@ -1521,18 +1537,8 @@ def _run_safety_full(
     safety_jsonl_path = Path(sft_cfg.data.train_split).resolve()
     env_overrides = _build_env_overrides(device, device_id)
 
-    # 1) Materialize the safety SFT JSONL via 19.
-    prep_args = ["--config", str(sft_safety_config)]
-    if force_rebuild:
-        prep_args.append("--force-rebuild")
-    _run_script(
-        "19_prepare_safety_data.py",
-        prep_args,
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-    )
-
-    # 2) Split into PAN-style 5 JSONLs under a per-baseline processed_dir.
+    # Resolve all roots before entering the cache lock. Dataset materialization,
+    # split generation, curation, and Phase-1 are one shared foundation unit.
     (
         safety_processed_dir,
         pan_processed_dir,
@@ -1545,26 +1551,7 @@ def _run_safety_full(
         phase1_config_path=phase1_config_path,
         phasef_config_path=phasef_config_path,
     )
-    if not dry_run:
-        safety_processed_dir.mkdir(parents=True, exist_ok=True)
-    _run_script(
-        "20_split_safety_for_semalign.py",
-        [
-            "--safety-jsonl",
-            str(safety_jsonl_path),
-            "--output-dir",
-            str(safety_processed_dir),
-            "--pan-processed-dir",
-            str(pan_processed_dir),
-            "--harmless-source",
-            "auto",
-            *(["--validation-only"] if skip_test_eval else []),
-        ],
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-    )
-
-    # 3) Generate Phase 1 + PhaseF override yamls pointing at the persistent
+    # Generate Phase 1 + PhaseF override yamls pointing at the persistent
     # safety split and the cell-owned output roots resolved above.
     phase1_override, phasef_override = _make_safety_full_overrides(
         device=device,
@@ -1578,19 +1565,6 @@ def _run_safety_full(
         apply_dataset_overrides=not disable_dataset_overrides,
     )
 
-    # 3b) Curate the Phase 1 contrast subset (alignment_set.jsonl) from
-    # train_set.jsonl. For clean baselines (PAN/STL/coconot/HH-RLHF) this is
-    # a byte-identical copy via mode=off. For WJB/WGM it applies a strict
-    # per-baseline pre-filter plus a universal teacher-confidence filter.
-    _invoke_phase1_curation(
-        baseline_name=baseline_name,
-        processed_dir=safety_processed_dir,
-        phase1_yaml=phase1_override,
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-    )
-
-    # 4) Run Phase 1-E (skip 00 — safety splits are already on disk).
     # Per-baseline cleaner-subspace knobs (e.g. WJB: --top-k 3 / --energy-threshold
     # 0.7 / --rank-cap 8) go first; caller-supplied extras append after so an
     # explicit CLI --phase1-analyze-extra / --phase1-subspace-extra still wins.
@@ -1605,16 +1579,59 @@ def _run_safety_full(
         *phase_overrides.get("subspace_extra", ()),
         *(subspace_extras or ()),
     ]
-    _run_phase1_precompute(
+    def build_foundation() -> None:
+        prep_args = ["--config", str(sft_safety_config)]
+        if force_rebuild:
+            prep_args.append("--force-rebuild")
+        _run_script(
+            "19_prepare_safety_data.py",
+            prep_args,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
+        if not dry_run:
+            safety_processed_dir.mkdir(parents=True, exist_ok=True)
+        _run_script(
+            "20_split_safety_for_semalign.py",
+            [
+                "--safety-jsonl",
+                str(safety_jsonl_path),
+                "--output-dir",
+                str(safety_processed_dir),
+                "--pan-processed-dir",
+                str(pan_processed_dir),
+                "--harmless-source",
+                "auto",
+                *(["--validation-only"] if skip_test_eval else []),
+            ],
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
+        _invoke_phase1_curation(
+            baseline_name=baseline_name,
+            processed_dir=safety_processed_dir,
+            phase1_yaml=phase1_override,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
+        _run_phase1_precompute(
+            phase1_override,
+            smoke=smoke,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+            skip_prepare=True,
+            analyze_extras=merged_analyze_extras,
+            subspace_extras=merged_subspace_extras,
+            stage_extras=stage_extras,
+            validation_only=skip_test_eval,
+        )
+
+    _run_cached_foundation(
         phase1_override,
-        smoke=False,
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-        skip_prepare=True,
-        analyze_extras=merged_analyze_extras,
-        subspace_extras=merged_subspace_extras,
-        stage_extras=stage_extras,
+        cache_key=foundation_cache_key,
         validation_only=skip_test_eval,
+        dry_run=dry_run,
+        builder=build_foundation,
     )
 
     # 5) PhaseF training.
@@ -1641,7 +1658,7 @@ def _run_safety_full(
             env_overrides=env_overrides,
         )
 
-        # 7) Test evaluation belongs only to the formal result cell, never a selector.
+        # Test evaluation belongs only to the formal result cell, never a selector.
         phasef_cfg = load_phasef_config(phasef_override)
         _run_adapter_eval(
             device=device,
@@ -1658,6 +1675,45 @@ def _run_safety_full(
             safety_eval_datasets=safety_eval_datasets,
             eval_config_path=str(eval_config_src),
         )
+
+
+def _run_cached_foundation(
+    phase1_config: Path,
+    *,
+    cache_key: str,
+    validation_only: bool,
+    dry_run: bool,
+    builder: Callable[[], None],
+) -> bool:
+    """Build Phase-1 once per canonical key; return True on a cache hit."""
+
+    if not cache_key:
+        builder()
+        return False
+    phase1_root = Path(load_phase1_config(phase1_config).extraction.output_root).resolve()
+    with foundation_lock(phase1_root):
+        if foundation_is_ready(
+            phase1_root, cache_key, validation_only=validation_only
+        ):
+            print(
+                json.dumps(
+                    {
+                        "event": "foundation_cache_hit",
+                        "cache_key": cache_key,
+                        "phase1_root": str(phase1_root),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return True
+        builder()
+        if not dry_run:
+            mark_foundation_ready(
+                phase1_root, cache_key, validation_only=validation_only
+            )
+        return False
 
 
 def _run_safety_distill(
@@ -2669,6 +2725,8 @@ def _run_full_pipeline(
     analyze_extras: Sequence[str] | None = None,
     subspace_extras: Sequence[str] | None = None,
     stage_extras: Mapping[str, Sequence[str]] | None = None,
+    skip_test_eval: bool = False,
+    foundation_cache_key: str = "",
 ) -> None:
     _validate_device_request(num_devices)
     config_map = FULL_PIPELINE_CONFIGS
@@ -2697,14 +2755,21 @@ def _run_full_pipeline(
     phasef_cfg = load_phasef_config(phasef_config)
 
     env_overrides = _build_env_overrides(device, device_id)
-    _run_phase1_precompute(
+    _run_cached_foundation(
         phase1_config,
-        smoke=smoke,
+        cache_key=foundation_cache_key,
+        validation_only=skip_test_eval,
         dry_run=dry_run,
-        env_overrides=env_overrides,
-        analyze_extras=analyze_extras,
-        subspace_extras=subspace_extras,
-        stage_extras=stage_extras,
+        builder=lambda: _run_phase1_precompute(
+            phase1_config,
+            smoke=smoke,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+            analyze_extras=analyze_extras,
+            subspace_extras=subspace_extras,
+            stage_extras=stage_extras,
+            validation_only=skip_test_eval,
+        ),
     )
 
     training_output_root = Path(phasef_cfg.output.output_root)
@@ -2748,21 +2813,22 @@ def _run_full_pipeline(
         sanity_args += ["--max-samples-per-label", "8", "--max-new-tokens", "32"]
 
     _run_script("09_train_student_semalign.py", ["--config", str(phasef_config)], dry_run=dry_run, env_overrides=env_overrides)
-    _run_script("10_sanity_eval.py", sanity_args, dry_run=dry_run, env_overrides=env_overrides)
-    _run_script("11_make_tables.py", tables_args, dry_run=dry_run, env_overrides=env_overrides)
-    _run_adapter_eval(
-        device=device,
-        model_size="0.8b",
-        training_output_root=training_output_root,
-        epochs=int(phasef_cfg.optim.epochs),
-        device_id=device_id,
-        dry_run=dry_run,
-        env_overrides=env_overrides,
-        opencompass_dir=opencompass_dir,
-        opencompass_datasets=opencompass_datasets,
-        skip_opencompass=skip_opencompass,
-        enable_opencompass=enable_opencompass,
-    )
+    if not skip_test_eval:
+        _run_script("10_sanity_eval.py", sanity_args, dry_run=dry_run, env_overrides=env_overrides)
+        _run_script("11_make_tables.py", tables_args, dry_run=dry_run, env_overrides=env_overrides)
+        _run_adapter_eval(
+            device=device,
+            model_size="0.8b",
+            training_output_root=training_output_root,
+            epochs=int(phasef_cfg.optim.epochs),
+            device_id=device_id,
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+            opencompass_dir=opencompass_dir,
+            opencompass_datasets=opencompass_datasets,
+            skip_opencompass=skip_opencompass,
+            enable_opencompass=enable_opencompass,
+        )
 
     if not dry_run:
         summary = {
@@ -2968,7 +3034,7 @@ def main() -> None:
                 num_devices=args.num_devices,
                 dry_run=args.dry_run,
                 force_rebuild=bool(args.force_rebuild),
-                smoke=False,
+                smoke=bool(getattr(args, "smoke", False)),
                 phasef_config_path=args.phasef_config,
                 phase1_config_path=phase1_config_path,
                 analyze_extras=analyze_extras,
@@ -2977,6 +3043,7 @@ def main() -> None:
                 cell_id=getattr(args, "cell_id", "") or "",
                 disable_dataset_overrides=bool(getattr(args, "disable_dataset_overrides", False)),
                 skip_test_eval=bool(getattr(args, "skip_test_eval", False)),
+                foundation_cache_key=str(getattr(args, "foundation_cache_key", "") or ""),
                 **oc_kwargs,
             )
             return
@@ -2984,13 +3051,15 @@ def main() -> None:
             args.device,
             device_id=args.device_id,
             num_devices=args.num_devices,
-            smoke=False,
+            smoke=bool(getattr(args, "smoke", False)),
             dry_run=args.dry_run,
             phasef_config_path=args.phasef_config,
             phase1_config_path=phase1_config_path,
             analyze_extras=analyze_extras,
             subspace_extras=subspace_extras,
             stage_extras=stage_extras,
+            skip_test_eval=bool(getattr(args, "skip_test_eval", False)),
+            foundation_cache_key=str(getattr(args, "foundation_cache_key", "") or ""),
             **oc_kwargs,
         )
         return
