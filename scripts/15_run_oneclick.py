@@ -1491,6 +1491,74 @@ def _resolve_safety_full_roots(
     return safety_processed_dir, pan_processed_dir, phase1_root, phasef_root
 
 
+def _completed_training_can_resume(
+    training_root: str | Path,
+    current_config: str | Path,
+) -> bool:
+    """Accept only an atomically completed, config-identical PhaseF run."""
+
+    root = Path(training_root).resolve()
+    manifest_path = root / "manifest.json"
+    train_metrics_path = root / "train_metrics.jsonl"
+    val_metrics_path = root / "val_metrics.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return False
+        previous_config = Path(str(manifest["config_path"])).resolve()
+        previous_payload = yaml.safe_load(previous_config.read_text(encoding="utf-8"))
+        current_payload = yaml.safe_load(Path(current_config).read_text(encoding="utf-8"))
+        if not isinstance(previous_payload, dict) or previous_payload != current_payload:
+            return False
+        epochs_completed = int(manifest["epochs_completed"])
+        if epochs_completed <= 0:
+            return False
+        checkpoint = root / "checkpoints" / f"epoch_{epochs_completed:03d}.pt"
+        if not checkpoint.is_file() or checkpoint.stat().st_size <= 0:
+            return False
+        if not train_metrics_path.is_file() or train_metrics_path.stat().st_size <= 0:
+            return False
+        val_metrics = json.loads(val_metrics_path.read_text(encoding="utf-8"))
+        if not isinstance(val_metrics, dict) or f"epoch_{epochs_completed}" not in val_metrics:
+            return False
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        yaml.YAMLError,
+    ):
+        return False
+    return True
+
+
+def _cell_owned_post_training_layout(
+    phase1_root: str | Path,
+    training_root: str | Path,
+) -> tuple[str, str, str]:
+    """Return table/eval paths that cannot collide across shared-cache cells."""
+
+    phase1 = Path(phase1_root).resolve()
+    training = Path(training_root).resolve()
+    try:
+        training_relative = training.relative_to(phase1)
+    except ValueError as exc:
+        raise ValueError(
+            "PhaseF output.output_root must live under the shared Phase1 "
+            f"output root; got PhaseF={training} and Phase1={phase1}."
+        ) from exc
+    if training_relative == Path("training"):
+        return "training", "sanity_eval", "tables"
+    suffix = training.name
+    return (
+        training_relative.as_posix(),
+        f"sanity_eval_{suffix}",
+        f"tables_{suffix}",
+    )
+
+
 def _run_safety_full(
     device: str,
     *,
@@ -1634,26 +1702,71 @@ def _run_safety_full(
         builder=build_foundation,
     )
 
-    # 5) PhaseF training.
-    _run_script(
-        "09_train_student_semalign.py",
-        ["--config", str(phasef_override)],
-        dry_run=dry_run,
-        env_overrides=env_overrides,
+    # 5) PhaseF training.  A retry after a downstream evaluation failure must
+    # reuse a completed, config-identical cell checkpoint instead of spending
+    # another full training budget.  The manifest is written only after the
+    # final epoch, and every supporting artifact is validated above.
+    training_resume_hit = (
+        not dry_run
+        and _completed_training_can_resume(
+            safety_phasef_output_root,
+            phasef_override,
+        )
     )
+    if training_resume_hit:
+        print(
+            json.dumps(
+                {
+                    "event": "training_resume_hit",
+                    "training_root": str(safety_phasef_output_root),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    else:
+        _run_script(
+            "09_train_student_semalign.py",
+            ["--config", str(phasef_override)],
+            dry_run=dry_run,
+            env_overrides=env_overrides,
+        )
 
     if not skip_test_eval:
         eval_config_src = _resolve(_safety_eval_config(device, "0.8b", baseline_name))
+        training_dir_name, sanity_dir_name, tables_dir_name = (
+            _cell_owned_post_training_layout(
+                safety_phase1_output_root,
+                safety_phasef_output_root,
+            )
+        )
         # 6) Sanity eval + tables (still PAN-comparable; uses safety processed_dir).
         _run_script(
             "10_sanity_eval.py",
-            ["--config", str(phase1_override)],
+            [
+                "--config",
+                str(phase1_override),
+                "--training-dir",
+                str(safety_phasef_output_root),
+                "--output-dir-name",
+                sanity_dir_name,
+            ],
             dry_run=dry_run,
             env_overrides=env_overrides,
         )
         _run_script(
             "11_make_tables.py",
-            ["--config", str(phase1_override)],
+            [
+                "--config",
+                str(phase1_override),
+                "--training-dir-name",
+                training_dir_name,
+                "--sanity-dir-name",
+                sanity_dir_name,
+                "--tables-dir-name",
+                tables_dir_name,
+            ],
             dry_run=dry_run,
             env_overrides=env_overrides,
         )
