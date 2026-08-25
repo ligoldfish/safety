@@ -17,6 +17,39 @@ from src.ablations.foundation_cache import (
 
 
 class FoundationCacheTests(unittest.TestCase):
+    def test_required_artifacts_match_recompose_output_directory_names(self) -> None:
+        root = Path("/phase1")
+
+        validation_paths = {
+            path.relative_to(root).as_posix()
+            for path in required_foundation_artifacts(root, validation_only=True)
+        }
+        formal_paths = {
+            path.relative_to(root).as_posix()
+            for path in required_foundation_artifacts(root, validation_only=False)
+        }
+
+        self.assertIn(
+            "student_targets/student_safe_targets_alignment/manifest.json",
+            validation_paths,
+        )
+        self.assertIn(
+            "student_targets/student_safe_targets_val/manifest.json",
+            validation_paths,
+        )
+        self.assertNotIn(
+            "student_targets/student_safe_targets_analysis_val/manifest.json",
+            formal_paths,
+        )
+        self.assertIn(
+            "student_targets/student_safe_targets_pan_test/manifest.json",
+            formal_paths,
+        )
+        self.assertIn(
+            "student_targets/student_safe_targets_sanity_test/manifest.json",
+            formal_paths,
+        )
+
     def test_marker_is_written_only_after_every_declared_artifact_exists(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "phase1"

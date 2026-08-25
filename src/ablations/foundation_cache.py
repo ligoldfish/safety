@@ -11,6 +11,17 @@ class FoundationCacheError(RuntimeError):
     """Raised when a declared reusable Phase-1 foundation is incomplete."""
 
 
+STUDENT_TARGET_DIR_BY_SPLIT = {
+    "alignment": "student_safe_targets_alignment",
+    # The recompose stage intentionally uses the shorter on-disk name ``val``
+    # for the logical ``analysis_val`` split.  Keep the cache contract aligned
+    # with scripts/08_recompose_student_targets.py instead of deriving names.
+    "analysis_val": "student_safe_targets_val",
+    "pan_test": "student_safe_targets_pan_test",
+    "sanity_test": "student_safe_targets_sanity_test",
+}
+
+
 def required_foundation_artifacts(
     phase1_root: str | Path, *, validation_only: bool
 ) -> tuple[Path, ...]:
@@ -27,7 +38,10 @@ def required_foundation_artifacts(
         root / "semantic_bases" / "manifest.json",
         root / "semantic_bases" / "bridge_artifact.pt",
         *(
-            root / "student_targets" / f"student_safe_targets_{split}" / "manifest.json"
+            root
+            / "student_targets"
+            / STUDENT_TARGET_DIR_BY_SPLIT[split]
+            / "manifest.json"
             for split in target_splits
         ),
     )

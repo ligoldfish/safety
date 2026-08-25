@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.semantic_recompose import recompose_from_sparse_coeffs
+from src.ablations.foundation_cache import STUDENT_TARGET_DIR_BY_SPLIT
 from src.ablations.strategies.bridge import hidden_bridge_targets, remap_sparse_coefficients
 from src.utils.config import load_phase1_config
 from src.utils.io import ensure_dir, write_json
@@ -22,10 +23,22 @@ from src.utils.seed import set_global_seed
 
 
 SPLIT_DIR_MAP = {
-    "alignment": ("teacher_top256_coeffs_alignment", "student_safe_targets_alignment"),
-    "analysis_val": ("teacher_top256_coeffs_val", "student_safe_targets_val"),
-    "pan_test": ("teacher_top256_coeffs_pan_test", "student_safe_targets_pan_test"),
-    "sanity_test": ("teacher_top256_coeffs_sanity_test", "student_safe_targets_sanity_test"),
+    "alignment": (
+        "teacher_top256_coeffs_alignment",
+        STUDENT_TARGET_DIR_BY_SPLIT["alignment"],
+    ),
+    "analysis_val": (
+        "teacher_top256_coeffs_val",
+        STUDENT_TARGET_DIR_BY_SPLIT["analysis_val"],
+    ),
+    "pan_test": (
+        "teacher_top256_coeffs_pan_test",
+        STUDENT_TARGET_DIR_BY_SPLIT["pan_test"],
+    ),
+    "sanity_test": (
+        "teacher_top256_coeffs_sanity_test",
+        STUDENT_TARGET_DIR_BY_SPLIT["sanity_test"],
+    ),
 }
 
 
